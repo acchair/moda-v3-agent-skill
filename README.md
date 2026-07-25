@@ -49,3 +49,54 @@ python tools/run_pipeline.py --stock 000001 --name 平安银行
 
 报告写入 `knowledge/research/`。最终答复可通过 `tools/export_skill_output.py` 导出；设置 `MODA_OUTPUT_DIR` 可以更改导出目录。
 
+## 使用流程
+
+### 1. 给 Agent 下达任务
+
+直接提供股票名称或 6 位代码，例如：
+
+```text
+分析平安银行（000001），按 moda-v3 五层评分框架给出总分、评级、来源和风险触发器。
+```
+
+### 2. 运行基础流水线
+
+Agent 自动确认代码后运行：
+
+```powershell
+python tools/run_pipeline.py --stock 000001 --name 平安银行
+```
+
+流水线依次生成基本面与行情、深度财务、技术因子、公告互动和五层评分报告。
+
+### 3. 读取报告并核对来源
+
+重点读取以下文件：
+
+```text
+knowledge/research/finance_data/000001.md
+knowledge/research/finance_deep/000001.md
+knowledge/research/tdx_analysis/000001.md
+knowledge/research/announcements/000001.md
+knowledge/research/scoring/000001.md
+```
+
+每项结论都保留来源标签；报告缺失、接口失败或无法交叉验证的字段统一标记为 `需人工确认`。
+
+### 4. 形成最终结论
+
+按 F1 至 F5 汇总分数，再依次检查 ST/退市风险、控股股东或实控人减持、估值过热和产业逻辑证伪。结论只能使用 `根`、`矛`、`学习仓` 或 `不碰`。
+
+### 5. 导出答复
+
+将最终答复写入 UTF-8 文本后执行：
+
+```powershell
+python tools/export_skill_output.py --stock 000001 --name 平安银行 --input final.md
+```
+
+默认导出到 `knowledge/output/`；可设置 `MODA_OUTPUT_DIR` 改为其他目录。
+
+## 隐私边界
+
+仓库不包含浏览器二进制、登录状态、Cookie、本机日志、历史报告、网页工作台或产业链数据库。可选代理凭据只从环境变量读取，禁止提交到仓库。
