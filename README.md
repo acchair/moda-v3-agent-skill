@@ -1,4 +1,4 @@
-![Uploading ChatGPT Image 2026年7月25日 20_24_27.png…]()
+ChatGPT Image 2026年7月25日 20_24_27.png
 # 安装 moda-v3
 
 ## 让你的 Agent 按五层框架研究 A 股
