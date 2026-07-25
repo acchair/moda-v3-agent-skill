@@ -1,0 +1,41 @@
+# Local runtime data
+.env
+.env.*
+!.env.example
+knowledge/research/*
+!knowledge/research/.gitkeep
+knowledge/output/
+output/
+
+# Browser data and logs
+tools/xueqiu/
+tools/webapp/
+skills/
+docs/
+tools/yahoo/
+tools/akshare/business_scraper.py
+tools/akshare/company_profile_provider.py
+tools/akshare/legulegu_scraper.py
+tools/akshare/market_events.py
+tools/akshare/popularity.py
+tools/scoring/supply_demand.py
+tools/test_core_fixes.py
+tools/test_dashboard.py
+*.log
+*.log.*
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.bak
+
+# Credentials and editor state
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+.vscode/
+.idea/
+.codex/
+tools/akshare/cninfo_backup.py

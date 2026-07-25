@@ -1,0 +1,7 @@
+akshare==1.18.37
+baostock==0.8.9
+easy-tdx==1.19.0
+efinance==0.5.8
+numpy==2.4.3
+pandas==2.3.3
+requests==2.32.5

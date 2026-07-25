@@ -1,0 +1,541 @@
+# A股全行业产业链资料库 v2 - 修正版
+# 按资源/制造/科技/消费/金融/基建六大类组织
+# 说明：
+# 1. industries 尽量使用东方财富/AKShare 中更常见的板块名
+# 2. 识别时 keywords 往往比 industries 更重要
+# 3. 已删除重复的“白酒产业链”
+
+chains:
+  # ═══════════════════ 资源类 ═══════════════════
+  - name: 煤炭产业链
+    aliases: [煤炭, 煤化工, 焦煤, 动力煤]
+    upstream:
+      industries: [煤炭开采, 专用设备]
+      keywords: [煤机, 采掘, 矿, 勘探, 综采, 液压支架, 掘进机]
+    midstream:
+      industries: [煤炭开采, 焦炭加工, 化学原料]
+      keywords: [洗煤, 焦煤, 焦炭, 无烟煤, 动力煤, 煤化工, 煤制油, 煤制气, 煤制烯烃]
+    downstream:
+      industries: [电力, 钢铁, 化工, 建材]
+      keywords: [火电, 发电, 钢铁, 水泥, 化肥, 甲醇, 烯烃, 供暖]
+
+  - name: 石油化工产业链
+    aliases: [石油, 石化, 炼化, 油气]
+    upstream:
+      industries: [油气开采, 专用设备]
+      keywords: [勘探, 钻井, 采油, 油服, 地震, 测井, 压裂, 海上平台]
+    midstream:
+      industries: [石油加工贸易, 化学原料, 化学制品]
+      keywords: [炼油, 乙烯, 丙烯, 芳烃, PX, PTA, 裂解, 催化裂化, 加氢]
+    downstream:
+      industries: [化学制品, 化纤, 塑料, 橡胶, 纺织制造]
+      keywords: [塑料, 合成纤维, 合成橡胶, 涤纶, 锦纶, 聚酯, 聚烯烃, 润滑油, 沥青]
+
+  - name: 天然气产业链
+    aliases: [天然气, LNG, 燃气, 页岩气]
+    upstream:
+      industries: [油气开采, 油服工程]
+      keywords: [气田, 页岩气, 煤层气, 勘探开发, 钻井, 压裂]
+    midstream:
+      industries: [燃气, 港口航运, 物流]
+      keywords: [LNG液化, LNG接收站, LNG运输船, 管道, 储气库, 槽车]
+    downstream:
+      industries: [燃气, 电力, 化工]
+      keywords: [城市燃气, 加气站, 工业燃气, 天然气发电, 天然气化工, 分布式能源]
+
+  - name: 有色金属产业链
+    aliases: [有色, 铜, 铝, 锌, 铅, 锡, 镍]
+    upstream:
+      industries: [工业金属, 小金属, 能源金属]
+      keywords: [矿, 采选, 铜矿, 铝土矿, 锌矿, 铅锌矿, 锡矿, 镍矿, 冶炼]
+    midstream:
+      industries: [工业金属, 金属新材料]
+      keywords: [电解铜, 电解铝, 阴极铜, 铝锭, 锌锭, 铜材, 铝材, 铝箔, 铜箔, 铜管]
+    downstream:
+      industries: [电力, 家用电器, 汽车零部件, 建筑材料, 电子元件]
+      keywords: [电线电缆, 铜缆, 铝型材, 散热器, 空调, 汽车轻量化, 建筑铝材, PCB铜箔, 锂电池铜箔]
+
+  - name: 稀土产业链
+    aliases: [稀土, 永磁, 稀土永磁, 镨钕]
+    upstream:
+      industries: [小金属, 有色金属]
+      keywords: [稀土矿, 开采, 分离, 稀土氧化物, 氧化镨钕, 氧化镝, 氧化铽, 独居石, 离子型稀土]
+    midstream:
+      industries: [小金属, 金属新材料]
+      keywords: [稀土金属, 镨钕金属, 永磁材料, 钕铁硼, 烧结钕铁硼, 粘结钕铁硼, 磁材, 稀土抛光粉, 稀土催化剂]
+    downstream:
+      industries: [新能源车, 风电设备, 消费电子, 机器人, 家用电器]
+      keywords: [驱动电机, 风力发电机, 变频空调, 智能手机, 伺服电机, 工业机器人, 磁共振, 节能电梯]
+
+  - name: 钢铁产业链
+    aliases: [钢铁, 钢材, 特钢]
+    upstream:
+      industries: [冶钢原料, 煤炭开采]
+      keywords: [铁矿石, 焦煤, 焦炭, 废钢, 石灰石, 锰矿, 铬矿, 合金]
+    midstream:
+      industries: [钢铁, 普钢, 特钢]
+      keywords: [高炉, 电炉, 转炉, 连铸, 热轧, 冷轧, 螺纹钢, 线材, 板材, 管材, 特钢, 不锈钢, 硅钢, 取向硅钢]
+    downstream:
+      industries: [建筑材料, 汽车零部件, 机械设备, 家用电器, 船舶制造, 电力设备]
+      keywords: [建筑用钢, 汽车板, 家电板, 造船板, 管线钢, 风电钢, 桥梁钢, 容器板]
+
+  # ═══════════════════ 制造类 ═══════════════════
+  - name: 半导体产业链
+    aliases: [半导体, 芯片, 集成电路, IC, 晶圆]
+    upstream:
+      industries: [半导体, 电子化学品, 专用设备]
+      keywords: [硅片, 大硅片, 光刻胶, 电子特气, 靶材, CMP, 抛光液, 半导体设备, 刻蚀机, 薄膜沉积, EDA, 掩膜版, IP核, 光刻机, 离子注入, 清洗设备, 检测设备, 单晶炉]
+    midstream:
+      industries: [半导体, 电子元件]
+      keywords: [芯片设计, 集成电路设计, 晶圆制造, 代工, 封装, 测试, 功率半导体, 模拟芯片, MCU, 存储芯片, SoC, FPGA, IGBT, SiC, 碳化硅, 氮化镓, 先进封装, Chiplet]
+    downstream:
+      industries: [消费电子, 通信设备, 汽车零部件, 计算机设备, 国防军工]
+      keywords: [智能手机, 汽车电子, 通信基站, 服务器, 工业控制, 物联网, AI芯片, 自动驾驶芯片, 军工电子]
+
+  - name: 光伏产业链
+    aliases: [光伏, 太阳能, 新能源]
+    upstream:
+      industries: [光伏设备, 化学原料, 玻璃玻纤, 有色金属]
+      keywords: [硅料, 多晶硅, 工业硅, 石英砂, 石英坩埚, 银浆, 胶膜, 光伏玻璃, EVA, POE, 金刚线, 边框, 接线盒]
+    midstream:
+      industries: [光伏设备, 电源设备]
+      keywords: [硅片, 电池片, 光伏组件, 组件, 逆变器, 支架, HJT, TOPCon, BC电池, 钙钛矿, 微型逆变器, 优化器]
+    downstream:
+      industries: [电力, 电网设备, 工程建设]
+      keywords: [光伏电站, 电站运营, EPC, 分布式光伏, 集中式光伏, BIPV, 农光互补, 渔光互补]
+
+  - name: 风电产业链
+    aliases: [风电, 风力发电, 海上风电]
+    upstream:
+      industries: [专用设备, 玻璃玻纤, 化学制品, 有色金属]
+      keywords: [玻纤, 碳纤维, 环氧树脂, 结构胶, 稀土永磁, 齿轮箱, 轴承, 主轴, 铸件, 锻件, 法兰]
+    midstream:
+      industries: [风电设备, 电源设备]
+      keywords: [风机, 风电机组, 整机, 叶片, 塔筒, 机舱, 变流器, 变桨系统, 海上风机, 直驱, 半直驱, 双馈]
+    downstream:
+      industries: [电力, 工程建设, 电网设备]
+      keywords: [风电场运营, 风电EPC, 海上风电安装, 风电运维, 海缆, 海上升压站, 风电制氢]
+
+  - name: 锂电池产业链
+    aliases: [锂电, 锂电池, 动力电池, 新能源车电池]
+    upstream:
+      industries: [能源金属, 小金属, 化学原料, 化学制品]
+      keywords: [锂矿, 盐湖提锂, 碳酸锂, 氢氧化锂, 钴矿, 镍矿, 锰矿, 天然石墨, 六氟磷酸锂, 电解液原料, 溶剂, 添加剂, 粘结剂, 导电剂]
+    midstream:
+      industries: [电池, 化学制品]
+      keywords: [正极材料, 负极材料, 电解液, 隔膜, 电芯, 电池包, BMS, 动力电池, 储能电池, 磷酸铁锂, 三元, 钠电池, 固态电池, 复合集流体]
+    downstream:
+      industries: [汽车整车, 储能, 消费电子]
+      keywords: [新能源汽车, 电动车, 储能系统, 两轮车, 消费电子, 充换电, 电池回收, 梯次利用]
+
+  - name: 固态电池产业链
+    aliases: [固态电池, 全固态, 半固态]
+    upstream:
+      industries: [化学原料, 小金属, 电子元件]
+      keywords: [硫化物电解质, 氧化物电解质, 聚合物电解质, 锂镧锆氧, LLZO, 硫化锂, 锆, 镧]
+    midstream:
+      industries: [电池, 汽车零部件]
+      keywords: [固态电芯, 固态电池包, 半固态电池, 凝聚态电池]
+    downstream:
+      industries: [汽车整车, 消费电子, 储能]
+      keywords: [固态电池车, 固态电池无人机, 固态电池储能]
+
+  - name: 氢能产业链
+    aliases: [氢能, 氢燃料电池, 绿氢, 制氢]
+    upstream:
+      industries: [电源设备, 专用设备, 化学制品]
+      keywords: [电解槽, PEM电解, 碱性电解, 可再生能源制氢, 催化剂, 质子交换膜, 双极板, 碳纸, 膜电极]
+    midstream:
+      industries: [电源设备, 汽车零部件, 燃气]
+      keywords: [氢燃料电池, 电堆, 储氢罐, 加氢站, 氢储运, 液氢, 固态储氢, 高压气氢]
+    downstream:
+      industries: [汽车整车, 电力, 化工, 钢铁]
+      keywords: [氢能重卡, 氢能公交, 氢发电, 氢炼钢, 氢化工, 合成氨, 甲醇]
+
+  - name: 储能产业链
+    aliases: [储能, 储能系统, 电力储能, 新型储能]
+    upstream:
+      industries: [电池, 能源金属, 化学制品]
+      keywords: [锂电池, 钠电池, 液流电池, 钒电池, 钒电解液, 碳酸锂, 温控, 液冷方案, 压缩机]
+    midstream:
+      industries: [电网设备, 电源设备, 电池]
+      keywords: [变流器, PCS, IGBT, 储能系统集成, 储能电站, 工商业储能, 户用储能, BMS, EMS, 集装箱储能, 组串式储能]
+    downstream:
+      industries: [电力, 光伏设备, 风电设备, 工程建设]
+      keywords: [光伏配储, 风电配储, 电网调频, 峰谷套利, 虚拟电厂, 共享储能, 独立储能, 工商业储能运营]
+
+  - name: 充电桩产业链
+    aliases: [充电桩, 充换电, 超充]
+    upstream:
+      industries: [电子元件, 电力设备, 专用设备]
+      keywords: [充电模块, 功率模块, 充电枪, 线缆, 继电器, 接触器, IGBT, SiC模块, 变压器]
+    midstream:
+      industries: [电源设备, 电力设备]
+      keywords: [充电桩整机, 直流快充, 交流慢充, 超充桩, 充电堆, 换电站, 液冷超充, V2G]
+    downstream:
+      industries: [汽车服务, 电力]
+      keywords: [充电运营, 充电平台, 换电运营, 高速公路充电, 小区充电, 目的地充电]
+
+  - name: 机器人产业链
+    aliases: [机器人, 人形机器人, 具身智能, 自动化]
+    upstream:
+      industries: [通用设备, 专用设备, 自动化设备, 电子元件]
+      keywords: [减速器, 伺服电机, 丝杠, 滚珠丝杠, 行星滚柱丝杠, 谐波减速器, RV减速器, 力矩传感器, 六维力, 编码器, 控制器, 轴承, 空心杯电机, 无框力矩电机, 触觉传感器]
+    midstream:
+      industries: [自动化设备, 机器人]
+      keywords: [工业机器人, 协作机器人, 人形机器人, 本体, 整机, 执行器, 灵巧手, 关节模组]
+    downstream:
+      industries: [汽车零部件, 计算机设备, 物流, 医疗服务, 家用电器]
+      keywords: [汽车制造, 电子组装, 仓储物流, 医疗手术, 家庭服务, 巡检, 焊接, 喷涂, 搬运]
+
+  - name: 低空经济产业链
+    aliases: [低空经济, eVTOL, 无人机, 飞行汽车]
+    upstream:
+      industries: [航空航天, 有色金属, 电池, 电子元件]
+      keywords: [碳纤维, 钛合金, 高能量密度电池, 固态电池, 旋翼, 电驱, 电控, 传感器, 惯导, 雷达]
+    midstream:
+      industries: [航空航天, 国防军工, 汽车零部件]
+      keywords: [eVTOL整机, 无人机, 飞行汽车, 倾转旋翼, 适航取证, 飞控, 航电]
+    downstream:
+      industries: [交通运输, 物流, 旅游, 应急]
+      keywords: [城市空中交通, 低空物流, 空中出租车, 低空旅游, 应急救援, 农业植保, 巡检]
+
+  - name: 商业航天产业链
+    aliases: [商业航天, 航天, 卫星, 火箭, 星链]
+    upstream:
+      industries: [航空航天, 有色金属, 专用设备, 电子元件]
+      keywords: [高温合金, 钛合金, 碳纤维, 发动机, 推进剂, 惯导, 星敏, 相控阵天线, TR组件, 太阳翼, 燃料贮箱, 整流罩]
+    midstream:
+      industries: [航空航天, 通信设备, 国防军工]
+      keywords: [火箭总装, 卫星制造, 地面终端, 测控, 相控阵, 卫星平台, 发射服务, 可回收火箭]
+    downstream:
+      industries: [通信服务, 软件开发, 国防军工]
+      keywords: [卫星互联网, 遥感, 卫星通信, 导航增强, 物联网, 手机直连卫星, 太空旅游, 太空资源]
+
+  - name: 大飞机产业链
+    aliases: [大飞机, 国产大飞机, C919, 航空制造]
+    upstream:
+      industries: [航空航天, 有色金属, 复合材料, 专用设备]
+      keywords: [铝锂合金, 钛合金, 碳纤维复材, 航空发动机, 航电系统, 起落架, 机轮刹车, 航空轴承]
+    midstream:
+      industries: [航空航天, 国防军工]
+      keywords: [机体制造, 总装, 部件, 机翼, 尾翼, 舱门, 内饰]
+    downstream:
+      industries: [航空运输, 机场, 航空服务]
+      keywords: [航空公司, 飞机租赁, 维修MRO, 飞行员培训, 航材]
+
+  - name: 高温合金/军工材料
+    aliases: [高温合金, 军工材料, 特种材料, 航空材料, 镍基合金]
+    upstream:
+      industries: [小金属, 有色金属, 钢铁]
+      keywords: [镍, 钴, 钨, 钼, 铼, 铬, 钛, 海绵钛, 铌, 钽, 稀土, 铪]
+    midstream:
+      industries: [有色金属, 钢铁, 金属新材料]
+      keywords: [高温合金, 精密铸件, 锻件, 粉末冶金, 单晶叶片, 定向凝固, 3D打印, 增材制造, 变形高温合金, 铸造高温合金]
+    downstream:
+      industries: [航空航天, 国防军工, 电力, 石油加工贸易]
+      keywords: [航空发动机, 燃气轮机, 核电, 超超临界, 涡轮叶片, 燃烧室, 火箭发动机, 导弹]
+
+  - name: 军工产业链
+    aliases: [军工, 国防, 武器装备, 军队]
+    upstream:
+      industries: [航空航天, 有色金属, 电子元件, 专用设备]
+      keywords: [特种材料, 芯片, FPGA, 军用连接器, 红外探测器, 惯导, 电子对抗, 雷达组件, 弹药]
+    midstream:
+      industries: [航空航天, 国防军工, 船舶制造, 汽车零部件]
+      keywords: [导弹, 飞机, 舰船, 坦克, 雷达整机, 指挥系统, 电子战, 水下装备, 无人机, 巡飞弹]
+    downstream:
+      industries: [国防军工]
+      keywords: [军队装备, 军贸出口, 维修保障, 军事训练]
+
+  # ═══════════════════ 科技/软件类 ═══════════════════
+  - name: AI算力产业链
+    aliases: [AI, 算力, 人工智能, 大模型, 智算]
+    upstream:
+      industries: [半导体, 电子元件, 专用设备]
+      keywords: [GPU, HBM, 光模块, CPO, 硅光, 液冷, 服务器电源, PCB, 高速背板, 光芯片, DFB激光器, 铜缆, 交换机芯片, 800G, 1.6T]
+    midstream:
+      industries: [计算机设备, 通信设备, IT服务]
+      keywords: [服务器, 交换机, 算力租赁, 数据中心, IDC, 智算中心, 云计算, 推理芯片, AI训练, 算力调度]
+    downstream:
+      industries: [互联网服务, 软件开发, 传媒, 金融, 教育]
+      keywords: [AI应用, 大模型, ChatGPT, AIGC, 智能客服, AI搜索, AI办公, AI编程, AI医疗, AI教育]
+
+  - name: 信创产业链
+    aliases: [信创, 国产替代, 国产软件, 安全可控]
+    upstream:
+      industries: [半导体, 电子元件]
+      keywords: [CPU, 国产芯片, 海光, 兆芯, 鲲鹏, 飞腾, 龙芯, 申威, 操作系统内核, 数据库内核]
+    midstream:
+      industries: [软件开发, IT服务, 计算机设备]
+      keywords: [操作系统, 数据库, 中间件, 办公软件, ERP, OA, 安全软件, 服务器, PC, 打印机]
+    downstream:
+      industries: [政府, 金融, 通信设备, 能源, 教育]
+      keywords: [政务信创, 金融信创, 央企信创, 教育信创, 行业应用]
+
+  - name: 数据要素产业链
+    aliases: [数据要素, 数据资产, 数据交易, 数据标注]
+    upstream:
+      industries: [IT服务, 软件开发]
+      keywords: [数据采集, 数据清洗, 数据标注, 数据脱敏, 隐私计算, 联邦学习]
+    midstream:
+      industries: [IT服务, 互联网服务]
+      keywords: [数据交易所, 数据确权, 数据定价, 数据资产管理, 数据治理, 数据中台]
+    downstream:
+      industries: [金融, 政务, 医疗服务, 交通运输, 营销]
+      keywords: [数据入表, 数据应用, 精准营销, 风控, 智慧城市, 数据贷款]
+
+  - name: 量子计算产业链
+    aliases: [量子计算, 量子, 量子通信]
+    upstream:
+      industries: [专用设备, 电子元件, 半导体]
+      keywords: [稀释制冷机, 量子芯片, 超导材料, 低温线缆, 微波器件, 量子比特]
+    midstream:
+      industries: [计算机设备, IT服务]
+      keywords: [量子计算机, 量子云平台, 量子软件, 量子算法, 量子纠错]
+    downstream:
+      industries: [金融, 医药, 化工, 国防军工]
+      keywords: [量子金融, 药物研发, 材料模拟, 密码破译, 优化计算]
+
+  # ═══════════════════ 消费类 ═══════════════════
+  - name: 白酒产业链
+    aliases: [白酒, 酒类, 酿酒]
+    upstream:
+      industries: [农产品加工, 包装材料, 造纸, 玻璃玻纤]
+      keywords: [高粱, 小麦, 酒曲, 包装, 酒瓶, 玻璃瓶, 瓶盖, 纸盒, 酒标]
+    midstream:
+      industries: [酿酒行业]
+      keywords: [白酒, 酱香, 浓香, 清香, 基酒, 酿造, 酒业, 年份酒, 窖池]
+    downstream:
+      industries: [商业百货, 互联网电商, 旅游酒店]
+      keywords: [经销, 渠道, 电商, 商超, 餐饮, 终端消费, 团购, 老酒收藏]
+
+  - name: 食品饮料产业链
+    aliases: [食品, 饮料, 乳业, 调味品, 预制菜, 零食]
+    upstream:
+      industries: [农产品加工, 食品加工, 包装材料]
+      keywords: [粮食, 大豆, 玉米, 原奶, 糖, 油脂, 添加剂, 香精, 包装材料, PET瓶, 利乐包]
+    midstream:
+      industries: [食品加工, 饮料制造, 酿酒行业]
+      keywords: [乳制品, 调味品, 酱油, 预制菜, 速冻食品, 零食, 坚果, 卤制品, 饮料, 啤酒, 功能饮料, 植物蛋白]
+    downstream:
+      industries: [商业百货, 互联网电商, 餐饮]
+      keywords: [超市, 便利店, 电商平台, 直播带货, 餐饮连锁, 团餐, 外卖, 新零售]
+
+  - name: 养殖产业链
+    aliases: [养殖, 生猪, 肉鸡, 水产, 饲料, 动保]
+    upstream:
+      industries: [农产品加工, 化学制品]
+      keywords: [饲料原料, 豆粕, 玉米, 鱼粉, 氨基酸, 维生素, 疫苗原料, 兽药原料]
+    midstream:
+      industries: [养殖业, 饲料, 动物保健]
+      keywords: [种猪, 仔猪, 育肥猪, 白羽鸡, 黄羽鸡, 蛋鸡, 水产养殖, 疫苗, 兽药, 饲料, 预混料]
+    downstream:
+      industries: [食品加工, 商业百货]
+      keywords: [屠宰, 冷鲜肉, 肉制品, 熟食, 商超, 农贸市场, 餐饮, 预制菜]
+
+  - name: 汽车产业链
+    aliases: [汽车, 整车, 乘用车, 商用车]
+    upstream:
+      industries: [汽车零部件, 钢铁, 有色金属, 橡胶, 电子元件]
+      keywords: [钢材, 铝材, 玻璃, 轮胎, 芯片, 传感器, 线束, 模具, 铸件, 锻件, 内饰材料]
+    midstream:
+      industries: [汽车整车, 汽车零部件]
+      keywords: [整车制造, 发动机, 变速箱, 底盘, 车桥, 座椅, 空调, 车灯, 仪表, 安全气囊, ADAS, 域控制器, 线控底盘, 空气悬架]
+    downstream:
+      industries: [汽车服务, 汽车金融]
+      keywords: [4S店, 经销商, 维修保养, 二手车, 汽车金融, 汽车保险, 充电, 加油]
+
+  - name: 智能驾驶产业链
+    aliases: [智能驾驶, 自动驾驶, 智驾, ADAS, 无人驾驶]
+    upstream:
+      industries: [电子元件, 半导体, 软件开发]
+      keywords: [激光雷达, 毫米波雷达, 摄像头, 超声波雷达, 智驾芯片, Orin, Thor, 高精地图, 定位, V2X模组]
+    midstream:
+      industries: [汽车零部件, 软件开发]
+      keywords: [智驾域控, 域控制器, 智驾方案, 算法, 感知, 规控, 行泊一体, NOA, 端到端]
+    downstream:
+      industries: [汽车整车, 物流, 交通运输]
+      keywords: [Robotaxi, 无人配送, 智慧公交, 港口自动驾驶, 矿区自动驾驶, 干线物流]
+
+  - name: 汽车出海产业链
+    aliases: [汽车出海, 汽车出口, 汽车船, 整车出口]
+    upstream:
+      industries: [港口航运, 汽车零部件]
+      keywords: [汽车船, 滚装船, PCTC, RORO, 集装箱船, 港口码头, 报关, 海运, 中欧班列]
+    midstream:
+      industries: [汽车整车, 汽车零部件]
+      keywords: [整车出口, 新能源车出口, 海外KD工厂, 海外经销商网络, 海外建厂]
+    downstream:
+      industries: [汽车服务, 贸易行业, 物流]
+      keywords: [海外4S店, 海外售后, 充电桩出口, 电池回收出海, 海外金融]
+
+  - name: 消费电子产业链
+    aliases: [消费电子, 手机, TWS, 可穿戴, VR]
+    upstream:
+      industries: [电子元件, 半导体, 光学光电子]
+      keywords: [芯片, 传感器, PCB, FPC, 连接器, 声学器件, 摄像头模组, 显示面板, 盖板玻璃, 天线, 射频, 微型电池]
+    midstream:
+      industries: [消费电子, 电子制造]
+      keywords: [整机组装, ODM, OEM, 代工, SMT, 模组, 微型电机, 铰链, 结构件]
+    downstream:
+      industries: [互联网服务, 软件开发, 零售]
+      keywords: [手机品牌, TWS品牌, VR/AR头显, 智能手表, 智能音箱, 配件, 二手回收]
+
+  - name: 医药产业链
+    aliases: [医药, 制药, 化学药, 生物药]
+    upstream:
+      industries: [化学制药, 生物制品, 药用辅料]
+      keywords: [原料药, 中间体, API, 辅料, 培养基, 色谱填料, 层析介质, 反应器, 生物反应器]
+    midstream:
+      industries: [化学制药, 生物制品, 中药]
+      keywords: [化学药制剂, 生物药, 疫苗, 血制品, 中药, 胰岛素, 抗体, ADC, CAR-T, mRNA, 小核酸]
+    downstream:
+      industries: [医药商业, 医疗服务]
+      keywords: [医药流通, 药房, 医院, 互联网医疗, 医药电商, 医保, 集采]
+
+  - name: CXO产业链
+    aliases: [CXO, CRO, CDMO, 医药外包]
+    upstream:
+      industries: [化学制药, 专用设备, 科研仪器]
+      keywords: [试剂, 耗材, 色谱柱, 质谱仪, 反应釜, 冻干机, 实验室设备]
+    midstream:
+      industries: [医疗服务, 生物制品]
+      keywords: [药物发现, 临床前CRO, 临床CRO, CDMO, CMO, 制剂CDMO, 大分子CDMO, 基因治疗CDMO, SMO]
+    downstream:
+      industries: [化学制药, 生物制品]
+      keywords: [创新药企, Big Pharma, Biotech, 仿制药企]
+
+  - name: 医疗器械产业链
+    aliases: [医疗器械, 医疗设备, IVD, 耗材]
+    upstream:
+      industries: [电子元件, 化学制品, 塑料]
+      keywords: [传感器, 芯片, 光学器件, 电机, 泵, 阀, 高分子材料, 生物原料, 抗原抗体, 酶]
+    midstream:
+      industries: [医疗器械, 体外诊断]
+      keywords: [影像设备, CT, MRI, 超声, 内窥镜, 监护仪, 呼吸机, IVD, 化学发光, 分子诊断, POCT, 骨科植入, 心血管介入, 眼科耗材, 牙科]
+    downstream:
+      industries: [医疗服务, 医药商业]
+      keywords: [医院, 体检中心, 第三方检验, 经销商, 集采, DRG/DIP]
+
+  - name: 中药产业链
+    aliases: [中药, 中成药, 中药材, 配方颗粒]
+    upstream:
+      industries: [中药, 农产品加工]
+      keywords: [中药材种植, 饮片, 提取物, 标准汤剂, GAP基地]
+    midstream:
+      industries: [中药]
+      keywords: [中成药, 中药配方颗粒, 中药注射剂, 经典名方, OTC中药, 品牌中药]
+    downstream:
+      industries: [医药商业, 医疗服务]
+      keywords: [中药房, 中医院, 连锁药店, 电商, 保健品直销]
+
+  - name: 医美产业链
+    aliases: [医美, 轻医美, 光电医美, 注射]
+    upstream:
+      industries: [化学制品, 生物制品, 医疗器械]
+      keywords: [玻尿酸原料, 肉毒素原料, 胶原蛋白原料, 再生材料, PLLA, PCL, 激光器, 射频器]
+    midstream:
+      industries: [医疗器械, 生物制品]
+      keywords: [玻尿酸注射, 肉毒素, 胶原蛋白注射, 再生注射, 光电设备, 热玛吉, 超声刀]
+    downstream:
+      industries: [医疗服务]
+      keywords: [医美机构, 连锁诊所, 公立医院整形科, 医美平台, 新氧]
+
+  # ═══════════════════ 基建/地产类 ═══════════════════
+  - name: 房地产产业链
+    aliases: [房地产, 地产, 房建, 住宅]
+    upstream:
+      industries: [钢铁, 水泥建材, 玻璃玻纤, 工程机械]
+      keywords: [钢材, 水泥, 建材, 玻璃, 防水材料, 工程机械, 挖掘机, 混凝土, 管桩]
+    midstream:
+      industries: [房地产开发, 工程建设, 装修建材]
+      keywords: [房地产开发, 商品房, 住宅, 商业地产, 建筑施工, 装修装饰, 代建]
+    downstream:
+      industries: [物业服务, 家居用品, 家用电器, 房地产服务]
+      keywords: [物业, 家居, 家电, 房产中介, 租赁, 按揭, 长租公寓, 城市更新]
+
+  - name: 水泥建材产业链
+    aliases: [水泥, 建材, 混凝土]
+    upstream:
+      industries: [煤炭开采, 电力]
+      keywords: [石灰石, 黏土, 石膏, 矿渣, 粉煤灰]
+    midstream:
+      industries: [水泥建材]
+      keywords: [水泥熟料, 水泥粉磨, 特种水泥, 白水泥, 混凝土, 预拌砂浆, 骨料]
+    downstream:
+      industries: [工程建设, 房地产开发, 装修建材]
+      keywords: [房地产建设, 基建, 水利, 公路, 铁路, 桥梁, 隧道]
+
+  - name: 电力产业链
+    aliases: [电力, 发电, 电网, 特高压]
+    upstream:
+      industries: [煤炭开采, 专用设备, 有色金属]
+      keywords: [动力煤, 天然气, 风机, 光伏组件, 铀, 变压器, 开关, GIS, 电表, 线缆, 铁塔, 绝缘子]
+    midstream:
+      industries: [电力, 电网设备]
+      keywords: [火电, 水电, 核电, 风电, 光伏发电, 特高压, 柔直, 配电网, 智能电网, 抽水蓄能]
+    downstream:
+      industries: []
+      keywords: [工业用电, 商业用电, 居民用电, 充电桩, 数据中心用电, 电解铝]
+
+  - name: 核电产业链
+    aliases: [核电, 核能, 核电站]
+    upstream:
+      industries: [专用设备, 有色金属, 钢铁]
+      keywords: [核级设备, 压力容器, 蒸汽发生器, 主泵, 主管道, 堆内构件, U形管, 核级铸锻件, 核级焊材]
+    midstream:
+      industries: [电力, 工程建设]
+      keywords: [核电站建设, 核电运营, 核岛安装, 常规岛, BOP, 核燃料加工]
+    downstream:
+      industries: [电力]
+      keywords: [核电上网, 核能供热, 核能制氢, 同位素, 退役]
+
+  - name: 航运港口产业链
+    aliases: [航运, 港口, 海运, 物流]
+    upstream:
+      industries: [船舶制造, 专用设备, 钢铁]
+      keywords: [造船, 集装箱制造, 港口机械, 岸桥, 龙门吊, 柴油, 低硫油, 海员]
+    midstream:
+      industries: [港口航运, 物流]
+      keywords: [集装箱航运, 干散货, 油运, LNG运输, 汽车船, 滚装, 特种船, 港口码头]
+    downstream:
+      industries: [贸易行业, 制造业, 能源]
+      keywords: [进出口贸易, 跨境电商, 大宗商品贸易, 供应链, 货代, 报关]
+
+  # ═══════════════════ 金融类 ═══════════════════
+  - name: 银行产业链
+    aliases: [银行, 商业银行, 信贷]
+    upstream:
+      industries: [IT服务, 软件开发]
+      keywords: [核心银行系统, 支付系统, 风控系统, 征信, 数据服务, 现金设备, ATM]
+    midstream:
+      industries: [银行]
+      keywords: [国有大行, 股份行, 城商行, 农商行, 对公贷款, 零售贷款, 按揭, 理财, 存款]
+    downstream:
+      industries: []
+      keywords: [企业贷款, 个人贷款, 财富管理, 支付结算, 贸易金融, 投行]
+
+  - name: 券商产业链
+    aliases: [券商, 证券, 投行, 经纪]
+    upstream:
+      industries: [IT服务, 软件开发, 金融科技]
+      keywords: [交易系统, 行情数据, 资讯终端, 风控系统, 极速交易, 算法交易]
+    midstream:
+      industries: [证券]
+      keywords: [经纪业务, 投行, 资管, 自营, 研究, 两融, 衍生品, 做市, 财富管理]
+    downstream:
+      industries: []
+      keywords: [IPO, 再融资, 并购, 债券承销, 投资, 理财, 基金代销]
+
+  - name: 保险产业链
+    aliases: [保险, 寿险, 财险]
+    upstream:
+      industries: [IT服务, 医疗服务, 汽车服务]
+      keywords: [精算, 核保, 理赔系统, 健康管理, 汽车维修网络, 医院网络]
+    midstream:
+      industries: [保险]
+      keywords: [寿险, 健康险, 财险, 车险, 再保险, 年金, 养老险, 互联网保险]
+    downstream:
+      industries: []
+      keywords: [个人投保, 企业投保, 社保, 企业年金, 保险代理, 保险经纪]

@@ -1,0 +1,4 @@
+interface:
+  display_name: "莫大 A 股分析"
+  short_description: "运行五层框架分析 A 股标的"
+  default_prompt: "Use $moda-v3 to analyze an A-share stock."
