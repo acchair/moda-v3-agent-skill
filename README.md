@@ -1,4 +1,4 @@
-ChatGPT Image 2026年7月25日 20_24_27.png
+![image](https://github.com/acchair/moda-v3-agent-skill/blob/17a0930388984c2a90307d119618931949a2fcbb/ChatGPT%20Image%202026%E5%B9%B47%E6%9C%8825%E6%97%A5%2020_24_27.png)
 # 安装 moda-v3
 
 ## 让你的 Agent 按五层框架研究 A 股
