@@ -1,25 +1,43 @@
-# moda-v3 Agent Skill
+# Install moda-v3
 
-用于 Agent 的 A 股五层分析 Skill。它包含核心采集、技术因子、评分规则和来源标注；不包含网页工作台、浏览器二进制、登录状态、Cookie、历史报告或个人配置。
+## Give your Agent a disciplined A-share research workflow
 
-## 安装
+Choose your Agent. Copy one prompt. Your Agent does the rest.
 
-将本仓库目录放入 Agent 的 skills 目录，并保持目录名为 `moda-v3`。然后在该目录安装依赖：
+Five-factor research | Source-labeled evidence | Conservative hard caps
+
+## Set up your Agent
+
+### One-liner for your Agent
+
+Copy this prompt into an Agent with access to this private repository:
+
+```text
+Install the moda-v3 skill from https://github.com/acchair/moda-v3-agent-skill into your configured skills directory. Install requirements.txt, read SKILL.md, and preserve the repository-relative tools and knowledge directories.
+```
+
+### Platform compatibility
+
+| Platform | Skill folder | Status |
+|---|---|---|
+| Codex | `SKILL.md` + `agents/openai.yaml` | Recommended |
+| Any Agent that loads `SKILL.md` | Copy this repository to its skills directory | Supported |
+
+## What your Agent gets
+
+- A five-factor A-share analysis framework covering industry, shareholders, survival, profit realization, and valuation/reversal.
+- Local data-collection and technical-analysis scripts with source-labeled evidence.
+- Conservative ratings: `根`, `矛`, `学习仓`, or `不碰`; missing data stays `需人工确认`.
+
+## Run a research job
 
 ```powershell
 python -m pip install -r requirements.txt
-```
-
-## 使用
-
-Agent 读取根目录 `SKILL.md` 后，可运行：
-
-```powershell
 python tools/run_pipeline.py --stock 000001 --name 平安银行
 ```
 
-报告写入 `knowledge/research/`，最终答复可用 `tools/export_skill_output.py` 写入 `knowledge/output/`。设置 `MODA_OUTPUT_DIR` 可指定其他输出目录。
+Reports are written to `knowledge/research/`. Export the final Agent response with `tools/export_skill_output.py`; set `MODA_OUTPUT_DIR` to change its output directory.
 
-## 隐私与限制
+## Private by design
 
-不提交 `.env`、Token、Cookie、浏览器用户目录、本机日志和运行产物。可选代理仅从环境变量读取。浏览器增强和产业链网页工作台未随此核心包发布；相关结论应标记为 `需人工确认`。
+This repository does not include browser binaries, login state, Cookies, local logs, historical reports, the web workbench, or the industry-chain database. Optional proxy credentials are read only from environment variables and must never be committed.
