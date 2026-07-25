@@ -2,7 +2,7 @@
 
 ## 让你的 Agent 按五层框架研究 A 股
 
-选择 Agent，复制一段提示词，Agent 会完成安装和分析准备。
+选择你自己习惯的 Agent，复制一段提示词，Agent 会完成安装和分析准备。
 
 五层评分 | 数据来源标注 | 保守硬约束
 
@@ -49,6 +49,3 @@ python tools/run_pipeline.py --stock 000001 --name 平安银行
 
 报告写入 `knowledge/research/`。最终答复可通过 `tools/export_skill_output.py` 导出；设置 `MODA_OUTPUT_DIR` 可以更改导出目录。
 
-## 隐私边界
-
-仓库不包含浏览器二进制、登录状态、Cookie、本机日志、历史报告、网页工作台或产业链数据库。可选代理凭据只从环境变量读取，禁止提交到仓库。
