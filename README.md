@@ -1,89 +1,45 @@
-![image](https://github.com/acchair/moda-v3-agent-skill/blob/17a0930388984c2a90307d119618931949a2fcbb/ChatGPT%20Image%202026%E5%B9%B47%E6%9C%8825%E6%97%A5%2020_24_27.png)
+# moda-v3
 
-如果您觉得帮助到你进行选股,欢迎到雪球帖子下进行打赏
-![image](https://github.com/acchair/moda-v3-agent-skill/blob/2e50bfe35ad24b1cce924ab0a036db3b8d5d5971/_2026-07-31_000022_473.png)
-https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixin&data_type=link&data_model=utl&fix_uid=1500823973
+![moda-v3](./ChatGPT%20Image%202026%E5%B9%B47%E6%9C%8825%E6%97%A5%2020_24_27.png)
 
-# 如何安装 moda-v3
+面向 A 股研究的五层评分 Skill，支持数据来源标注、保守硬约束和固定格式输出。
 
-## 让你的 Agent 按五层框架研究 A 股
+> 五层评分 · 来源可追溯 · 缺失数据不猜测 · Hard Cap 风险控制
 
-选择你自己习惯的 Agent，复制一段提示词，Agent 会完成安装和分析准备。
+## 快速安装
 
-五层评分 | 数据来源标注 | 保守硬约束
-
-## 配置 Agent
-
-### 一段提示词
-
-将以下内容粘贴给可访问本私有仓库的 Agent：
+将下面的提示词交给可访问 GitHub 的 Agent：
 
 ```text
 请将 https://github.com/acchair/moda-v3-agent-skill 安装为 moda-v3 Skill：克隆到你的 skills 目录，安装 requirements.txt，读取 SKILL.md，并保持 tools 与 knowledge 的相对目录结构。随后按五层评分框架分析 A 股。
 ```
 
-### 兼容方式
-
-| 平台 | 使用方式 | 状态 |
-|---|---|---|
-| Codex | 读取 `SKILL.md` 与 `agents/openai.yaml` | 推荐 |
-| Claude Code | 将仓库放入其 Skills 目录后读取 `SKILL.md` | 支持 |
-| Hermes Agent | 粘贴上述提示词并授予私有仓库访问权限 | 支持 |
-| 其他支持 `SKILL.md` 的 Agent | 复制仓库到对应 Skills 目录 | 支持 |
-
-### 手机端
-![image](https://openminis.app/icon-dark.png)
-https://openminis.app/ 
-即可下载 openminis  Agent使用此skills
-
- 
-## 评分框架
-
-| 因子 | 满分 | 核心判断 |
-|---|---:|---|
-| F1 产业趋势与资本开支 | 30 | 行业景气、政策、供需、产能和订单 |
-| F2 股东与筹码 | 15 | 增减持、质押、解禁和股东户数 |
-| F3 生存能力与龙头 | 20 | 营收、利润、现金、负债和行业地位 |
-| F4 利润兑现路径 | 15 | 主营、订单、产能、收入和公告兑现 |
-| F5 低位与困境反转 | 20 | PE/PB、价格位置、估值和反转证据 |
-| 合计 | 100 | 仅对有来源的证据评分 |
-
-评级：`>=85 根`、`>=70 矛`、`>=55 学习仓`、`<55 不碰`。
-
-硬约束：ST 或退市风险直接为 `不碰`；控股股东或实控人减持最高为 `学习仓`；缺失数据一律标注 `需人工确认`，不得自动转为正面结论。
-
-## 运行分析
+也可以手动安装：
 
 ```powershell
+git clone https://github.com/acchair/moda-v3-agent-skill.git
+cd moda-v3-agent-skill
 python -m pip install -r requirements.txt
-python tools/run_pipeline.py --stock 000001 --name 平安银行
 ```
 
-报告写入 `knowledge/research/`。最终答复可通过 `tools/export_skill_output.py` 导出；设置 `MODA_OUTPUT_DIR` 可以更改导出目录。
+## 使用方法
 
-## 使用流程
-
-### 1. 给 Agent 下达任务
-
-直接提供股票名称或 6 位代码，例如：
+直接向 Agent 提供股票名称或六位股票代码，例如：
 
 ```text
-/moda-v3 中国平安或者股票代码
+/moda-v3 中国平安
+/moda-v3 601318
 ```
 
-### 2. 运行基础流水线
-
-Agent 自动确认代码后运行：
+Agent 会确认股票代码并运行基础流水线：
 
 ```powershell
 python tools/run_pipeline.py --stock 000001 --name 平安银行
 ```
 
-流水线先获取一次共享日K，并行生成基本面与行情、技术因子和公告互动报告，最后生成五层评分报告。基本面使用 easy_tdx/TDX 行业与同行快照，并通过 easy_tdx/Sina 获取三张财报。
+流水线会获取行情、财务、技术因子和公告数据，并生成五层评分报告。报告保存在 `knowledge/research/`。
 
-### 3. 读取报告并核对来源
-
-重点读取以下文件：
+重点报告：
 
 ```text
 knowledge/research/finance_data/000001.md
@@ -92,22 +48,84 @@ knowledge/research/announcements/000001.md
 knowledge/research/scoring/000001.md
 ```
 
-每项结论都保留来源标签；报告缺失、接口失败或无法交叉验证的字段统一标记为 `需人工确认`。
+## 输出格式
 
-### 4. 形成最终结论
+最终分析固定按以下顺序输出：
 
-按 F1 至 F5 汇总分数，再依次检查 ST/退市风险、控股股东或实控人减持、估值过热和产业逻辑证伪。结论只能使用 `根`、`矛`、`学习仓` 或 `不碰`。
+1. 总分、评级与技术信号
+2. 一句话结论
+3. 五层评分卡及 F1-F5 逐项诊断
+4. 修正项
+5. Hard Cap 检查
+6. 睡得着检查
+7. 动态纠错触发器
+8. 数据覆盖与待确认项
+9. 最终结论与免责声明
 
-### 5. 导出答复
+每个关键判断都标注实际数据来源。报告缺失、接口失败或无法交叉验证的内容统一标记为 `需人工确认`，不会自动转为正面结论。
 
-将最终答复写入 UTF-8 文本后执行：
+## 五层评分框架
+
+| 因子 | 满分 | 核心判断 |
+|---|---:|---|
+| F1 产业趋势与资本开支 | 30 | 行业景气、政策、供需、产能和订单 |
+| F2 股东与筹码 | 15 | 增减持、质押、解禁和股东户数 |
+| F3 生存能力与龙头 | 20 | 营收、利润、现金、负债和行业地位 |
+| F4 利润兑现路径 | 15 | 主营、订单、产能、收入和公告兑现 |
+| F5 低位与困境反转 | 20 | PE/PB、价格位置、估值和反转证据 |
+| **合计** | **100** | **仅对有来源的证据评分** |
+
+评级标准：
+
+| 分数 | 评级 |
+|---:|---|
+| `>=85` | 根 |
+| `70-84` | 矛 |
+| `55-69` | 学习仓 |
+| `<55` | 不碰 |
+
+Hard Cap：
+
+- ST 或退市风险：直接评为 `不碰`。
+- 控股股东或实控人减持：最高评为 `学习仓`。
+- F1 低于 15 分或 F3 低于 8 分：最高评为 `学习仓`。
+
+## 导出结果
+
+需要保存完整答复时，将最终内容写入 UTF-8 文本并执行：
 
 ```powershell
 python tools/export_skill_output.py --stock 000001 --name 平安银行 --input final.md
 ```
 
-默认导出到 `knowledge/output/`；可设置 `MODA_OUTPUT_DIR` 改为其他目录。
+默认导出到 `knowledge/output/`。可通过环境变量 `MODA_OUTPUT_DIR` 更改目录。
 
-## 隐私边界
+## 平台兼容
 
-仓库不包含浏览器二进制、登录状态、Cookie、本机日志或历史报告。可选代理凭据只从环境变量读取，禁止提交到仓库。
+| 平台 | 使用方式 | 状态 |
+|---|---|---|
+| Codex | 读取 `SKILL.md` 与 `agents/openai.yaml` | 推荐 |
+| Claude Code | 将仓库放入 Skills 目录并读取 `SKILL.md` | 支持 |
+| Hermes Agent | 使用安装提示词并授予仓库访问权限 | 支持 |
+| OpenMinis | 在手机端下载 Agent 并安装本 Skill | 支持 |
+| 其他支持 `SKILL.md` 的 Agent | 复制仓库到对应 Skills 目录 | 支持 |
+
+### 手机端
+
+[![OpenMinis](https://openminis.app/icon-dark.png)](https://openminis.app/)
+
+访问 [OpenMinis](https://openminis.app/) 下载手机端 Agent，即可安装并使用本 Skill。
+
+## 隐私与安全
+
+仓库不包含浏览器登录状态、Cookie、本机日志或历史分析报告。可选代理凭据只从环境变量读取，禁止写入代码、报告或提交记录。
+
+## 支持项目
+
+如果这个项目对选股研究有帮助，可以前往[雪球主页](https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixin&data_type=link&data_model=utl&fix_uid=1500823973)支持作者。
+
+[![支持作者](./_2026-07-31_000022_473.png)](https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixin&data_type=link&data_model=utl&fix_uid=1500823973)
+
+## 免责声明
+
+本项目仅供研究与学习，不构成任何投资建议。
