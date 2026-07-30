@@ -1,9 +1,6 @@
 akshare==1.18.37
 easy-tdx==1.19.0
 efinance==0.5.8
-fastapi==0.135.1
-Jinja2==3.1.6
 numpy==2.4.3
 pandas==2.3.3
 requests==2.32.5
-uvicorn==0.41.0

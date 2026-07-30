@@ -7,7 +7,7 @@ description: Analyze mainland China A-share stocks with the moda-v3 five-factor 
 
 ## Run
 
-1. Resolve a supplied stock name with the bundled chain database first: `python -c "from tools.webapp.chain_db import search; print(search('{name}', 5))"`. Use external search only when the local result is empty; if uncertain, state the ambiguity instead of guessing.
+1. Resolve a supplied stock name with the bundled market-data adapter first: `python -c "from tools.efinance.provider import search_stock; print(search_stock('{name}', 5))"`. Use external search only when the local result is empty; if uncertain, state the ambiguity instead of guessing.
 2. From this skill directory, run:
 
 ```powershell
@@ -37,7 +37,7 @@ Pass the response through standard input or `--input`. The default output direct
 
 ## Limits
 
-- Browser-based sentiment, login state, web workbench, and industry-chain database are intentionally excluded.
+- Browser UI, browser-based sentiment, login state, and the industry-chain database are intentionally excluded.
 - Overseas revenue and browser-only evidence remain `需人工确认`.
 - AxData is an optional enrichment adapter, disabled by default. Set `MODA_AXDATA=1` only for explicit validation; prefer bundled easy_tdx adapters for overlapping TDX/Sina capabilities.
 - Optional proxy credentials are read only from environment variables. Do not print, store, or add them to files.

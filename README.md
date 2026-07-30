@@ -105,18 +105,3 @@ python tools/export_skill_output.py --stock 000001 --name 平安银行 --input f
 ## 隐私边界
 
 仓库不包含浏览器二进制、登录状态、Cookie、本机日志或历史报告。可选代理凭据只从环境变量读取，禁止提交到仓库。
-
-## A股研究工作台
-
-```powershell
-python -m pip install -r requirements.txt
-python -m tools.webapp.start
-```
-
-终端会输出本地地址，默认从 `http://127.0.0.1:8765` 开始寻找可用端口。工作台提供研究池、产业图谱、特征矩阵、股票列表、主动发现和 A 股市场压力，并可直接运行当前 5 模块流水线。
-
-- 产业候选只使用 SQLite 中的精确行业关系。
-- 行情优先使用 `easy_tdx`，失败时保留缺失状态。
-- 压力分数至少需要 70% 指标权重，否则不输出总分。
-- `market_dashboard.db` 和 `workbench.db` 是本地可变数据，不提交到仓库。
-- `/dashboard` 保留为兼容入口并跳转到统一工作台。

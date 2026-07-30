@@ -72,68 +72,12 @@ AxData 已完成接口调研。财务与公司侧可用 `stock_finance_summary_t
 
 2026-07-30 对 `300820` 复核确认：easy_tdx 可直接返回“其他发电设备”行业及 25 家成分股的实时 PE、TTM PE、每股净资产和市值；easy_tdx/Sina 可返回利润表、资产负债表和现金流量表。因此当前先复用已有适配器，只有需要历史 PE/PB Band 或股东增减持增强时再评估 AxData。
 
-## 5. CloakBrowser
-
-### 已验证
-
-- 自动后台启动和端口 `9222` 检测可用。
-- 保留包内 `user-data` 登录状态。
-- 雪球热帖实测 10 条。
-- 东财股吧实测 20 条并按作者去重。
-- 东财F10无地区数据时，同花顺主营页面可作为出口占比备用。
-
-### 风险
-
-- 页面结构变化会使选择器失效。
-- 登录 Cookie 和浏览器用户目录属于敏感本地状态，不应提交或外传。
-- 同花顺地区分类需要保留原始行，避免把产品分类误判为地区收入。
-
-## 6. 乐咕乐股
-
-旧实现从 HTML 表格提取行业拥挤度，但当前页面已改为图表组件。新实现通过 CloakBrowser 页面上下文读取其实际 JSON 接口。
-
-实测结果：
-
-- 取得 131 个申万二级行业。
-- easy_tdx 将平安银行映射到“股份制银行”。
-- 行业拥挤度状态为 `neutral`。
-- 全市场拥挤度仍由 AKShare `stock_a_congestion_lg` 提供。
-- 市场宽度页面仍依赖网页结构，应视为增强证据而非硬依赖。
-
-## 7. QVeris 备用调研
+## 5. QVeris 备用调研
 
 QVeris 的 Gildata A 股公告工具已验证可返回有效公告，但会消耗额度。当前 easy_tdx/CNINFO 公告链已可用，因此没有把 QVeris 加入生产依赖。
 
-## 8. A 股市场看板数据口径
+## 6. 当前端到端基线
 
-市场看板不调用乐咕乐股会员接口。行业面板通过项目现有 `a_stock_data_provider._get_json` 请求东方财富公开行业列表 `push2 ... /clist/get` 及行业板块日线 `push2his ... /stock/kline/get`；已验证 `90.BK1027` 日线可返回历史成交额。首屏只显示已经取得的真实快照与 SQLite 缓存，后台再按板块补齐最多 60 个交易日。占比的分母为同日已取得行业板块成交额之和，横截面排名用于红高绿低热力色，不将缺失日期、行业或成交额填为零。若东方财富临时断连且本地缓存为空，`easy_tdx` 当前行业排行作为无日期快照降级，按该接口返回集合计算比例，绝不伪装为历史数据。
-
-融资面板使用 AKShare `macro_china_market_margin_sh` 与 `macro_china_market_margin_sz` 的融资买入额，按共同交易日合并；上证指数日线优先使用 `stock_zh_index_daily_em`，失败时尝试 `stock_zh_index_daily`。分母使用 `stock_sse_deal_daily` 的主板 A 股与科创板成交金额（该接口为亿元，转换为元），加上 `stock_szse_summary` 的主板 A 股与创业板 A 股成交金额（元）。这一定义为“沪深 A 股融资买入 / 成交额”，不含北交所，也不再使用上证指数成交额代理。四个成交额分项任一缺失，`market_turnover` 与 `ratio` 均为 `null`。
-
-状态语义：`LIVE` 表示本次在线数据完整，`CACHE` 表示进程或本地 SQLite 缓存可读，`PARTIAL` 表示日期、行业、融资侧或成交额分母不完整，`UNAVAILABLE` 表示没有可展示数据，`SYNCING` 表示已返回真实可读数据但后台尚在补齐。接口同时返回来源、数据日期、缓存年龄、同步进度和失败原因，便于复核。
-
-## 9. 当前端到端基线
-
-当前 `tools/run_pipeline.py` 先用 easy_tdx 获取一次共享日K，再并行执行 `finance_data`、`tdx_analysis` 和 `announcements`，最后执行 `scoring`。网页工作台直接调用该入口，不维护独立模块清单。
+当前 `tools/run_pipeline.py` 先用 easy_tdx 获取一次共享日 K，再并行执行 `finance_data`、`tdx_analysis` 和 `announcements`，最后执行 `scoring`。
 
 每个模块同时检查退出码和报告更新时间，评分器只接收本次成功模块的新报告，最终状态写入 `knowledge/research/pipeline/{code}.json`。外部数据源失败时保留模块错误，不能把旧报告冒充为本次成功结果。
-
-## 10. Webapp 参考项目
-
-本次工作台参考 `yaoleifly/ai-stock-pool` 的信息组织方式：左侧筛选、顶部决策摘要、图谱/矩阵/列表多视图、主动发现和压力指标。
-
-采用内容：
-
-- 紧凑研究工作台布局；
-- 候选与正式研究池分离；
-- 每项指标展示来源、日期和缺失状态；
-- 原生 JavaScript、CSS 和 SVG。
-
-未采用内容：
-
-- 美股股票池和跨市场映射；
-- 新闻、arXiv 和美国政策压力数据；
-- Yahoo Finance 行情依赖；
-- 参考项目的静态数据文件和部署链。
-
-moda v3 的候选来自本地行业成交额历史与精确产业关系，市场压力来自融资占比、上证指数和行业成交结构。

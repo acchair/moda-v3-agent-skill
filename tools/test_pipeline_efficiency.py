@@ -14,7 +14,6 @@ from tools.akshare import announcements, finance_data
 from tools import run_pipeline
 from tools.scoring import grader
 from tools.providers import axdata_provider
-from tools.webapp import runner
 
 
 class PipelineEfficiencyTest(unittest.TestCase):
@@ -114,23 +113,6 @@ class PipelineEfficiencyTest(unittest.TestCase):
             result = announcements.fetch_announcements("300820", days=30)
         fetch.assert_called_once()
         self.assertEqual(result["total"], 1)
-
-    def test_running_stock_job_is_reused(self) -> None:
-        runner.JOBS.clear()
-        with patch.object(runner.threading, "Thread") as thread:
-            first = runner.start_stock_job("300820", "英杰电气")
-            second = runner.start_stock_job("300820", "英杰电气")
-        self.assertEqual(first, second)
-        self.assertEqual(thread.call_count, 1)
-        runner.JOBS.clear()
-
-    def test_batch_stocks_are_deduplicated(self) -> None:
-        runner.JOBS.clear()
-        with patch.object(runner.threading, "Thread"):
-            job_id = runner.start_batch_job([{"code": "300820"}, {"code": "300820"}])
-        self.assertEqual(len(runner.JOBS[job_id]["payload"]["stocks"]), 1)
-        runner.JOBS.clear()
-
 
 if __name__ == "__main__":
     unittest.main()
