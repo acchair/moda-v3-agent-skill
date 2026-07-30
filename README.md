@@ -116,15 +116,17 @@ python tools/export_skill_output.py --stock 000001 --name 平安银行 --input f
 
 访问 [OpenMinis](https://openminis.app/) 下载手机端 Agent，即可安装并使用本 Skill。
 
+## 支持项目
+
+如果这个项目对选股研究有帮助，可以前往[雪球主页](https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixin&data_type=link&data_model=utl&fix_uid=1500823973)打开任意帖子进行打赏作者。
+
+[![支持作者](./_2026-07-31_000022_473.png)](https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixin&data_type=link&data_model=utl&fix_uid=1500823973)
+
 ## 隐私与安全
 
 仓库不包含浏览器登录状态、Cookie、本机日志或历史分析报告。可选代理凭据只从环境变量读取，禁止写入代码、报告或提交记录。
 
-## 支持项目
 
-如果这个项目对选股研究有帮助，可以前往[雪球主页](https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixin&data_type=link&data_model=utl&fix_uid=1500823973)支持作者。
-
-[![支持作者](./_2026-07-31_000022_473.png)](https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixin&data_type=link&data_model=utl&fix_uid=1500823973)
 
 ## 免责声明
 
