@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>莫大 v3 A股研究工作台</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260727-workbench">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-mark" aria-hidden="true">M3</div>
+    <div class="brand-copy">
+      <h1>莫大 v3 A股研究工作台</h1>
+      <p>产业链 · 五层评分 · 研究优先级</p>
+    </div>
+    <div class="topbar-status">
+      <span id="connectionDot" class="live-dot"></span>
+      <span id="statusLine">正在检查数据源</span>
+      <button id="refreshAll" class="icon-btn" type="button" title="刷新工作台" aria-label="刷新工作台">↻</button>
+    </div>
+  </header>
+
+  <div class="workbench">
+    <aside class="filter-panel" aria-label="研究池筛选">
+      <div class="search-box">
+        <input id="searchInput" type="search" placeholder="代码、公司或行业" autocomplete="off">
+        <button id="searchBtn" class="icon-btn" type="button" title="搜索" aria-label="搜索">⌕</button>
+      </div>
+      <div id="searchResults" class="search-results" hidden></div>
+
+      <section class="filter-group">
+        <div class="filter-heading"><h2>研究状态</h2><button id="resetFilters" class="text-btn" type="button">重置</button></div>
+        <div id="stateFilter" class="segmented vertical" role="group" aria-label="研究状态">
+          <button type="button" class="active" data-state="">全部</button>
+          <button type="button" data-state="core">核心跟踪</button>
+          <button type="button" data-state="watch">观察研究</button>
+        </div>
+      </section>
+
+      <section class="filter-group">
+        <div class="filter-heading"><h2>行业</h2><span id="industryCount">0</span></div>
+        <select id="industryFilter" aria-label="行业筛选"><option value="">全部行业</option></select>
+      </section>
+
+      <section class="source-block">
+        <span>数据原则</span>
+        <p>只展示真实来源。行情、评分或行业历史缺失时保留为空。</p>
+      </section>
+    </aside>
+
+    <main class="main-panel">
+      <section id="summaryStrip" class="summary-strip" aria-label="研究池摘要">
+        <div><span>当前标的</span><strong id="poolMetric">0</strong></div>
+        <div><span>已分析</span><strong id="analyzedMetric">0</strong></div>
+        <div><span>核心跟踪</span><strong id="coreMetric">0</strong></div>
+        <div class="accent"><span>数据缺口</span><strong id="gapMetric">0</strong></div>
+      </section>
+
+      <section id="decisionPanel" class="decision-panel">
+        <div>
+          <span class="eyebrow">今日研究优先级</span>
+          <h2 id="decisionTitle">正在整理候选</h2>
+          <p id="decisionText">行业升温数据就绪后显示待研究标的。</p>
+        </div>
+        <button id="openDiscovery" class="secondary" type="button">查看候选</button>
+      </section>
+
+      <div class="view-bar">
+        <nav class="view-tabs" aria-label="工作台视图">
+          <button type="button" class="active" data-view="graph"><span aria-hidden="true">⌘</span>关联图谱</button>
+          <button type="button" data-view="matrix"><span aria-hidden="true">▦</span>特征矩阵</button>
+          <button type="button" data-view="list"><span aria-hidden="true">☷</span>股票列表</button>
+          <button type="button" data-view="discovery"><span aria-hidden="true">◎</span>主动发现</button>
+          <button type="button" data-view="pressure"><span aria-hidden="true">∿</span>市场压力</button>
+        </nav>
+        <span class="visible-count">显示 <strong id="visibleCount">0</strong> / <span id="totalCount">0</span></span>
+      </div>
+
+      <section id="graphView" class="content-view active" data-panel="graph">
+        <div class="graph-toolbar">
+          <div class="segmented compact" id="graphFilter">
+            <button type="button" class="active" data-kind="all">全部关系</button>
+            <button type="button" data-kind="industry">行业</button>
+            <button type="button" data-kind="product">产品</button>
+          </div>
+          <div class="graph-actions">
+            <button id="zoomOut" class="icon-btn" type="button" title="缩小" aria-label="缩小">−</button>
+            <span id="zoomLabel">100%</span>
+            <button id="zoomIn" class="icon-btn" type="button" title="放大" aria-label="放大">+</button>
+            <button id="zoomReset" class="icon-btn" type="button" title="复位" aria-label="复位">⌂</button>
+          </div>
+        </div>
+        <div class="graph-layout">
+          <div id="graphCanvas" class="graph-canvas empty-state">从研究池、搜索结果或候选中选择股票。</div>
+          <aside id="graphInsight" class="graph-insight"><h3>产业关系</h3><p>选择标的后显示公司、产品和上下游行业。</p></aside>
+        </div>
+      </section>
+
+      <section id="matrixView" class="content-view" data-panel="matrix">
+        <div class="table-wrap"><table class="data-table"><thead><tr><th>代码 / 公司</th><th>行业</th><th>评分</th><th>评级</th><th>价格</th><th>涨跌</th><th>状态</th><th>数据</th></tr></thead><tbody id="matrixBody"></tbody></table></div>
+      </section>
+
+      <section id="listView" class="content-view" data-panel="list">
+        <div id="stockList" class="stock-list"></div>
+      </section>
+
+      <section id="discoveryView" class="content-view" data-panel="discovery">
+        <div class="panel-head"><div><span class="eyebrow">INDUSTRY WARMING</span><h2>主动发现</h2><p id="discoveryNote">按精确行业关系生成研究候选，不自动入池。</p></div><button id="refreshDiscovery" class="secondary" type="button">刷新候选</button></div>
+        <div id="discoveryList" class="discovery-list"><div class="empty-state">切换到本视图后加载候选。</div></div>
+      </section>
+
+      <section id="pressureView" class="content-view" data-panel="pressure">
+        <div class="panel-head"><div><span class="eyebrow">A-SHARE MARKET PRESSURE</span><h2>A股市场压力</h2><p>分数越高表示市场约束越强，不构成投资建议。</p></div><button id="refreshPressure" class="secondary" type="button">刷新数据</button></div>
+        <div id="pressureHero" class="pressure-hero"><div><span>综合压力</span><strong>-</strong></div><p>等待数据</p></div>
+        <div id="pressureFactors" class="factor-grid"></div>
+        <div id="pressureTrend" class="trend-panel"></div>
+      </section>
+    </main>
+  </div>
+
+  <aside id="detailDrawer" class="detail-drawer" aria-label="股票详情" aria-hidden="true">
+    <div class="drawer-head"><div><span id="drawerCode" class="eyebrow"></span><h2 id="drawerTitle">股票详情</h2></div><button id="closeDrawer" class="icon-btn" type="button" title="关闭" aria-label="关闭">×</button></div>
+    <div id="drawerContent" class="drawer-content"></div>
+  </aside>
+  <div id="drawerBackdrop" class="drawer-backdrop" hidden></div>
+
+  <details id="taskDock" class="task-dock">
+    <summary><span>任务终端</span><span id="jobBadge" class="status-badge">无任务</span></summary>
+    <div class="task-body">
+      <div id="jobModules" class="job-modules"></div>
+      <pre id="terminalOutput" class="terminal-output">等待分析任务...</pre>
+    </div>
+  </details>
+
+  <script src="/static/app.js?v=20260727-workbench"></script>
+</body>
+</html>

@@ -108,10 +108,7 @@ def fetch_realtime_quotes(code: str) -> dict[str, Any]:
     """Fetch realtime quote for one A-share code from efinance."""
     try:
         ef = _load_efinance()
-        try:
-            df = ef.stock.get_latest_quote(stock_codes=code)
-        except Exception:
-            df = ef.stock.get_realtime_quotes()
+        df = ef.stock.get_latest_quote(stock_codes=code)
         if df is None or df.empty:
             return {}
 
