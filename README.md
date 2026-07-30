@@ -1,5 +1,10 @@
 ![image](https://github.com/acchair/moda-v3-agent-skill/blob/17a0930388984c2a90307d119618931949a2fcbb/ChatGPT%20Image%202026%E5%B9%B47%E6%9C%8825%E6%97%A5%2020_24_27.png)
-# 安装 moda-v3
+
+如果您觉得帮助到你进行选股,欢迎到雪球帖子下进行打赏
+![image](https://github.com/acchair/moda-v3-agent-skill/blob/2e50bfe35ad24b1cce924ab0a036db3b8d5d5971/_2026-07-31_000022_473.png)
+https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixin&data_type=link&data_model=utl&fix_uid=1500823973
+
+# 如何安装 moda-v3
 
 ## 让你的 Agent 按五层框架研究 A 股
 
