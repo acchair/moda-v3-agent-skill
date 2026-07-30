@@ -1,7 +1,7 @@
 """
-AKShare 公告 + 互动易数据模块
-=============================
-采集个股最新公告(东方财富)和投资者互动问答(巨潮资讯互动易)，
+公告 + 互动易数据模块
+====================
+采集个股最新公告(easy_tdx/CNINFO)和投资者互动问答(AKShare/CNINFO)，
 输出结构化 Markdown 报告供莫大分析参考。
 
 用法:
@@ -9,6 +9,7 @@ AKShare 公告 + 互动易数据模块
     python3 tools/akshare/announcements.py --stock 002466,603290 --days 7
 """
 import time, sys, os, argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -17,6 +18,7 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools/akshare"))
 
 # ══ 反限流 ══
@@ -81,50 +83,42 @@ def fetch_irm_qa(code: str, name: str = None) -> dict:
 
 
 def fetch_announcements(code: str, name: str = None, days: int = 7) -> dict:
-    """获取东方财富个股公告 (过滤)"""
-    print(f"  [公告] 获取近{days}天公告 (过滤 {code}) ...")
-    ann_list = []
-    errors = []
+    """单次查询个股公告，失败时回退 CloakBrowser。"""
+    days = max(1, int(days))
+    print(f"  [公告] CNINFO 单次查询近{days}天公告 ({code}) ...")
+    ann_list: list[dict] = []
+    error = ""
+    try:
+        from tools.providers.easy_tdx_provider import fetch_announcements as fetch_cninfo
 
-    for i in range(days):
-        date_str = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
+        df = fetch_cninfo(code, count=max(30, min(days * 2, 100)))
+        if df is not None and not df.empty:
+            cutoff = pd.Timestamp(datetime.now().date() - timedelta(days=days - 1))
+            dates = pd.to_datetime(df["date"], errors="coerce")
+            for _, row in df[dates >= cutoff].iterrows():
+                ann_list.append({
+                    "date": str(row.get("date", ""))[:10],
+                    "title": str(row.get("title", "")).strip(),
+                    "type": str(row.get("type", "")).strip(),
+                    "url": str(row.get("url", "")).strip(),
+                })
+        ann_list.sort(key=lambda item: item["date"], reverse=True)
+        print(f"  [公告] easy_tdx/CNINFO: {len(ann_list)} 条")
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        print(f"  [公告] easy_tdx/CNINFO失败: {error}")
         try:
-            df = ak.stock_notice_report(symbol="全部", date=date_str)
-            if df is not None and not df.empty and "代码" in df.columns:
-                # 过滤目标股票代码
-                mask = df["代码"].astype(str).str.strip() == code
-                matched = df[mask]
-                for _, row in matched.iterrows():
-                    ann_list.append({
-                        "date": date_str,
-                        "title": str(row.get("公告标题", "")).strip(),
-                        "type": str(row.get("公告类型", "")).strip(),
-                        "url": str(row.get("网址", "")).strip(),
-                    })
-            time.sleep(0.15)  # 避免请求过快
-        except Exception as e:
-            errors.append(f"  [公告] {date_str} 失败: {str(e)[:60]}")
-
-    ann_list.sort(key=lambda x: x["date"], reverse=True)
-    print(f"  [公告] AKShare: {len(ann_list)} 条 (近{days}天)")
-    if errors:
-        for e in errors[:3]:
-            print(e)
-
-    # ── AKShare结果太少 → 回退 CloakBrowser ──
-    if len(ann_list) == 0 and len(errors) > days / 2:
-        try:
-            print(f"  [公告] AKShare多数失败，尝试 CloakBrowser 备用...")
+            print("  [公告] 尝试 CloakBrowser 备用...")
             from cninfo_backup import fetch_cninfo_announcements
             cninfo_ann = fetch_cninfo_announcements(code, name, days)
             if cninfo_ann:
                 ann_list = cninfo_ann
                 ann_list.sort(key=lambda x: x.get("date", ""), reverse=True)
                 print(f"  [公告] CloakBrowser备用: {len(ann_list)} 条")
-        except Exception as e:
-            print(f"  [公告] CloakBrowser备用也失败: {e}")
+        except Exception as fallback_exc:
+            print(f"  [公告] CloakBrowser备用也失败: {fallback_exc}")
 
-    return {"total": len(ann_list), "ann_list": ann_list, "days": days}
+    return {"total": len(ann_list), "ann_list": ann_list, "days": days, "error": error}
 
 
 def extract_keywords_from_qa(qa_list: list) -> dict:
@@ -169,7 +163,7 @@ def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str
         f"# 公告与互动: {name or code}({code})",
         f"",
         f"> 采集时间: {ts}",
-        f"> 数据源: 东方财富公告 + 巨潮资讯互动易",
+        f"> 数据源: easy_tdx/CNINFO 公告 + AKShare/CNINFO 互动易",
         f"",
         "---",
         f"",
@@ -244,7 +238,7 @@ def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str
         "---",
         "## 免责声明",
         "",
-        "数据来自东方财富和巨潮资讯网公开信息，仅供信息参考，不构成投资建议。",
+        "数据来自 easy_tdx、AKShare 和巨潮资讯网公开信息，仅供信息参考，不构成投资建议。",
     ]
     return "\n".join(lines)
 
@@ -257,10 +251,11 @@ def process_stock(code: str, name: str = None, days: int = 7):
     print(f"  公告+互动易: {name}({code})  (近{days}天)")
     print(f"{'='*55}")
 
-    # 并行获取 (串行避免被封)
-    irm_data = fetch_irm_qa(code, name)
-    time.sleep(0.3)
-    ann_data = fetch_announcements(code, name, days)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        irm_future = executor.submit(fetch_irm_qa, code, name)
+        ann_future = executor.submit(fetch_announcements, code, name, days)
+        irm_data = irm_future.result()
+        ann_data = ann_future.result()
 
     # 生成报告
     report = generate_report(code, name, irm_data, ann_data)

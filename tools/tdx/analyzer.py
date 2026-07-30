@@ -18,6 +18,7 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT))
 OUTPUT_BASE = ROOT / "knowledge/research/tdx_analysis"
 OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
@@ -674,8 +675,20 @@ class AlphaSorosAnalyzer:
 #  Main: 从 AKShare 取数 → 通达信分析 → 报告
 # ══════════════════════════════════════════════════════
 
-def fetch_daily_kline(code: str) -> pd.DataFrame:
-    """获取日K线数据 (复用 finance_data 的数据源逻辑)"""
+def fetch_daily_kline(code: str, kline_file: Path | None = None) -> pd.DataFrame:
+    """获取日K线数据，优先使用本次流水线共享文件。"""
+    if kline_file and kline_file.stem == code and kline_file.exists():
+        return pd.read_csv(kline_file, parse_dates=["date"])
+
+    try:
+        from tools.providers.easy_tdx_provider import fetch_kline_daily
+
+        df = fetch_kline_daily(code)
+        if not df.empty:
+            return df
+    except Exception as e:
+        print(f"  [数据] easy_tdx失败: {e}")
+
     import akshare as ak
 
     # 方案1: 东财
@@ -705,7 +718,7 @@ def fetch_daily_kline(code: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def analyze_stock(code: str, name: str = None) -> str:
+def analyze_stock(code: str, name: str = None, kline_file: Path | None = None) -> str:
     if not name:
         name = code
 
@@ -714,7 +727,7 @@ def analyze_stock(code: str, name: str = None) -> str:
     print(f"{'='*55}")
 
     print("[1/2] 获取日K线 ...")
-    df = fetch_daily_kline(code)
+    df = fetch_daily_kline(code, kline_file)
     if df.empty:
         print("  !! 无法获取 K 线数据")
         return ""
@@ -729,12 +742,13 @@ def main():
     p = argparse.ArgumentParser(description="通达信 ALPHA-SOROS 技术分析 (日K版)")
     p.add_argument("--stock", required=True, help="股票代码 (如 603290)")
     p.add_argument("--name", help="股票名称 (选填)")
+    p.add_argument("--kline-file", type=Path, help="本次流水线共享的日K文件")
     args = p.parse_args()
 
     codes = [c.strip() for c in args.stock.split(",")]
     for code in codes:
         try:
-            analyze_stock(code, args.name)
+            analyze_stock(code, args.name, args.kline_file)
         except Exception as e:
             print(f"[Error] {code}: {e}")
             import traceback

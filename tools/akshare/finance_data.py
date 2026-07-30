@@ -1,15 +1,16 @@
 """
-AKShare 个股基本面 + 行情数据模块 (独立模块 v1)
-===============================================
-集成 AKShare 获取 A 股实时行情、历史 K 线、财务指标、同行比较，
+个股基本面 + 行情数据模块
+========================
+集成 easy_tdx、Sina、efinance 和 AKShare 获取 A 股行情与基本面数据，
 输出结构化 Markdown 报告供莫大 persona 参考。
 
-数据源优先级: 东方财富 → 新浪 → 腾讯
+数据源优先级: easy_tdx/TDX/Sina → efinance/AKShare
 用法:
     python3 tools/akshare/finance_data.py --stock 603290 --name 斯达半导
     python3 tools/akshare/finance_data.py --stock 603290,600460
 """
-import time, sys, os, argparse
+import time, sys, os, argparse, json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -17,6 +18,7 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools/akshare"))
 
 # ══ 反限流: 必须在 import akshare 之前 ══
@@ -43,8 +45,23 @@ OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 #  Data Fetchers (each with fallback)
 # ══════════════════════════════════════════════════════
 
-def fetch_kline_daily(code: str) -> pd.DataFrame:
-    """日K线: 优先东财, 回退新浪"""
+def fetch_kline_daily(code: str, kline_file: Path | None = None) -> pd.DataFrame:
+    """日K线: 本次共享缓存 → easy_tdx → 东财 → 新浪。"""
+    if kline_file and kline_file.stem == code and kline_file.exists():
+        df = pd.read_csv(kline_file, parse_dates=["date"])
+        print(f"  [日K] 共享缓存 → {len(df)} 条")
+        return df
+
+    try:
+        from tools.providers.easy_tdx_provider import fetch_kline_daily as fetch_easy_tdx_kline
+
+        df = fetch_easy_tdx_kline(code)
+        if not df.empty:
+            print(f"  [日K] easy_tdx → {len(df)} 条")
+            return df
+    except Exception as e:
+        print(f"  [日K] easy_tdx失败: {e}")
+
     # 方案1: 东财 (最近一年)
     try:
         df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
@@ -74,26 +91,14 @@ def fetch_kline_daily(code: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def fetch_kline_quarterly(code: str) -> pd.DataFrame:
-    """季K线: 用月K降采样 (AKShare 不直接支持季度)"""
-    print(f"  [季K] 从月K降采样 ...", end=" ")
-    try:
-        # 优先东财月K
-        df = ak.stock_zh_a_hist(symbol=code, period="monthly", adjust="qfq")
-        if df.empty:
-            raise ValueError("月K空")
-        df = df.rename(columns=EM_COL_MAP_DAILY)
-        df["date"] = pd.to_datetime(df["date"])
-    except Exception:
-        # 回退: 用新浪日K聚合
-        pfx = "sh" if code[0] == "6" else "sz"
-        try:
-            df = ak.stock_zh_a_daily(symbol=f"{pfx}{code}", adjust="qfq")
-            df = df.rename(columns=SINA_COL_MAP)
-            df["date"] = pd.to_datetime(df["date"])
-        except Exception as e:
-            print(f"失败: {e}")
-            return pd.DataFrame()
+def fetch_kline_quarterly(code: str, daily: pd.DataFrame | None = None) -> pd.DataFrame:
+    """季K线: 从已取得的日K本地聚合。"""
+    print("  [季K] 从日K降采样 ...", end=" ")
+    df = daily.copy() if daily is not None else fetch_kline_daily(code)
+    if df.empty:
+        print("失败: 日K为空")
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"])
 
     # 降采样到季度
     df = df.set_index("date")
@@ -110,89 +115,86 @@ def fetch_kline_quarterly(code: str) -> pd.DataFrame:
 
 
 def fetch_spot(code: str) -> dict:
-    """实时行情: 优先东财全量表, 回退新浪"""
-    # 方案1: 东财
+    """实时行情: easy_tdx 单股查询，回退 efinance 单股查询。"""
     try:
-        df = ak.stock_zh_a_spot_em()
-        row = df[df["代码"] == code]
-        if not row.empty:
-            r = row.iloc[0]
-            print(f"  [行情] 东财 → {r.get('最新价', 'N/A')}")
-            return {
-                "source": "东方财富",
-                "最新价": r.get("最新价"), "涨跌幅": r.get("涨跌幅"),
-                "涨跌额": r.get("涨跌额"), "换手率": r.get("换手率"),
-                "量比": r.get("量比"), "市盈率-动态": r.get("市盈率-动态"),
-                "市净率": r.get("市净率"), "总市值": r.get("总市值"),
-                "流通市值": r.get("流通市值"),
-                "60日涨跌幅": r.get("60日涨跌幅"),
-                "年初至今涨跌幅": r.get("年初至今涨跌幅"),
-            }
-    except Exception as e:
-        print(f"  [行情] 东财失败: {e}")
+        from tools.providers.easy_tdx_provider import fetch_realtime_quote
 
-    # 方案2: 新浪
-    try:
-        df = ak.stock_zh_a_spot()
-        pfx = "sh" if code[0] == "6" else "sz"
-        col_code = [c for c in df.columns if "代码" in c or "code" in c.lower()]
-        code_col = col_code[0] if col_code else df.columns[0]
-        row = df[df[code_col].str.contains(code, na=False)]
-        if not row.empty:
-            r = row.iloc[0]
-            print(f"  [行情] 新浪 → {r.iloc[2] if len(r) > 2 else 'N/A'}")
-            # 新浪列序: 代码, 名称, 最新价, 涨跌额, 涨跌幅, 买价, 卖价, ...
-            cols = df.columns.tolist()
-            result = {"source": "新浪"}
-            if len(cols) > 2: result["最新价"] = r.iloc[2]
-            if len(cols) > 3: result["涨跌额"] = r.iloc[3]
-            if len(cols) > 4: result["涨跌幅"] = r.iloc[4]
+        result = fetch_realtime_quote(code)
+        if result:
+            print(f"  [行情] easy_tdx → {result.get('最新价', 'N/A')}")
             return result
     except Exception as e:
-        print(f"  [行情] 新浪失败: {e}")
+        print(f"  [行情] easy_tdx失败: {e}")
+
+    try:
+        from tools.efinance.provider import fetch_realtime_quotes
+
+        result = fetch_realtime_quotes(code)
+        if result:
+            print(f"  [行情] efinance → {result.get('最新价', 'N/A')}")
+            return result
+    except Exception as e:
+        print(f"  [行情] efinance失败: {e}")
 
     return {}
 
 
-def fetch_company_info(code: str) -> dict:
-    """公司信息: 东财"""
+def fetch_company_and_peers(code: str) -> tuple[dict, pd.DataFrame]:
+    """从所属行业板块一次取得行业标签和同行估值快照。"""
+    from tools.providers.easy_tdx_provider import fetch_belong_boards, fetch_board_members
+
     try:
-        df = ak.stock_individual_info_em(symbol=code)
-        if not df.empty:
-            info = {}
-            for _, row in df.iterrows():
-                k = str(row.get("item", ""))
-                v = row.get("value", "")
-                if k and pd.notna(v):
-                    info[k] = str(v)
-            print(f"  [信息] → {len(info)} 项")
-            return info
+        boards = fetch_belong_boards(code)
     except Exception as e:
-        print(f"  [信息] 东财失败: {e}")
-    return {}
+        print(f"  [行业] easy_tdx失败: {e}")
+        return {}, pd.DataFrame()
+    if boards is None or boards.empty:
+        return {}, pd.DataFrame()
 
+    industries = boards[pd.to_numeric(boards["board_type"], errors="coerce") == 12]
+    if industries.empty:
+        return {}, pd.DataFrame()
+    names = list(dict.fromkeys(industries["board_name"].dropna().astype(str)))
+    info = {"source": "easy_tdx/TDX", "行业": " / ".join(names)}
+    board = industries.iloc[-1]
 
-def fetch_valuation_comparison(code: str) -> pd.DataFrame:
-    """同行估值"""
     try:
-        df = ak.stock_zh_valuation_comparison_em(symbol=code)
+        members = fetch_board_members(str(board["board_code"]))
+    except Exception as e:
+        print(f"  [同行] easy_tdx失败: {e}")
+        return info, pd.DataFrame()
+    if members is None or members.empty:
+        return info, pd.DataFrame()
+
+    close = pd.to_numeric(members.get("close"), errors="coerce")
+    net_assets = pd.to_numeric(members.get("net_assets"), errors="coerce")
+    peers = pd.DataFrame({
+        "代码": members["code"].astype(str).str.zfill(6),
+        "简称": members["name"],
+        "市盈率": pd.to_numeric(members.get("pe_dynamic"), errors="coerce"),
+        "市盈率-TTM": pd.to_numeric(members.get("pe_ttm"), errors="coerce"),
+        "市净率": close.div(net_assets.where(net_assets > 0)),
+        "总市值": pd.to_numeric(members.get("total_market_cap_ab"), errors="coerce"),
+        "每股收益": pd.to_numeric(members.get("eps"), errors="coerce"),
+    })
+    peers = peers[close > 0].copy()
+    peers["_target"] = peers["代码"].eq(code)
+    peers = peers.sort_values(["_target", "总市值"], ascending=[False, False]).drop(columns="_target")
+    print(f"  [同行] {board['board_name']} → {len(peers)} 家")
+    return info, peers
+
+
+def fetch_financial_report(code: str, report_type: str) -> pd.DataFrame:
+    """财报: easy_tdx 封装的 Sina JSON 接口。"""
+    try:
+        from tools.providers.easy_tdx_provider import fetch_financial_report as fetch_sina_report
+
+        df = fetch_sina_report(code, report_type, num=8)
         if not df.empty:
-            print(f"  [估值] → {len(df)} 家")
+            print(f"  [财报/{report_type}] easy_tdx/Sina → {len(df)} 期")
             return df
     except Exception as e:
-        print(f"  [估值] 失败: {e}")
-    return pd.DataFrame()
-
-
-def fetch_growth_comparison(code: str) -> pd.DataFrame:
-    """同行成长性"""
-    try:
-        df = ak.stock_zh_growth_comparison_em(symbol=code)
-        if not df.empty:
-            print(f"  [成长] → {len(df)} 家")
-            return df
-    except Exception as e:
-        print(f"  [成长] 失败: {e}")
+        print(f"  [财报/{report_type}] easy_tdx/Sina失败: {e}")
     return pd.DataFrame()
 
 
@@ -209,22 +211,55 @@ def _safe_num(v, fmt=".2f"):
     return str(v)
 
 
+def _report_metrics(code: str, valuation: pd.DataFrame, financials: dict[str, pd.DataFrame]) -> dict[str, float]:
+    def latest(report_type: str, column: str):
+        frame = financials.get(report_type, pd.DataFrame())
+        if frame.empty or column not in frame.columns:
+            return None
+        value = pd.to_numeric(pd.Series([frame.iloc[0][column]]), errors="coerce").iloc[0]
+        return None if pd.isna(value) else float(value)
+
+    metrics = {
+        "revenue_yoy": latest("lrb", "营业收入_同比"),
+        "profit_yoy": latest("lrb", "归属于母公司所有者的净利润_同比"),
+        "operating_cashflow": latest("llb", "经营活动产生的现金流量净额"),
+        "net_profit": latest("lrb", "归属于母公司所有者的净利润"),
+    }
+    assets, liabilities = latest("fzb", "资产总计"), latest("fzb", "负债合计")
+    if assets and liabilities is not None:
+        metrics["debt_ratio"] = liabilities / assets
+    cash = latest("fzb", "货币资金")
+    if cash is not None and liabilities and liabilities > 0:
+        metrics["cash_to_debt"] = cash / liabilities
+    if not valuation.empty:
+        target = valuation[valuation["代码"].eq(code)]
+        if not target.empty:
+            metrics["pe_ttm"] = float(target.iloc[0]["市盈率-TTM"])
+            metrics["pb"] = float(target.iloc[0]["市净率"])
+        peers = pd.to_numeric(valuation.loc[~valuation["代码"].eq(code), "市盈率-TTM"], errors="coerce")
+        peers = peers[peers > 0]
+        if not peers.empty:
+            metrics["peer_pe_ttm_median"] = float(peers.median())
+    return {key: value for key, value in metrics.items() if value is not None and np.isfinite(value)}
+
+
 def build_report(code: str, name: str,
                  spot: dict, info: dict,
                  kline_daily: pd.DataFrame,
                  kline_quarterly: pd.DataFrame,
                  valuation: pd.DataFrame,
-                 growth: pd.DataFrame) -> str:
+                 financials: dict[str, pd.DataFrame]) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     L = [
         f"# 基本面+行情报告: {name}({code})",
         f"",
-        f"> 采集时间: {ts}  |  数据源: AKShare",
+        f"> 采集时间: {ts}  |  数据源: easy_tdx/TDX/Sina + efinance/AKShare",
         f"> 雪球: [个股页](https://xueqiu.com/S/{'SH' if code[0]=='6' else 'SZ'}{code})  "
         f"|  东财: [股吧](https://guba.eastmoney.com/list,{code},99,f.html)",
         f"",
         "---",
     ]
+    L.append(f"<!-- moda_metrics: {json.dumps(_report_metrics(code, valuation, financials), ensure_ascii=False)} -->")
 
     # ── 1. 实时行情 ──
     L += ["## 1. 实时行情", ""]
@@ -246,8 +281,8 @@ def build_report(code: str, name: str,
     # ── 2. 公司信息 ──
     L += ["## 2. 公司信息", ""]
     if info:
-        keys = ["总市值", "流通市值", "行业", "上市时间", "总股本", "流通股",
-                "净利润", "营业收入", "每股净资产", "每股公积金", "每股未分配利润"]
+        L.append(f"*来源: {info.get('source', '')}*  \n")
+        keys = ["行业"]
         L.append("| 指标 | 数值 |")
         L.append("|------|------|")
         for k in keys:
@@ -258,8 +293,35 @@ def build_report(code: str, name: str,
         L.append("⚠️ 无公司信息数据")
     L.append("")
 
-    # ── 3. 近期行情 ──
-    L += ["## 3. 近期行情 (日K)", ""]
+    # ── 3. 财务摘要 ──
+    L += ["## 3. 财务摘要", "", "*来源: easy_tdx/Sina*  ", ""]
+    financial_columns = {
+        "利润表": ("lrb", ["报告期", "营业收入", "营业收入_同比", "归属于母公司所有者的净利润", "归属于母公司所有者的净利润_同比", "基本每股收益"]),
+        "资产负债表": ("fzb", ["报告期", "货币资金", "应收账款", "存货", "资产总计", "负债合计", "归属于母公司股东权益合计"]),
+        "现金流量表": ("llb", ["报告期", "经营活动产生的现金流量净额", "投资活动产生的现金流量净额", "筹资活动产生的现金流量净额"]),
+    }
+    for title, (report_type, wanted) in financial_columns.items():
+        frame = financials.get(report_type, pd.DataFrame())
+        L += [f"### {title}", ""]
+        cols = [column for column in wanted if column in frame.columns]
+        if frame.empty or not cols:
+            L += ["⚠️ 无数据", ""]
+            continue
+        L.append("| " + " | ".join(cols) + " |")
+        L.append("|" + "|".join(["------"] * len(cols)) + "|")
+        for _, row in frame.head(4).iterrows():
+            values = []
+            for column in cols:
+                value = row.get(column, "")
+                if column.endswith("_同比") and pd.notna(value):
+                    values.append(f"{float(value) * 100:.2f}%")
+                else:
+                    values.append(_safe_num(value))
+            L.append("| " + " | ".join(values) + " |")
+        L.append("")
+
+    # ── 4. 近期行情 ──
+    L += ["## 4. 近期行情 (日K)", ""]
     if not kline_daily.empty:
         recent = kline_daily.tail(10).sort_values("date", ascending=False)
         L.append("| 日期 | 开盘 | 收盘 | 最高 | 最低 | 涨跌幅% | 成交量 |")
@@ -283,8 +345,8 @@ def build_report(code: str, name: str,
         L.append("⚠️ 无日K数据")
     L.append("")
 
-    # ── 4. 季K 趋势 ──
-    L += ["## 4. 季K 趋势（莫大最重视）", ""]
+    # ── 5. 季K 趋势 ──
+    L += ["## 5. 季K 趋势（莫大最重视）", ""]
     if not kline_quarterly.empty and len(kline_quarterly) >= 2:
         q_data = kline_quarterly.tail(8).sort_values("date", ascending=False)
         L.append("| 季度 | 开盘 | 收盘 | 最高 | 最低 | 涨跌幅% | 成交量 |")
@@ -317,11 +379,11 @@ def build_report(code: str, name: str,
         L.append("⚠️ 无季K数据")
     L.append("")
 
-    # ── 5. 同行估值 ──
-    L += ["## 5. 同行估值对比", ""]
+    # ── 6. 同行估值 ──
+    L += ["## 6. 同行估值对比", ""]
     if not valuation.empty:
         v = valuation
-        wanted = ["代码", "简称", "市盈率", "市净率", "市销率", "总市值"]
+        wanted = ["代码", "简称", "市盈率", "市盈率-TTM", "市净率", "总市值", "每股收益"]
         cols = [c for c in wanted if c in v.columns]
         if not cols:
             cols = list(v.columns[:6])
@@ -333,28 +395,12 @@ def build_report(code: str, name: str,
         L.append("⚠️ 无同行估值数据")
     L.append("")
 
-    # ── 6. 成长比较 ──
-    L += ["## 6. 同行成长性对比", ""]
-    if not growth.empty:
-        g = growth
-        wanted = ["代码", "简称", "基本每股收益同比增长", "营业收入同比增长", "净利润同比增长"]
-        cols = [c for c in wanted if c in g.columns]
-        if not cols:
-            cols = list(g.columns[:6])
-        L.append("| " + " | ".join(cols) + " |")
-        L.append("|" + "|".join(["------"] * len(cols)) + "|")
-        for _, r in g.head(10).iterrows():
-            L.append("| " + " | ".join(_safe_num(r.get(c, "")) for c in cols) + " |")
-    else:
-        L.append("⚠️ 无同行成长数据")
-    L.append("")
-
     L += [
         "---",
         "",
         "## 免责声明",
         "",
-        "本报告基于 AKShare 自动采集，仅供信息参考，不构成任何投资建议。",
+        "本报告基于 easy_tdx、Sina、efinance 和 AKShare 自动采集，仅供信息参考，不构成任何投资建议。",
         "数据可能因网络延迟、交易所休市等原因不完整。",
         "请以交易所官网、券商正式公告为准。",
     ]
@@ -366,7 +412,7 @@ def build_report(code: str, name: str,
 #  Main
 # ══════════════════════════════════════════════════════
 
-def analyze_stock(code: str, name: str = None) -> str:
+def analyze_stock(code: str, name: str = None, kline_file: Path | None = None) -> str:
     if not name:
         name = code
 
@@ -374,33 +420,35 @@ def analyze_stock(code: str, name: str = None) -> str:
     print(f"  {name}({code})")
     print(f"{'='*55}")
 
-    print("[1/5] 实时行情 ...")
-    spot = fetch_spot(code)
+    print("[1/3] 并行获取行情、行业同行和三张财报 ...")
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        spot_future = executor.submit(fetch_spot, code)
+        company_future = executor.submit(fetch_company_and_peers, code)
+        financial_futures = {
+            report_type: executor.submit(fetch_financial_report, code, report_type)
+            for report_type in ("lrb", "fzb", "llb")
+        }
 
-    print("[2/5] 公司信息 ...")
-    info = fetch_company_info(code)
+        print("[2/3] 读取日K线 ...")
+        kline_daily = fetch_kline_daily(code, kline_file)
+        print("[3/3] 从日K生成季K ...")
+        kline_quarterly = fetch_kline_quarterly(code, kline_daily)
 
-    print("[3/5] 日K线 ...")
-    kline_daily = fetch_kline_daily(code)
-
-    print("[4/5] 季K线 ...")
-    kline_quarterly = fetch_kline_quarterly(code)
-
-    print("[5/5] 同行比较 ...")
-    valuation = fetch_valuation_comparison(code)
-    growth = fetch_growth_comparison(code)
+        spot = spot_future.result()
+        info, valuation = company_future.result()
+        financials = {report_type: future.result() for report_type, future in financial_futures.items()}
 
     report = build_report(code, name, spot, info,
                           kline_daily, kline_quarterly,
-                          valuation, growth)
+                          valuation, financials)
 
     outpath = OUTPUT_BASE / f"{code}.md"
     outpath.write_text(report, encoding="utf-8")
 
     # 快速摘要
-    ok = sum(1 for x in [spot, info, not kline_daily.empty,
-                          not kline_quarterly.empty] if x)
-    print(f"\n  ✅ 报告 ({ok}/4 数据源可用) → {outpath}")
+    ok = sum(1 for x in [spot, info, not kline_daily.empty, not kline_quarterly.empty,
+                          not valuation.empty, any(not frame.empty for frame in financials.values())] if x)
+    print(f"\n  ✅ 报告 ({ok}/6 数据集可用) → {outpath}")
     print(f"{'='*55}")
     return str(outpath)
 
@@ -409,12 +457,13 @@ def main():
     p = argparse.ArgumentParser(description="AKShare 个股基本面+行情数据采集")
     p.add_argument("--stock", required=True, help="股票代码 (如 603290)")
     p.add_argument("--name", help="股票名称 (选填)")
+    p.add_argument("--kline-file", type=Path, help="本次流水线共享的日K文件")
     args = p.parse_args()
 
     codes = [c.strip() for c in args.stock.split(",")]
     for code in codes:
         try:
-            analyze_stock(code, args.name)
+            analyze_stock(code, args.name, args.kline_file)
         except Exception as e:
             print(f"[Error] {code}: {e}")
         time.sleep(0.5)
