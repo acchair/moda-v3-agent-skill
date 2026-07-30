@@ -31,6 +31,12 @@ https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixi
 | Hermes Agent | 粘贴上述提示词并授予私有仓库访问权限 | 支持 |
 | 其他支持 `SKILL.md` 的 Agent | 复制仓库到对应 Skills 目录 | 支持 |
 
+### 手机端
+![image](https://openminis.app/icon-dark.png)
+https://openminis.app/ 
+即可下载 openminis  Agent使用此skills
+
+ 
 ## 评分框架
 
 | 因子 | 满分 | 核心判断 |
