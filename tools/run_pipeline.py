@@ -15,8 +15,17 @@ if str(ROOT) not in sys.path:
 CACHE_ROOT = ROOT / "knowledge" / "research" / "pipeline" / "cache"
 REPORT_DIRS = {
     "finance_data": "finance_data",
-    "tdx_analysis": "tdx_analysis", "scoring": "scoring",
+    "business_data": "business_data",
+    "tdx_analysis": "tdx_analysis",
+    "scoring": "scoring",
     "announcements": "announcements",
+    "market_events": "market_events",
+    "popularity": "popularity",
+    "social_sentiment": "social_sentiment",
+    "congestion": "congestion",
+    "supply_demand": "supply_demand",
+    "macro_policy": "macro_policy",
+    "web_research": "web_research",
 }
 
 if sys.platform == "win32":
@@ -74,13 +83,27 @@ def prepare_kline(code: str) -> Path | None:
         return None
 
 
-def run_collectors(collectors: list[tuple[str, str, list[str]]]) -> list[dict]:
-    with ThreadPoolExecutor(max_workers=len(collectors)) as executor:
+def run_collectors(collectors: list[tuple]) -> list[dict]:
+    with ThreadPoolExecutor(max_workers=min(6, len(collectors))) as executor:
         return list(executor.map(lambda module: run_module(*module), collectors))
 
 
+def current_context(code: str, directories: tuple[str, ...], since: float) -> tuple[str, str]:
+    from tools.scoring.evidence import build_evidence, read_reports
+
+    evidence = build_evidence(code, code, read_reports(code, directories, since))
+    industry = str(evidence.get("industry") or "综合")
+    values = [
+        industry,
+        str(evidence.get("main_business") or ""),
+        " ".join(str(item) for item in evidence.get("business_items", [])),
+        " ".join(str(item) for item in evidence.get("concepts", [])),
+    ]
+    return industry, " ".join(value for value in values if value).strip()
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the moda-v3 non-web pipeline")
+    parser = argparse.ArgumentParser(description="Run the moda-v4 structured A-share pipeline")
     parser.add_argument("--stock", required=True)
     parser.add_argument("--name", default="")
     args = parser.parse_args()
@@ -92,15 +115,29 @@ def main() -> None:
     common = ["--stock", code, "--name", args.name or code]
     kline_path = prepare_kline(code)
     kline_args = ["--kline-file", str(kline_path)] if kline_path else []
-    collectors = [
-        ("finance_data", "tools/akshare/finance_data.py", [*common, *kline_args]),
-        ("tdx_analysis", "tools/tdx/analyzer.py", [*common, *kline_args]),
-        ("announcements", "tools/akshare/announcements.py", [*common, "--days", "30"]),
+    first_wave = [
+        ("finance_data", "tools/akshare/finance_data.py", [*common, *kline_args], 180),
+        ("business_data", "tools/akshare/business_data.py", common, 60),
+        ("tdx_analysis", "tools/tdx/analyzer.py", [*common, *kline_args], 120),
+        ("announcements", "tools/akshare/announcements.py", [*common, "--days", "180"], 120),
+        ("market_events", "tools/akshare/market_events.py", common, 90),
+        ("popularity", "tools/akshare/popularity.py", common, 30),
+        ("social_sentiment", "tools/akshare/social_sentiment.py", common, 45),
+        ("congestion", "tools/akshare/congestion.py", common, 90),
     ]
 
-    results = run_collectors(collectors)
+    results = run_collectors(first_wave)
+    first_sources = tuple(result["label"] for result in results if result.get("ok"))
+    industry, context = current_context(code, first_sources, started_ts)
+    second_wave = [
+        ("supply_demand", "tools/scoring/supply_demand.py", [*common, "--context", context], 150),
+        ("macro_policy", "tools/akshare/macro_policy.py", [*common, "--industry", industry], 150),
+        ("web_research", "tools/scoring/web_research.py", [*common, "--context", context], 180),
+    ]
+    results.extend(run_collectors(second_wave))
     successful_sources = ",".join(result["label"] for result in results if result.get("ok"))
-    scoring_args = [*common, "--sources", successful_sources, "--since", str(started_ts)]
+    requested_sources = ",".join([module[0] for module in first_wave + second_wave])
+    scoring_args = [*common, "--sources", successful_sources, "--requested-sources", requested_sources, "--since", str(started_ts)]
     results.append(run_module("scoring", "tools/scoring/grader.py", scoring_args))
     output = ROOT / "knowledge/research/pipeline"
     output.mkdir(parents=True, exist_ok=True)
@@ -108,7 +145,7 @@ def main() -> None:
     path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     passed = sum(item["ok"] for item in results)
     print(f"\nPipeline: {passed}/{len(results)} modules succeeded -> {path}")
-    if passed != len(results):
+    if not results[-1].get("ok"):
         raise SystemExit(1)
 
 

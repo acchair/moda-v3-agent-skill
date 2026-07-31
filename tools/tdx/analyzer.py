@@ -10,7 +10,7 @@
 """
 import numpy as np
 import pandas as pd
-import time, sys, os, argparse
+import time, sys, os, argparse, json
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -489,6 +489,31 @@ class AlphaSorosAnalyzer:
     # ── 报告 ──
     def generate_report(self) -> str:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        pf = self._last(self.A_PINGFEN)
+        pf_prev = self._last(self.A_PINGFEN[:-1]) if self.n >= 2 else pf
+        trend = "上升" if pf is not None and pf_prev is not None and pf > pf_prev + 0.02 else ("下降" if pf is not None and pf_prev is not None and pf < pf_prev - 0.02 else "持平")
+        close = self.df["close"]
+        volume = self.df["volume"]
+        momentum_20d = float(close.iloc[-1] / close.iloc[-21] - 1) if self.n >= 21 and close.iloc[-21] else None
+        ma20_slope_5d = float(self.M20.iloc[-1] / self.M20.iloc[-6] - 1) if self.n >= 25 and pd.notna(self.M20.iloc[-6]) and self.M20.iloc[-6] else None
+        prior_volume = volume.iloc[-21:-1].mean() if self.n >= 21 else None
+        volume_ratio_20d = float(volume.iloc[-1] / prior_volume) if prior_volume and pd.notna(prior_volume) else None
+        signal = "中性/无触发"
+        for label, series in (("清仓", self.SIGNAL_CLEAR), ("减仓", self.SIGNAL_REDUCE), ("加仓", self.SIGNAL_ADD), ("建仓", self.SIGNAL_OPEN)):
+            if self._last(series):
+                signal = label
+                break
+        technical = {
+            "alpha_score": pf,
+            "alpha_trend": trend,
+            "technical_position": self._last(self.QUWEI),
+            "technical_signal": signal,
+            "technical_overheat": bool(self._last(self._过热)),
+            "ma_structure": "bullish" if self._last(self.DUOPAI) else "bearish" if self._last(self.KONGPAI) else "mixed",
+            "momentum_20d": self._last([momentum_20d]),
+            "ma20_slope_5d": self._last([ma20_slope_5d]),
+            "volume_ratio_20d": self._last([volume_ratio_20d]),
+        }
         L = [
             f"# 通达信技术分析: {self.name}({self.code})",
             f"",
@@ -498,19 +523,18 @@ class AlphaSorosAnalyzer:
             f"",
             "---",
             "",
+            f"<!-- moda_technical: {json.dumps(technical, ensure_ascii=False)} -->",
+            "",
             "## 1. Alpha 综合评分",
             "",
         ]
 
-        pf = self._last(self.A_PINGFEN)
         if pf is not None:
             label = "偏多" if pf > self.JIAN_TH else ("偏空" if pf < self.RUO_TH else "中性")
             L.append(f"- **当前评分**: {pf:+.4f} ({label})")
             L.append(f"- 建仓阈值: +{self.JIAN_TH:.2f} / 加仓阈值: +{self.JIA_TH:.2f}")
             L.append(f"- 减仓阈值: {self.RUO_TH:+.2f} / 清仓阈值: {self.QING_TH:+.2f}")
             # 评分趋势
-            pf_prev = self.A_PINGFEN[-2] if self.n >= 2 else pf
-            trend = "↑ 上升" if pf > pf_prev + 0.02 else ("↓ 下降" if pf < pf_prev - 0.02 else "→ 持平")
             L.append(f"- 评分趋势: {trend}")
         L.append("")
 
@@ -619,15 +643,15 @@ class AlphaSorosAnalyzer:
         L += ["## 6. 综合判断", ""]
         pf_v = pf or 0
         if pf_v > self.JIA_TH and self._last(self.QUSHI_DUO):
-            L.append("**趋势+评分共振偏多** — 多头排列且评分高于加仓阈值。适合放在莫大的「矛」仓位中跟踪。")
+            L.append("**趋势+评分共振偏多**：多头排列且评分高于加仓阈值。")
         elif pf_v > self.JIAN_TH and self._last(self.ZHAN_DUAN):
-            L.append("**评分偏多但趋势未确认** — 可作为建仓观察。莫大框架下：先看季K有没有底部放量，再看'好爹'确认，再下手。")
+            L.append("**评分偏多但趋势未确认**：先核对季 K 量能、基本面和股东风险。")
         elif pf_v < self.QING_TH and self._last(self.QUSHI_KONG):
-            L.append("**趋势+评分共振偏空** — 空头排列且评分低于清仓阈值。莫大会说：观察，不动手，等主力鸡脚露出来。")
+            L.append("**趋势+评分共振偏空**：空头排列且评分低于清仓阈值。")
         elif pf_v < self.RUO_TH:
             L.append("**评分偏空** — 建议观望。结合情绪模块看看市场是否在恐慌（逆人性布局窗口）。")
         else:
-            L.append("**中性区间** — 无明确方向信号。莫大会说：不做也是一种操作。等信号明确再说。")
+            L.append("**中性区间**：当前没有明确方向信号。")
 
         # 风险提示
         warnings = []
@@ -748,11 +772,14 @@ def main():
     codes = [c.strip() for c in args.stock.split(",")]
     for code in codes:
         try:
-            analyze_stock(code, args.name, args.kline_file)
+            report = analyze_stock(code, args.name, args.kline_file)
+            if not report:
+                raise RuntimeError("technical report was not generated")
         except Exception as e:
             print(f"[Error] {code}: {e}")
             import traceback
             traceback.print_exc()
+            raise SystemExit(1)
         time.sleep(0.5)
 
 

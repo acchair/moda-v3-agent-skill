@@ -211,7 +211,8 @@ def _safe_num(v, fmt=".2f"):
     return str(v)
 
 
-def _report_metrics(code: str, valuation: pd.DataFrame, financials: dict[str, pd.DataFrame]) -> dict[str, float]:
+def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame,
+                    valuation: pd.DataFrame, financials: dict[str, pd.DataFrame]) -> dict:
     def latest(report_type: str, column: str):
         frame = financials.get(report_type, pd.DataFrame())
         if frame.empty or column not in frame.columns:
@@ -220,11 +221,23 @@ def _report_metrics(code: str, valuation: pd.DataFrame, financials: dict[str, pd
         return None if pd.isna(value) else float(value)
 
     metrics = {
+        "industry": info.get("行业") if info else None,
+        "latest_price": spot.get("最新价") if spot else None,
         "revenue_yoy": latest("lrb", "营业收入_同比"),
         "profit_yoy": latest("lrb", "归属于母公司所有者的净利润_同比"),
         "operating_cashflow": latest("llb", "经营活动产生的现金流量净额"),
         "net_profit": latest("lrb", "归属于母公司所有者的净利润"),
     }
+    income = financials.get("lrb", pd.DataFrame())
+    if len(income) >= 2:
+        for column, target in (
+            ("营业收入_同比", "revenue_yoy_delta"),
+            ("归属于母公司所有者的净利润_同比", "profit_yoy_delta"),
+        ):
+            if column in income.columns:
+                values = pd.to_numeric(income[column].head(2), errors="coerce")
+                if len(values) == 2 and values.notna().all():
+                    metrics[target] = float(values.iloc[0] - values.iloc[1])
     assets, liabilities = latest("fzb", "资产总计"), latest("fzb", "负债合计")
     if assets and liabilities is not None:
         metrics["debt_ratio"] = liabilities / assets
@@ -240,7 +253,23 @@ def _report_metrics(code: str, valuation: pd.DataFrame, financials: dict[str, pd
         peers = peers[peers > 0]
         if not peers.empty:
             metrics["peer_pe_ttm_median"] = float(peers.median())
-    return {key: value for key, value in metrics.items() if value is not None and np.isfinite(value)}
+    if not kline_daily.empty and "close" in kline_daily.columns:
+        close = pd.to_numeric(kline_daily["close"], errors="coerce").dropna().tail(800)
+        if len(close) >= 240:
+            latest_close, low, high = float(close.iloc[-1]), float(close.min()), float(close.max())
+            if high > low:
+                metrics["price_percentile_3y"] = (latest_close - low) / (high - low)
+                metrics["drawdown_from_3y_high"] = latest_close / high - 1
+    clean: dict = {}
+    for key, value in metrics.items():
+        if value is None:
+            continue
+        if isinstance(value, (int, float, np.number)):
+            if np.isfinite(value):
+                clean[key] = float(value)
+        else:
+            clean[key] = value
+    return clean
 
 
 def build_report(code: str, name: str,
@@ -259,7 +288,7 @@ def build_report(code: str, name: str,
         f"",
         "---",
     ]
-    L.append(f"<!-- moda_metrics: {json.dumps(_report_metrics(code, valuation, financials), ensure_ascii=False)} -->")
+    L.append(f"<!-- moda_metrics: {json.dumps(_report_metrics(code, spot, info, kline_daily, valuation, financials), ensure_ascii=False)} -->")
 
     # ── 1. 实时行情 ──
     L += ["## 1. 实时行情", ""]

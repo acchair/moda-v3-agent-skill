@@ -1,83 +1,33 @@
-# moda v3 数据源调研记录
+# 数据源与方法评估
 
-## 1. 调研范围
+## 已验证数据链
 
-本文件记录 2026-07-12 至 2026-07-13 在本机对 `000001 平安银行` 的实际验证结果。结论描述的是当前环境和当前接口状态，不代表数据源长期稳定。
-
-## 2. easy_tdx 1.19.0
-
-### 已验证可用
-
-| 能力 | 接口/用途 | 结果 |
+| 数据 | 当前来源 | 处理规则 |
 |---|---|---|
-| 日/月K线 | `get_stock_kline` | 可用，TDX 实测 800 条日K |
-| 实时行情 | `get_stock_quotes` | 可用 |
-| 公告 | `CninfoClient.get_announcements` | 可用，实测近30日2条 |
-| 三张财报 | `SinaClient.get_financial_report` | 可用，每类实测8期 |
-| 所属板块 | `get_belong_board` | 可用，可识别股份制银行等行业 |
-| 同行行情与估值 | `get_board_members` | 可用，实测9家同业 |
-| 当前资金流 | `get_capital_flow` | 可用，作为东财120日资金流失败后的当前快照 |
+| 行情/K线/技术 | easy_tdx/TDX | 共享日 K，技术模块输出结构化信号 |
+| 财务 | easy_tdx/Sina | 利润、现金流、负债与同比趋势 |
+| 主营/海外收入 | EastMoney F10 | 按业务与地区构成提取 |
+| 公告 | easy_tdx/CNINFO | 默认核验 180 日 |
+| 股东/质押/解禁 | Sina + EastMoney | 单接口失败独立降级 |
+| 个股人气 | EastMoney stockrank | 排名归一化为 0-1 热度 |
+| 市场拥挤 | AKShare/乐咕 | 必须校验日期；过期不计分 |
+| 社交热榜 | 6 个平台公开接口 | 5 分钟缓存，逐平台状态 |
+| 商品供需 | AKShare | 现货、基差、库存至少两类同向 |
+| 宏观政策 | LPR、PMI、gov.cn JSON | 只作背景，不因单条标题加分 |
+| 搜索补缺 | SearXNG / DuckDuckGo MCP | 正文读取、来源分级、双域名和双证据验证 |
 
-### 可派生数据
+## hot-money 评估
 
-- 营收和净利润增长率
-- 简化杜邦：ROE、净利率、资产周转率、权益乘数
-- 当前 PE/PB 快照
-- 同行业 PE/PB 对比
+可借鉴：多平台独立降级、热榜短缓存、陷阱信号单列、机构方法的数据门槛和最终自查。
 
-### 不能覆盖
+不直接采用：人物角色评分、搜索摘要关键词直接定性、未搜到即安全、用默认值补齐 DCF/LBO、虚构示例持仓。
 
-- 机构研报
-- 个股新闻正文
-- 未来限售解禁计划
-- 海外收入和出口占比
-- 雪球/东财社区情绪
-- 乐咕行业拥挤度
-- 完整公司档案和主营描述
+其机构方法文档存在 15/17/18 三种数量口径，当前索引实际列出 18 项。v4 不复制其第二套评分，而是逐项展示适用状态；只有量化筛选和投资逻辑追踪能在双重反向时降低 Alpha 1 分。
 
-`get_symbol_info` 是行情级证券信息，不应当作完整公司资料。
+## 当前限制
 
-### 已处理问题
-
-`MacClient.from_best_host()` 会写入用户目录下的共享配置。多个智能体或进程并发运行时可能触发 Windows 文件占用错误。当前适配器自行选择主机并直接创建客户端，不再并发写配置。
-
-## 3. AKShare 与东财直连
-
-### 观察
-
-- `stock_zh_a_hist`、实时行情和资金流端点可能出现 `RemoteDisconnected`。
-- 同一环境中，人气、新闻和部分数据中心接口仍可正常返回。
-- 浏览器页面请求头不应直接复用于 API 请求，可能增加断连概率。
-
-### 当前策略
-
-- 行情和K线由 easy_tdx 优先。
-- 东财直连只承担其独有数据，失败后快速降级，不长时间重复重试。
-- `a_stock_data_provider.py` 统一处理多种响应结构。
-- 限售解禁零行视为“当前查询区间无事件”，不是接口失败。
-
-实际验证中，市场事件模块达到 `10/10`：研报、板块、龙虎榜、解禁、融资融券、大宗交易、股东户数、分红、资金流和新闻均完成采集或有效空结果判定。
-
-## 4. 财务与估值降级
-
-- 利润表、资产负债表、现金流：easy_tdx/Sina
-- 成长性：由财报同比字段生成
-- 简化杜邦：由利润表和资产负债表计算
-- 行业：easy_tdx 所属板块
-- 估值：easy_tdx 当前快照
-
-旧深度财报模块已从运行时、依赖和报告链移除。历史 PE/PB 分位暂不输出；只有当前估值时，结论必须标记为当前快照。
-
-AxData 已完成接口调研。财务与公司侧可用 `stock_finance_summary_tdx`、`stock_profit_cashflow_summary_tdx`、`stock_balance_summary_tdx`、`stock_company_profile_tdx` 和 `stock_business_composition_tdx`；估值与同行侧可用 `stock_valuation_metrics_tdx`、`stock_valuation_series_tdx`、`stock_valuation_band_tdx` 和 `concept_constituent_comparison_tdx`；股东侧可用 `stock_share_capital_tdx` 与 `stock_shareholder_change_plans_tdx`。其中历史估值序列是当前最明确的增量，但这些接口多数是 source-request-only，TDX 源与现有 easy_tdx 重叠，AxData 0.1.3 仍为 Alpha 且会新增 `pyarrow`、DuckDB 等依赖，因此暂不加入生产链。
-
-2026-07-30 对 `300820` 复核确认：easy_tdx 可直接返回“其他发电设备”行业及 25 家成分股的实时 PE、TTM PE、每股净资产和市值；easy_tdx/Sina 可返回利润表、资产负债表和现金流量表。因此当前先复用已有适配器，只有需要历史 PE/PB Band 或股东增减持增强时再评估 AxData。
-
-## 5. QVeris 备用调研
-
-QVeris 的 Gildata A 股公告工具已验证可返回有效公告，但会消耗额度。当前 easy_tdx/CNINFO 公告链已可用，因此没有把 QVeris 加入生产依赖。
-
-## 6. 当前端到端基线
-
-当前 `tools/run_pipeline.py` 先用 easy_tdx 获取一次共享日 K，再并行执行 `finance_data`、`tdx_analysis` 和 `announcements`，最后执行 `scoring`。
-
-每个模块同时检查退出码和报告更新时间，评分器只接收本次成功模块的新报告，最终状态写入 `knowledge/research/pipeline/{code}.json`。外部数据源失败时保留模块错误，不能把旧报告冒充为本次成功结果。
+- 微博和抖音公开接口可能拒绝请求，报告会显示平台失败。
+- 社交热榜只能证明热点可见性，不能覆盖私域群或完整社区讨论。
+- 政府网最新政策页只适合近期标题匹配，不等于完整行业政策库。
+- DCF 和三表需要更完整的自由现金流、股本、净债务和经营假设，当前默认不运行。
+- SearXNG 实例可能禁用 JSON；DuckDuckGo MCP 需要单独启动 streamable HTTP 服务。两者不可用时不自动补分。

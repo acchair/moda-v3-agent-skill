@@ -8,7 +8,7 @@
     python3 tools/akshare/announcements.py --stock 002466 --name 天齐锂业
     python3 tools/akshare/announcements.py --stock 002466,603290 --days 7
 """
-import time, sys, os, argparse
+import time, sys, os, argparse, json, re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -158,6 +158,25 @@ def extract_keywords_from_qa(qa_list: list) -> dict:
 
 def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    titles = [str(item.get("title", "")) for item in ann_data.get("ann_list", [])]
+    title_text = " ".join(titles)
+    reduction = bool(re.search(r"(?:控股股东|实际控制人|实控人)[^。；\n]{0,35}减持|减持[^。；\n]{0,35}(?:控股股东|实际控制人|实控人)", title_text))
+    increase = bool(re.search(r"(?:控股股东|实际控制人|实控人)[^。；\n]{0,35}增持|增持[^。；\n]{0,35}(?:控股股东|实际控制人|实控人)", title_text))
+    controller_checked = not ann_data.get("error")
+    controller_action = "reduction" if reduction else "increase" if increase else "stable" if controller_checked else None
+    qa_text = " ".join(f"{item.get('question', '')} {item.get('answer', '')}" for item in irm_data.get("qa_list", []))
+    growth_matches = re.findall(r"(?:订单|新增订单)[^\n。]{0,40}?(?:同比(?:增幅)?|增长)[^\d]{0,8}([0-9]+(?:\.[0-9]+)?)%", qa_text)
+    catalyst_terms = ("中标", "重大合同", "新增订单", "订单增长", "扩产", "投产", "涨价", "回购", "增持", "业绩预增", "扭亏")
+    structured = {
+        "announcement_titles": titles,
+        "announcement_lookback_days": ann_data.get("days"),
+        "controller_checked": controller_checked,
+        "controller_action": controller_action,
+        "audit_risk": any(term in title_text for term in ("非标准审计", "保留意见", "无法表示意见", "否定意见", "退市风险警示")),
+        "verified_catalyst_count": sum(term in title_text for term in catalyst_terms),
+    }
+    if growth_matches:
+        structured["order_growth"] = max(float(value) for value in growth_matches)
 
     lines = [
         f"# 公告与互动: {name or code}({code})",
@@ -166,6 +185,8 @@ def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str
         f"> 数据源: easy_tdx/CNINFO 公告 + AKShare/CNINFO 互动易",
         f"",
         "---",
+        f"",
+        f"<!-- moda_announcements: {json.dumps(structured, ensure_ascii=False)} -->",
         f"",
     ]
 

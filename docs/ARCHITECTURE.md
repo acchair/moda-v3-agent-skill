@@ -1,59 +1,50 @@
-# moda v3 架构说明
+# moda v4 架构
 
-## 1. 总体结构
+## 流程
 
 ```text
-Agent / 命令行
+股票代码/名称
   -> tools/run_pipeline.py
-     -> easy_tdx 共享日 K 缓存
-     -> 并行采集
-        -> tools/akshare/finance_data.py
-        -> tools/tdx/analyzer.py
-        -> tools/akshare/announcements.py
-     -> tools/scoring/grader.py
-     -> knowledge/research/
+     -> 共享日 K 缓存
+     -> 第一阶段并行采集（8 模块）
+     -> 主营与行业上下文
+     -> 第二阶段采集（供需、宏观政策、可选搜索验证）
+     -> 结构化证据合并
+     -> 24 子项基础分 + ±8 修正
+     -> 4 类 Hard Cap
+     -> 固定格式 Markdown + JSON scorecard
 ```
 
-项目不包含网页服务、前端资源或本地 Web 数据库。
+## 关键边界
 
-## 2. 统一流水线
+- `tools/scoring/evidence.py` 只读取本次运行后新生成的报告。
+- 采集器通过 `<!-- moda_*: {...} -->` 输出结构化数据，Markdown 正文用于人工复核。
+- `tools/scoring/model.py` 是唯一评分规则源。
+- `tools/scoring/grader.py` 只负责合并、评分和报告渲染。
+- TDX 是 Alpha 原始分来源；两项机构技术复核只允许在双重冲突时向 0 收缩 1 分。
+- 其他机构方法在评分后运行，不向基础分、修正项或 Hard Cap 回写。
 
-`tools/run_pipeline.py` 执行以下流程：
+## 两阶段采集
 
-1. 使用 `easy_tdx` 获取一次日 K，并写入本次共享缓存。
-2. 并行运行基本面、技术和公告模块。
-3. 基本面模块并行获取行情、TDX 行业同行和 Sina 三张财报。
-4. 公告模块并行获取公告与互动易数据。
-5. 只把本次成功且新生成的报告交给评分器。
-6. 将模块状态写入 `knowledge/research/pipeline/{code}.json`。
+第一阶段：财务、主营、技术、公告、市场事件、人气、社交热榜、市场拥挤度。
 
-## 3. 评分规则
+第二阶段：根据第一阶段得到的行业、主营和概念运行商品供需映射、宏观政策和可选搜索验证，减少错误行业匹配。
 
-评分器先根据报告证据建立 F1-F5 基础分，再用营收、归母净利润、经营现金流、资产负债率、现金覆盖负债、负利润、负 PE 和同行 TTM PE 约束矛盾高分。
+## 降级
 
-- F1 低于 15 或 F3 低于 8：评级最高为学习仓。
-- 控股股东或实控人减持：评级最高为学习仓。
-- ST 或退市风险：评级为不碰。
-- 缺失或失败来源：标记需人工确认，不补造正面结论。
+- 单模块失败：记录失败，不读取旧报告。
+- 商品映射未命中：不强行生成供需分。
+- 搜索后端未配置、403、超时或正文读取失败：保留错误状态，不把摘要当证据。
+- 社交平台失败：其他平台继续；少于 3 个平台可用时热度标记不完整。
+- 拥挤度过期：展示但不计分、不触发 Hard Cap。
+- 评分器始终对缺失项输出 0 分和 `需人工确认`。
 
-## 4. 数据与输出
+## 输出目录
 
-- `knowledge/research/finance_data/`：基本面和行情报告。
-- `knowledge/research/tdx_analysis/`：技术分析报告。
-- `knowledge/research/announcements/`：公告与互动报告。
-- `knowledge/research/scoring/`：五层评分报告。
-- `knowledge/research/pipeline/`：本次模块状态与共享缓存。
-- `knowledge/output/`：按需导出的最终答复。
+- `knowledge/research/{module}/{code}.md`：模块证据。
+- `knowledge/research/scoring/{code}.md`：最终固定格式报告。
+- `knowledge/research/scorecards/{code}.json`：证据与评分结构。
+- `knowledge/research/pipeline/{code}.json`：本次模块状态。
+- `knowledge/research/web_research/{code}.md`：搜索查询、正文读取状态和交叉验证结果。
 
-运行生成的数据不提交到 Git。`MODA_OUTPUT_DIR` 可覆盖最终答复导出目录。
-
-## 5. 降级规则
-
-- 共享日 K 获取失败：各模块按自身降级路径继续运行。
-- 单个采集模块失败：保留错误状态，评分器不读取该模块的旧报告。
-- 覆盖不足：输出覆盖率并标记需人工确认。
-- AxData：仅在 `MODA_AXDATA=1` 时作为可选增强，不属于默认依赖。
-
-## 6. 安全边界
-
-只接受 6 位 A 股代码。密码、Token、Cookie、私钥和代理凭据不得写入代码、日志、报告或仓库，只能从环境变量读取。
+运行数据由 `.gitignore` 排除。

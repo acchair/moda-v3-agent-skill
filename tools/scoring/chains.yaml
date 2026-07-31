@@ -168,7 +168,7 @@ chains:
     aliases: [充电桩, 充换电, 超充]
     upstream:
       industries: [电子元件, 电力设备, 专用设备]
-      keywords: [充电模块, 功率模块, 充电枪, 线缆, 继电器, 接触器, IGBT, SiC模块, 变压器]
+      keywords: [充电模块, 电源模块, 功率模块, 充电枪, 线缆, 继电器, 接触器, IGBT, SiC模块, 变压器]
     midstream:
       industries: [电源设备, 电力设备]
       keywords: [充电桩整机, 直流快充, 交流慢充, 超充桩, 充电堆, 换电站, 液冷超充, V2G]

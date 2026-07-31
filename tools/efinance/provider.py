@@ -2,7 +2,7 @@
 efinance fallback data provider.
 
 The functions here normalize efinance output into the column names used by
-the existing moda v3 scripts.
+the existing moda v4 scripts.
 """
 from __future__ import annotations
 
