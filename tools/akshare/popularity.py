@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+import time
+
+import requests
+
+
+ROOT = Path(__file__).resolve().parents[2]
+OUTPUT_BASE = ROOT / "knowledge" / "research" / "popularity"
+API = "https://emappdata.eastmoney.com/stockrank/getCurrentLatest"
+
+
+def _market_code(code: str) -> str:
+    return ("SH" if code.startswith(("5", "6", "9")) else "SZ") + code
+
+
+def collect(code: str, timeout: float = 12) -> dict:
+    payload = {
+        "appId": "appId01",
+        "globalId": "786e4c21-70dc-435a-93bb-38",
+        "marketType": "",
+        "srcSecurityCode": _market_code(code),
+    }
+    response = requests.post(API, json=payload, timeout=timeout)
+    response.raise_for_status()
+    data = response.json().get("data") or {}
+    rank = data.get("rank")
+    total = data.get("marketAllCount")
+    if not isinstance(rank, (int, float)) or not isinstance(total, (int, float)) or total <= 1:
+        raise ValueError("EastMoney popularity response does not contain a valid rank")
+    heat = 1 - (float(rank) - 1) / (float(total) - 1)
+    return {
+        "attention_rank": int(rank),
+        "attention_universe": int(total),
+        "attention_heat": round(max(0.0, min(1.0, heat)), 4),
+        "attention_rank_change": data.get("rankChange"),
+        "attention_calc_time": data.get("calcTime"),
+        "attention_partial": False,
+    }
+
+
+def build_report(code: str, name: str, data: dict) -> str:
+    return "\n".join([
+        f"# 个股人气：{name or code}（{code}）",
+        "",
+        f"> 采集时间：{time.strftime('%Y-%m-%d %H:%M:%S')}  |  数据源：EastMoney 个股人气榜",
+        "",
+        f"<!-- moda_popularity: {json.dumps(data, ensure_ascii=False)} -->",
+        "",
+        f"- 当前排名：{data['attention_rank']} / {data['attention_universe']}",
+        f"- 关注热度：{data['attention_heat']:.4f}（0=冷，1=热）",
+        f"- 排名变化：{data.get('attention_rank_change', '需人工确认')}",
+        f"- 榜单时间：{data.get('attention_calc_time', '需人工确认')}",
+        "",
+        "本报告仅反映关注度，不代表看多或看空。",
+        "",
+    ])
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Collect EastMoney stock popularity")
+    parser.add_argument("--stock", required=True)
+    parser.add_argument("--name", default="")
+    args = parser.parse_args()
+    code = args.stock.strip()
+    if len(code) != 6 or not code.isdigit():
+        parser.error("--stock must be a 6-digit A-share code")
+    data = collect(code)
+    OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
+    path = OUTPUT_BASE / f"{code}.md"
+    path.write_text(build_report(code, args.name or code, data), encoding="utf-8")
+    print(path)
+
+
+if __name__ == "__main__":
+    main()

@@ -19,13 +19,13 @@ def export(text: str, stock: str = "", name: str = "") -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     label = "_".join(safe_name(value) for value in (name, stock) if value.strip()) or "analysis"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = output_dir / f"moda-v3_{label}_{timestamp}.txt"
+    path = output_dir / f"moda-v4_{label}_{timestamp}.txt"
     path.write_text(text, encoding="utf-8-sig")
     return path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export the final moda-v3 response")
+    parser = argparse.ArgumentParser(description="Export the final moda-v4 response")
     parser.add_argument("--stock", default="")
     parser.add_argument("--name", default="")
     parser.add_argument("--input", type=Path, help="Read final response from a UTF-8 text file; defaults to stdin")
