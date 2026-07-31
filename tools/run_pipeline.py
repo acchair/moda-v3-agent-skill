@@ -26,6 +26,7 @@ REPORT_DIRS = {
     "supply_demand": "supply_demand",
     "macro_policy": "macro_policy",
     "web_research": "web_research",
+    "industry_prosperity": "industry_prosperity",
 }
 
 if sys.platform == "win32":
@@ -63,6 +64,8 @@ def _report_coverage(label: str, path: Path) -> int:
         return sum(bool(line.strip()) and line.startswith("| F") for line in text.splitlines())
     if label == "announcements":
         return int("最新公告" in text) + int("投资者互动问答" in text)
+    if label == "industry_prosperity":
+        return int("moda_industry_prosperity" in text)
     return int("评分:" in text or "ALPHA-SOROS" in text)
 
 
@@ -106,6 +109,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the moda-v4 structured A-share pipeline")
     parser.add_argument("--stock", required=True)
     parser.add_argument("--name", default="")
+    parser.add_argument("--refresh", action="store_true", help="Force shared daily data caches to refresh")
     args = parser.parse_args()
     code = args.stock.strip()
     if len(code) != 6 or not code.isdigit():
@@ -113,6 +117,7 @@ def main() -> None:
 
     started_ts = time.time()
     common = ["--stock", code, "--name", args.name or code]
+    refresh_args = ["--refresh"] if args.refresh else []
     kline_path = prepare_kline(code)
     kline_args = ["--kline-file", str(kline_path)] if kline_path else []
     first_wave = [
@@ -123,7 +128,7 @@ def main() -> None:
         ("market_events", "tools/akshare/market_events.py", common, 90),
         ("popularity", "tools/akshare/popularity.py", common, 30),
         ("social_sentiment", "tools/akshare/social_sentiment.py", common, 45),
-        ("congestion", "tools/akshare/congestion.py", common, 90),
+        ("congestion", "tools/akshare/congestion.py", [*common, *refresh_args], 90),
     ]
 
     results = run_collectors(first_wave)
@@ -135,8 +140,15 @@ def main() -> None:
         ("web_research", "tools/scoring/web_research.py", [*common, "--context", context], 180),
     ]
     results.extend(run_collectors(second_wave))
+    prosperity = (
+        "industry_prosperity",
+        "tools/akshare/industry_prosperity.py",
+        [*common, "--industry", industry, *refresh_args],
+        180,
+    )
+    results.append(run_module(*prosperity))
     successful_sources = ",".join(result["label"] for result in results if result.get("ok"))
-    requested_sources = ",".join([module[0] for module in first_wave + second_wave])
+    requested_sources = ",".join([module[0] for module in first_wave + second_wave + [prosperity]])
     scoring_args = [*common, "--sources", successful_sources, "--requested-sources", requested_sources, "--since", str(started_ts)]
     results.append(run_module("scoring", "tools/scoring/grader.py", scoring_args))
     output = ROOT / "knowledge/research/pipeline"

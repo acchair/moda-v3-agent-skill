@@ -198,6 +198,29 @@ def fetch_financial_report(code: str, report_type: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def fetch_historical_valuation(code: str) -> dict[str, pd.DataFrame]:
+    """Five-year PE/PB history for individual valuation percentiles."""
+    results: dict[str, pd.DataFrame] = {}
+    for key, indicator in (("pe", "市盈率(TTM)"), ("pb", "市净率")):
+        try:
+            frame = ak.stock_zh_valuation_baidu(symbol=code, indicator=indicator, period="近五年")
+            if frame is not None and not frame.empty:
+                results[key] = frame
+        except Exception as exc:
+            print(f"  [历史估值/{indicator}] 失败: {exc}")
+    return results
+
+
+def _history_percentile(frame: pd.DataFrame) -> float | None:
+    if frame is None or frame.empty or "value" not in frame.columns:
+        return None
+    values = pd.to_numeric(frame["value"], errors="coerce").dropna()
+    if len(values) < 60:
+        return None
+    current = float(values.iloc[-1])
+    return float((values <= current).mean())
+
+
 # ══════════════════════════════════════════════════════
 #  Report Generator
 # ══════════════════════════════════════════════════════
@@ -212,7 +235,8 @@ def _safe_num(v, fmt=".2f"):
 
 
 def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame,
-                    valuation: pd.DataFrame, financials: dict[str, pd.DataFrame]) -> dict:
+                    valuation: pd.DataFrame, financials: dict[str, pd.DataFrame],
+                    valuation_history: dict[str, pd.DataFrame] | None = None) -> dict:
     def latest(report_type: str, column: str):
         frame = financials.get(report_type, pd.DataFrame())
         if frame.empty or column not in frame.columns:
@@ -263,6 +287,13 @@ def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame
         peers = peers[peers > 0]
         if not peers.empty:
             metrics["peer_pe_ttm_median"] = float(peers.median())
+    valuation_history = valuation_history or {}
+    pe_percentile = _history_percentile(valuation_history.get("pe", pd.DataFrame()))
+    pb_percentile = _history_percentile(valuation_history.get("pb", pd.DataFrame()))
+    if pe_percentile is not None:
+        metrics["pe_percentile_5y"] = pe_percentile
+    if pb_percentile is not None:
+        metrics["pb_percentile_5y"] = pb_percentile
     if not kline_daily.empty and "close" in kline_daily.columns:
         close = pd.to_numeric(kline_daily["close"], errors="coerce").dropna().tail(800)
         if len(close) >= 240:
@@ -289,7 +320,8 @@ def build_report(code: str, name: str,
                  kline_daily: pd.DataFrame,
                  kline_quarterly: pd.DataFrame,
                  valuation: pd.DataFrame,
-                 financials: dict[str, pd.DataFrame]) -> str:
+                 financials: dict[str, pd.DataFrame],
+                 valuation_history: dict[str, pd.DataFrame] | None = None) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     L = [
         f"# 基本面+行情报告: {name}({code})",
@@ -300,7 +332,7 @@ def build_report(code: str, name: str,
         f"",
         "---",
     ]
-    L.append(f"<!-- moda_metrics: {json.dumps(_report_metrics(code, spot, info, kline_daily, valuation, financials), ensure_ascii=False)} -->")
+    L.append(f"<!-- moda_metrics: {json.dumps(_report_metrics(code, spot, info, kline_daily, valuation, financials, valuation_history), ensure_ascii=False)} -->")
 
     # ── 1. 实时行情 ──
     L += ["## 1. 实时行情", ""]
@@ -436,6 +468,18 @@ def build_report(code: str, name: str,
         L.append("⚠️ 无同行估值数据")
     L.append("")
 
+    # ── 7. 历史估值分位 ──
+    valuation_history = valuation_history or {}
+    L += ["## 7. 五年估值分位", "", "| 指标 | 当前历史分位 | 样本数 |", "|---|---:|---:|"]
+    for key, label in (("pe", "PE-TTM"), ("pb", "PB")):
+        frame = valuation_history.get(key, pd.DataFrame())
+        percentile = _history_percentile(frame)
+        if percentile is not None:
+            L.append(f"| {label} | {percentile:.1%} | {len(frame)} |")
+        else:
+            L.append(f"| {label} | 需人工确认 | {len(frame)} |")
+    L.append("")
+
     L += [
         "---",
         "",
@@ -462,13 +506,14 @@ def analyze_stock(code: str, name: str = None, kline_file: Path | None = None) -
     print(f"{'='*55}")
 
     print("[1/3] 并行获取行情、行业同行和三张财报 ...")
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         spot_future = executor.submit(fetch_spot, code)
         company_future = executor.submit(fetch_company_and_peers, code)
         financial_futures = {
             report_type: executor.submit(fetch_financial_report, code, report_type)
             for report_type in ("lrb", "fzb", "llb")
         }
+        valuation_history_future = executor.submit(fetch_historical_valuation, code)
 
         print("[2/3] 读取日K线 ...")
         kline_daily = fetch_kline_daily(code, kline_file)
@@ -478,18 +523,20 @@ def analyze_stock(code: str, name: str = None, kline_file: Path | None = None) -
         spot = spot_future.result()
         info, valuation = company_future.result()
         financials = {report_type: future.result() for report_type, future in financial_futures.items()}
+        valuation_history = valuation_history_future.result()
 
     report = build_report(code, name, spot, info,
                           kline_daily, kline_quarterly,
-                          valuation, financials)
+                          valuation, financials, valuation_history)
 
     outpath = OUTPUT_BASE / f"{code}.md"
     outpath.write_text(report, encoding="utf-8")
 
     # 快速摘要
     ok = sum(1 for x in [spot, info, not kline_daily.empty, not kline_quarterly.empty,
-                          not valuation.empty, any(not frame.empty for frame in financials.values())] if x)
-    print(f"\n  ✅ 报告 ({ok}/6 数据集可用) → {outpath}")
+                          not valuation.empty, any(not frame.empty for frame in financials.values()),
+                          bool(valuation_history)] if x)
+    print(f"\n  ✅ 报告 ({ok}/7 数据集可用) → {outpath}")
     print(f"{'='*55}")
     return str(outpath)
 

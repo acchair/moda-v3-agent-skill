@@ -78,7 +78,7 @@ def _sleep_checks(card: Scorecard) -> list[tuple[str, str, str]]:
     ]
 
 
-def _framework_conclusion(card: Scorecard, evidence: dict[str, Any]) -> list[str]:
+def _framework_conclusion(card: Scorecard, evidence: dict[str, Any]) -> list[tuple[str, str]]:
     subfactors = {item.key: item for factor in card.factors for item in factor.subfactors}
     factors = {factor.key: factor for factor in card.factors}
     adjustments = {item.key: item for item in card.adjustments}
@@ -97,13 +97,14 @@ def _framework_conclusion(card: Scorecard, evidence: dict[str, Any]) -> list[str
     sentiment = adjustments["sentiment"]
     weakest = min(card.factors, key=lambda factor: factor.score / factor.maximum)
     logic_status = "基本成立" if factors["F1"].score >= 20 and factors["F3"].score >= 12 else "尚未完全成立"
+    prosperity = evidence.get("industry_prosperity_status", "需人工确认")
     return [
-        f"1. 一句话逻辑：{logic_status}。{name}的核心依据是{track.reason}，但必须以已验证证据为准。",
-        f"2. 产业位置：{upstream.reason}；供需判断为{supply.reason}。赛道成立不等于位置合适。",
-        f"3. 国产替代与兑现：{chokepoint.reason}；{capex.reason}；{realization.reason}。订单和利润没有共同兑现时，题材不能单独支撑评级。",
-        f"4. 位置与市场态度：{price.reason}；机构方向 {institutional.score:g}/2，技术结构 {technical.score:g}/4，情绪/拥挤度 {sentiment.score:g}/2。热榜只代表关注，不代表利好。",
-        f"5. 安全边际：{financial.reason}；{background.reason}。当前最大短板是 {weakest.key} {weakest.label}（{_fmt(weakest.score)}/{_fmt(weakest.maximum)}）。",
-        f"6. 结论：归入“{card.rating}”，{card.rating_reason}。证伪条件是产业需求、订单或资本开支连续两个报告期恶化，或现金流、审计和股东行为明显转坏。",
+        ("1. 一句话逻辑", f"{logic_status}。{name}的核心依据是{track.reason}，但必须以已验证证据为准。"),
+        ("2. 产业位置", f"{upstream.reason}；供需判断为{supply.reason}；行业景气交叉验证为{prosperity}。赛道成立不等于位置合适。"),
+        ("3. 国产替代与兑现", f"{chokepoint.reason}；{capex.reason}；{realization.reason}。订单和利润没有共同兑现时，题材不能单独支撑评级。"),
+        ("4. 位置与市场态度", f"{price.reason}；机构方向 {institutional.score:g}/2，技术结构 {technical.score:g}/4，情绪/拥挤度 {sentiment.score:g}/2。热榜只代表关注，不代表利好。"),
+        ("5. 安全边际", f"{financial.reason}；{background.reason}。当前最大短板是 {weakest.key} {weakest.label}（{_fmt(weakest.score)}/{_fmt(weakest.maximum)}）。"),
+        ("6. 最终判断", f"归入“{card.rating}”，{card.rating_reason}。证伪条件是产业需求、订单或资本开支连续两个报告期恶化，或现金流、审计和股东行为明显转坏。"),
     ]
 
 
@@ -151,6 +152,41 @@ def _technical_analysis(evidence: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _industry_prosperity_analysis(evidence: dict[str, Any]) -> list[str]:
+    mapping = evidence.get("industry_mapping") if isinstance(evidence.get("industry_mapping"), dict) else {}
+    financial = evidence.get("industry_financial_signal") if isinstance(evidence.get("industry_financial_signal"), dict) else {}
+    supply = evidence.get("industry_supply_signal") if isinstance(evidence.get("industry_supply_signal"), dict) else {}
+    market = evidence.get("industry_market_signal") if isinstance(evidence.get("industry_market_signal"), dict) else {}
+    conflicts = evidence.get("industry_prosperity_conflicts") if isinstance(evidence.get("industry_prosperity_conflicts"), list) else []
+
+    def pct(value: Any) -> str:
+        try:
+            return f"{float(value):.2%}"
+        except (TypeError, ValueError):
+            return "需人工确认"
+
+    def ratio(value: Any) -> str:
+        try:
+            return f"{float(value):.2f}x"
+        except (TypeError, ValueError):
+            return "需人工确认"
+    return [
+        "## 行业景气度交叉验证",
+        "",
+        f"- 行业映射：{mapping.get('matched_token', '需人工确认')} → {mapping.get('sw_second_name', '需人工确认')} → {mapping.get('sw_first_name', '需人工确认')}（{mapping.get('status', '不可用')}）",
+        f"- 综合状态：{evidence.get('industry_prosperity_status', '不可用')}；覆盖：{evidence.get('industry_prosperity_coverage', '不可用')}；报告期：{evidence.get('industry_prosperity_period', '需人工确认')}。本项只交叉验证，不独立加分。",
+        "",
+        "| 层面 | 状态 | 当前判断 |",
+        "|---|---|---|",
+        f"| 财务确认 | {financial.get('status', '不可用')} | 可用 {financial.get('available_metrics', 0)}/6；当期正向 {financial.get('current_positive', 0)}；边际正向 {financial.get('delta_positive', 0)} |",
+        f"| 供需先行 | {supply.get('status', '不可用')} | 商品 {supply.get('commodity') or '未匹配'}；证据 {supply.get('evidence_count') or 0} 类；PPI 同比 {supply.get('ppi_yoy', '需人工确认')} |",
+        f"| 市场验证 | {market.get('status', '不可用')} | 20日相对沪深300 {pct(market.get('relative_to_csi300_20d'))}；成交活跃比 {ratio(market.get('turnover_activity_ratio'))} |",
+        "",
+        "- 冲突检查：" + ("；".join(conflicts) if conflicts else "未发现已覆盖指标之间的明确冲突。"),
+        "- 来源边界：乐咕为 B 级聚合数据；雪球文章仅作 C 级方法线索，均不能单独确认产业景气。",
+    ]
+
+
 def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecard, requested_modules: tuple[str, ...]) -> str:
     adjustments = {item.key: item for item in card.adjustments}
     lines = [
@@ -174,9 +210,11 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
         "## 一句话结论与最终判断",
         "",
     ]
-    lines.extend(_framework_conclusion(card, evidence))
-    lines += [""]
+    for title, body in _framework_conclusion(card, evidence):
+        lines += [f"**{title}**", "", body, ""]
     lines.extend(_technical_analysis(evidence))
+    lines += [""]
+    lines.extend(_industry_prosperity_analysis(evidence))
     lines += [
         "",
         "## 六层图形概览",
@@ -225,7 +263,7 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
         "## 舆情、社交热榜与异常推广风险",
         "",
         f"- 个股关注热度：{evidence.get('attention_heat', '需人工确认')}（EastMoney 人气排名归一化）",
-        f"- 市场拥挤度：{evidence.get('market_congestion', '需人工确认')}；数据日期 {evidence.get('market_congestion_date', '需人工确认')}；{'有效' if evidence.get('market_congestion_fresh') is True else '过期或缺失，不计分'}",
+        f"- 市场拥挤度：{evidence.get('market_congestion', '需人工确认')}；今日检查 {evidence.get('market_congestion_checked_date', '需人工确认')}；源数据日期 {evidence.get('market_congestion_date', '需人工确认')}；{'有效' if evidence.get('market_congestion_fresh') is True else '过期或缺失，不计分'}",
         f"- 社交热榜：命中 {evidence.get('social_hot_hits', '需人工确认')} 条，覆盖 {evidence.get('social_platform_hits', '需人工确认')} 个平台",
         f"- 异常推广风险：{evidence.get('trap_risk_level', '需人工确认')}；命中 {evidence.get('trap_signal_count', '需人工确认')}/8",
         "",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 from io import StringIO
 import json
 from pathlib import Path
@@ -9,6 +10,7 @@ import sys
 import time
 from typing import Callable
 
+import akshare as ak
 import pandas as pd
 import requests
 
@@ -77,6 +79,33 @@ def fetch_pledge(code: str, timeout: float = 15) -> pd.DataFrame:
     return pd.DataFrame(result.get("data") or [])
 
 
+def _completed_quarters(reference: date | None = None, count: int = 6) -> list[str]:
+    current = reference or date.today()
+    year = current.year
+    quarter = (current.month - 1) // 3
+    if quarter == 0:
+        year -= 1
+        quarter = 4
+    values: list[str] = []
+    for _ in range(count):
+        values.append(f"{year}{quarter}")
+        quarter -= 1
+        if quarter == 0:
+            year -= 1
+            quarter = 4
+    return values
+
+
+def fetch_fund_holding(code: str) -> pd.DataFrame:
+    for quarter in _completed_quarters():
+        frame = ak.stock_institute_hold_detail(stock=code, quarter=quarter)
+        if frame is not None and not frame.empty:
+            result = frame.copy()
+            result["报告季度"] = quarter
+            return result
+    return pd.DataFrame()
+
+
 def _holder_metrics(holders: list[dict]) -> dict:
     if not holders:
         return {}
@@ -109,12 +138,28 @@ def collect(code: str) -> tuple[dict, dict[str, pd.DataFrame]]:
         "concepts": _safe_fetch(lambda: provider.concept_blocks(code)),
         "research": _safe_fetch(lambda: provider.research_reports(code, max_pages=1)),
         "pledge": _safe_fetch(lambda: fetch_pledge(code)),
+        "fund_holding": _safe_fetch(lambda: fetch_fund_holding(code)),
     }
     try:
         holders = fetch_top_holders(code)
     except Exception:
         holders = []
     structured = _holder_metrics(holders)
+
+    fund_holding = frames["fund_holding"]
+    if not fund_holding.empty:
+        ratios = pd.to_numeric(fund_holding.get("持股比例"), errors="coerce")
+        changes = pd.to_numeric(fund_holding.get("持股比例增幅"), errors="coerce")
+        structured["fund_holding_quarter"] = str(fund_holding.iloc[0].get("报告季度") or "")
+        structured["fund_holding_institutions"] = int(len(fund_holding))
+        if ratios.notna().any():
+            structured["fund_holding_ratio"] = float(ratios.fillna(0).sum())
+        if changes.notna().any():
+            structured["fund_holding_change_pct"] = float(changes.fillna(0).sum())
+        if "top10_quality_reason" in structured:
+            change = structured.get("fund_holding_change_pct")
+            change_text = f"；基金持股比例变化 {change:.2f} 个百分点" if change is not None else "；基金持仓变化需人工确认"
+            structured["top10_quality_reason"] += change_text
 
     holder_num = frames["holder_num"]
     if not holder_num.empty:
@@ -201,6 +246,10 @@ def build_report(code: str, name: str, structured: dict, frames: dict[str, pd.Da
         "## 股权质押",
         "",
         *_frame_table(frames["pledge"], ["NOTICE_DATE", "HOLDER_NAME", "PF_TSR", "UNFREEZE_STATE"]),
+        "",
+        "## 基金持仓季度变化",
+        "",
+        *_frame_table(frames["fund_holding"], ["报告季度", "持股机构简称", "持股比例", "持股比例增幅", "占流通股比例"]),
         "",
         "## 概念与研报",
         "",

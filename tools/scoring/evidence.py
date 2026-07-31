@@ -23,6 +23,7 @@ SOURCE_LABELS = {
     "social_sentiment": "公开社交热榜",
     "macro_policy": "AKShare/PBOC + gov.cn",
     "web_research": "SearXNG + DuckDuckGo MCP",
+    "industry_prosperity": "乐咕乐股(B级) + AKShare/申万",
 }
 REPORTS = tuple(SOURCE_LABELS)
 COMMENT_PATTERN = re.compile(r"<!--\s*(moda_[a-z_]+):\s*(\{.*?\})\s*-->", re.S)
@@ -152,10 +153,12 @@ def _chain_match(evidence: dict[str, Any]) -> None:
             data = chain.get(stage, {}) or {}
             industries = [str(item).lower() for item in data.get("industries", [])]
             keywords = [str(item).lower() for item in data.get("keywords", [])]
-            score = alias_score
-            score += 2 * sum(item and item in industry_text for item in industries)
-            score += sum(item and item in context for item in keywords)
-            score += 0.25 * sum(item and item in concept_context and item not in context for item in keywords)
+            primary_score = alias_score if primary_aliases else 0
+            primary_score += 2 * sum(item and item in industry_text for item in industries)
+            primary_score += sum(item and item in context for item in keywords)
+            if primary_score <= 0:
+                continue
+            score = primary_score + 0.25 * sum(item and item in concept_context and item not in context for item in keywords)
             candidate = (score, chain_name, stage)
             if score > 0 and (best is None or candidate[0] > best[0]):
                 best = candidate
@@ -164,9 +167,26 @@ def _chain_match(evidence: dict[str, Any]) -> None:
         _set(evidence, "chain_stage", best[2], source)
         _set(evidence, "chain_name", best[1], source)
         _set(evidence, "business_chain_match", min(1.0, best[0] / 3), source)
-        evidence["chain_partial"] = best[0] < 3
-        evidence["business_match_partial"] = best[0] < 3
-        evidence["business_match_reason"] = f"匹配 {best[1]}，位置为 {best[2]}"
+        breakdown = evidence.get("business_breakdown") if isinstance(evidence.get("business_breakdown"), list) else []
+        product_rows = [item for item in breakdown if item.get("category") == "按产品分类"]
+        revenue_rows = product_rows or [item for item in breakdown if item.get("category") == "按行业分类"]
+        matched_ratio = 0.0
+        chain = next((item for item in raw.get("chains", []) if str(item.get("name")) == best[1]), {})
+        stage_data = chain.get(best[2], {}) or {}
+        revenue_terms = [str(item).lower() for item in stage_data.get("keywords", [])]
+        for row in revenue_rows:
+            item_name = str(row.get("item") or "").lower()
+            ratio = _float(row.get("revenue_ratio"))
+            if ratio is not None and any(term and term in item_name for term in revenue_terms):
+                matched_ratio += ratio
+        if matched_ratio > 0:
+            _set(evidence, "business_chain_revenue_ratio", min(1.0, matched_ratio), "EastMoney/F10")
+        revenue_confirmed = matched_ratio >= 0.30
+        partial = best[0] < 3 or not revenue_confirmed
+        evidence["chain_partial"] = partial
+        evidence["business_match_partial"] = partial
+        ratio_text = f"，主营收入支持 {matched_ratio:.1%}" if matched_ratio > 0 else "，缺少收入占比确认"
+        evidence["business_match_reason"] = f"匹配 {best[1]}，位置为 {best[2]}{ratio_text}"
 
 
 def _chokepoint_match(evidence: dict[str, Any]) -> None:
@@ -199,30 +219,58 @@ def _chokepoint_match(evidence: dict[str, Any]) -> None:
 
 
 def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) -> None:
-    structured_context = " ".join([
-        str(evidence.get("industry", "")),
+    industry_context = str(evidence.get("industry", ""))
+    business_context = " ".join([
         str(evidence.get("main_business", "")),
         " ".join(str(item) for item in evidence.get("business_items", [])[:30]),
-        " ".join(str(item) for item in evidence.get("concepts", [])[:30]),
     ])
+    concept_context = " ".join(str(item) for item in evidence.get("concepts", [])[:30])
+    structured_context = " ".join([industry_context, business_context])
     searchable_reports = [report for directory, report in reports.items() if directory != "web_research"]
     full_context = structured_context + " " + " ".join(searchable_reports)
-    matched_tracks = [label for label, terms in TRACK_GROUPS.items() if any(term.lower() in structured_context.lower() for term in terms)]
-    if matched_tracks:
-        strength = 1.0 if len(matched_tracks) >= 2 else 0.8
+    track_candidates: list[tuple[int, int, int, str, list[str], list[str]]] = []
+    concept_clues: list[str] = []
+    for label, terms in TRACK_GROUPS.items():
+        industry_hits = [term for term in terms if term.lower() in industry_context.lower()]
+        business_hits = [term for term in terms if term.lower() in business_context.lower()]
+        concept_hits = [term for term in terms if term.lower() in concept_context.lower()]
+        primary_score = len(industry_hits) * 2 + len(business_hits)
+        if primary_score:
+            track_candidates.append((primary_score, len(business_hits), len(industry_hits), label, industry_hits, business_hits))
+        elif concept_hits:
+            concept_clues.append(label)
+    if track_candidates:
+        _, business_count, industry_count, dominant_track, industry_hits, business_hits = max(track_candidates, key=lambda item: item[:3])
+        strength = 1.0 if industry_count and business_count else 0.8 if business_count >= 2 else 0.6
         _set(evidence, "track_strength", strength, "行业/主营结构化匹配")
-        evidence["track_reason"] = "匹配赛道：" + "、".join(matched_tracks)
-        evidence["track_partial"] = len(matched_tracks) == 1
+        evidence["dominant_track"] = dominant_track
+        hits = list(dict.fromkeys([*industry_hits, *business_hits]))
+        evidence["track_reason"] = f"主导赛道：{dominant_track}（主营/行业命中：{'、'.join(hits)}）"
+        evidence["track_partial"] = strength < 1.0
+    elif concept_clues:
+        evidence["track_clues"] = list(dict.fromkeys(concept_clues))
+        evidence["track_reason"] = "仅概念板块提示可能赛道，不参与大时代赛道得分"
 
     order_growth = _float(evidence.get("order_growth"))
-    capex_hits = [term for term in CAPEX_TERMS if term in full_context]
-    if order_growth is not None and order_growth > 0:
-        _set(evidence, "capex_strength", 1.0, evidence.get("metric_sources", {}).get("order_growth", ["公告"])[0])
-        evidence["capex_reason"] = f"订单增长 {order_growth:.2f}% 并出现资本开支兑现证据"
-    elif capex_hits:
+    announcement_text = " ".join(str(item) for item in evidence.get("announcement_titles", []))
+    capex_hits = [term for term in CAPEX_TERMS if term in announcement_text]
+    company_capex = bool(order_growth is not None and order_growth > 0) or bool(capex_hits)
+    industry_capex = evidence.get("industry_capex_signal") == "上行"
+    if company_capex and industry_capex:
+        _set(evidence, "capex_strength", 1.0, "公司公告 + 行业资本开支")
+        evidence["capex_reason"] = "公司订单/扩产与行业资本开支双侧确认"
+    elif company_capex or industry_capex:
         _set(evidence, "capex_strength", 0.5, "公告/主营文本")
-        evidence["capex_reason"] = "发现资本开支相关证据：" + "、".join(capex_hits[:3])
+        detail = f"订单增长 {order_growth:.2f}%" if order_growth is not None and order_growth > 0 else "、".join(capex_hits[:3]) if capex_hits else "行业资本开支上行"
+        evidence["capex_reason"] = f"仅单侧资本开支证据：{detail}"
         evidence["capex_partial"] = True
+
+    prosperity = evidence.get("industry_prosperity_status")
+    coverage = evidence.get("industry_prosperity_coverage")
+    if prosperity:
+        evidence["industry_prosperity_reason"] = f"行业景气 {prosperity}（{coverage or '覆盖未知'}）"
+        if prosperity in {"走弱", "不可用"} or coverage != "完整":
+            evidence["track_partial"] = True
 
     titles = [str(item) for item in evidence.get("announcement_titles", [])]
     title_text = " ".join(titles)

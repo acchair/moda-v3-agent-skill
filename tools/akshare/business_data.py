@@ -46,12 +46,23 @@ def build_structured(frame: pd.DataFrame) -> dict:
     latest = latest.sort_values("MBI_RATIO", ascending=False)
     business_rows = latest[latest["MAINOP_TYPE"].isin(("1", "2"))]
     business_items = business_rows["ITEM_NAME"].dropna().astype(str).head(20).tolist()
+    breakdown: list[dict] = []
+    for _, row in business_rows.head(30).iterrows():
+        ratio = row.get("MBI_RATIO")
+        margin = row.get("GROSS_RPOFIT_RATIO")
+        breakdown.append({
+            "category": TYPE_NAMES.get(str(row.get("MAINOP_TYPE")), str(row.get("MAINOP_TYPE"))),
+            "item": str(row.get("ITEM_NAME") or ""),
+            "revenue_ratio": None if pd.isna(ratio) else round(float(ratio), 6),
+            "gross_margin": None if pd.isna(margin) else round(float(margin), 6),
+        })
     region_rows = latest[latest["MAINOP_TYPE"].eq("3")]
     overseas_rows = region_rows[region_rows["ITEM_NAME"].astype(str).map(lambda value: any(term in value for term in OVERSEAS_TERMS))]
     overseas_ratio = float(overseas_rows["MBI_RATIO"].sum() * 100) if not overseas_rows.empty else 0.0
     return {
         "business_report_date": latest_date.strftime("%Y-%m-%d"),
         "business_items": business_items,
+        "business_breakdown": breakdown,
         "main_business": "、".join(business_items[:8]),
         "overseas_revenue_ratio": round(overseas_ratio, 4),
     }

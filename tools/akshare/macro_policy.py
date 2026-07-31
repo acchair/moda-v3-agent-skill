@@ -44,10 +44,35 @@ def _latest_pmi() -> dict:
     clean["_date"] = pd.to_datetime(clean["月份"].astype(str).str.replace("月份", "", regex=False), format="%Y年%m", errors="coerce")
     clean = clean.dropna(subset=["_date"]).sort_values("_date")
     latest = clean.iloc[-1]
+    previous = clean.iloc[-2] if len(clean) > 1 else latest
     return {
         "pmi_date": latest["_date"].date().isoformat(),
         "manufacturing_pmi": float(latest["制造业-指数"]),
         "non_manufacturing_pmi": float(latest["非制造业-指数"]),
+        "manufacturing_pmi_change": round(float(latest["制造业-指数"] - previous["制造业-指数"]), 4),
+    }
+
+
+def _latest_ppi() -> dict:
+    frame = ak.macro_china_ppi()
+    if frame is None or frame.empty:
+        return {}
+    clean = frame.copy()
+    clean["_date"] = pd.to_datetime(
+        clean["月份"].astype(str).str.replace("月份", "", regex=False),
+        format="%Y年%m",
+        errors="coerce",
+    )
+    clean["当月同比增长"] = pd.to_numeric(clean["当月同比增长"], errors="coerce")
+    clean = clean.dropna(subset=["_date", "当月同比增长"]).sort_values("_date")
+    if clean.empty:
+        return {}
+    latest = clean.iloc[-1]
+    previous = clean.iloc[-2] if len(clean) > 1 else latest
+    return {
+        "ppi_date": latest["_date"].date().isoformat(),
+        "ppi_yoy": float(latest["当月同比增长"]),
+        "ppi_yoy_change": round(float(latest["当月同比增长"] - previous["当月同比增长"]), 4),
     }
 
 
@@ -80,6 +105,10 @@ def collect(industry: str) -> dict:
     except Exception as exc:
         data["macro_errors"].append(f"pmi:{type(exc).__name__}")
     try:
+        data.update(_latest_ppi())
+    except Exception as exc:
+        data["macro_errors"].append(f"ppi:{type(exc).__name__}")
+    try:
         latest, relevant = _policy_titles(industry)
         data["official_policy_titles"] = latest
         data["relevant_policy_titles"] = relevant
@@ -104,6 +133,7 @@ def build_report(code: str, name: str, data: dict) -> str:
         f"- 行业上下文：{data.get('macro_industry') or '需人工确认'}",
         f"- LPR：1 年 {data.get('lpr_1y', '需人工确认')}%，5 年 {data.get('lpr_5y', '需人工确认')}%（{data.get('lpr_date', '需人工确认')}）",
         f"- PMI：制造业 {data.get('manufacturing_pmi', '需人工确认')}，非制造业 {data.get('non_manufacturing_pmi', '需人工确认')}（{data.get('pmi_date', '需人工确认')}）",
+        f"- PPI：同比 {data.get('ppi_yoy', '需人工确认')}%，边际变化 {data.get('ppi_yoy_change', '需人工确认')} 个百分点（{data.get('ppi_date', '需人工确认')}）",
         f"- 相关政策：{data.get('policy_evidence_count', '需人工确认')} 条，方向 {data.get('policy_direction', '需人工确认')}",
         "",
         "## 相关政策标题",

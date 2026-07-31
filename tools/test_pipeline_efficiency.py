@@ -208,7 +208,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
         evidence["completed_modules"] = []
         card = score_evidence(evidence)
         report = grader.render_report("300820", "英杰电气", evidence, card, ())
-        for heading in ("## 综合得分", "## 一句话结论与最终判断", "## 技术分析（easy-tdx 日 K）", "## 六层图形概览",
+        for heading in ("## 综合得分", "## 一句话结论与最终判断", "## 技术分析（easy-tdx 日 K）", "## 行业景气度交叉验证", "## 六层图形概览",
                         "## 六层评分卡", "## F5 低位与困境反转", "## F6 修正项", "## 舆情、社交热榜与异常推广风险",
                         "## Hard Cap 检查", "## 机构方法交叉验证", "## 睡得着检查"):
             self.assertIn(heading, report)
@@ -225,6 +225,67 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertNotIn("A股适用性", report)
         self.assertIn("当前价格：30.0；支撑位：28.0；压力位：33.0", report)
         self.assertIn("F6 是独立的第六层，已计入综合分", report)
+        self.assertIn("**1. 一句话逻辑**\n\n", report)
+        self.assertIn("**6. 最终判断**\n\n", report)
+
+    def test_coldness_requires_f3_survival_gate(self) -> None:
+        data = full_evidence()
+        for key in ("background_quality", "leadership_strength", "net_profit", "operating_cashflow",
+                    "debt_ratio", "cash_to_debt", "st_risk", "audit_risk", "goodwill_risk", "specialized_strength"):
+            data.pop(key, None)
+            data["metric_sources"].pop(key, None)
+        f5 = next(factor for factor in score_evidence(data).factors if factor.key == "F5")
+        coldness = next(item for item in f5.subfactors if item.key == "coldness")
+        self.assertEqual(coldness.score, 0)
+        self.assertIn("生存门槛未通过", coldness.reason)
+
+    def test_expectation_gap_requires_low_attention(self) -> None:
+        data = full_evidence()
+        data["attention_heat"] = 0.8
+        f5 = next(factor for factor in score_evidence(data).factors if factor.key == "F5")
+        gap = next(item for item in f5.subfactors if item.key == "expectation_gap")
+        self.assertEqual(gap.score, 0)
+
+    def test_industry_prosperity_only_changes_confidence_not_score(self) -> None:
+        baseline = score_evidence(full_evidence())
+        data = full_evidence()
+        data.update({
+            "industry_prosperity_status": "走弱",
+            "industry_prosperity_coverage": "完整",
+            "industry_prosperity_conflicts": ["利润改善但营收边际下降"],
+            "industry_financial_signal": {"status": "走弱"},
+            "industry_supply_signal": {"status": "走弱"},
+        })
+        checked = score_evidence(data)
+        self.assertEqual(checked.final_score, baseline.final_score)
+        realization = next(item for factor in checked.factors for item in factor.subfactors if item.key == "realization")
+        self.assertEqual(realization.status, "部分覆盖")
+
+    def test_concept_only_track_is_a_clue_not_a_score(self) -> None:
+        reports = {"market_events": '<!-- moda_market_events: {"concepts": ["AI算力", "商业航天"]} -->'}
+        evidence = evidence_module.build_evidence("301128", "强瑞技术", reports)
+        self.assertNotIn("track_strength", evidence)
+        self.assertIn("AI 算力与数据中心", evidence["track_clues"])
+
+    def test_one_dominant_track_and_revenue_backed_chain(self) -> None:
+        reports = {
+            "finance_data": '<!-- moda_metrics: {"industry": "半导体"} -->',
+            "business_data": '<!-- moda_business: {"main_business": "半导体设备", "business_items": ["半导体设备"], "business_breakdown": [{"category": "按产品分类", "item": "半导体设备", "revenue_ratio": 0.4}]} -->',
+            "market_events": '<!-- moda_market_events: {"concepts": ["AI算力", "商业航天", "储能"]} -->',
+        }
+        evidence = evidence_module.build_evidence("301128", "强瑞技术", reports)
+        self.assertEqual(evidence["dominant_track"], "半导体国产替代")
+        self.assertNotIn("AI 算力与数据中心", evidence["track_reason"])
+        self.assertGreaterEqual(evidence["business_chain_revenue_ratio"], 0.3)
+        self.assertFalse(evidence["chain_partial"])
+
+    def test_unconfirmed_business_revenue_caps_chain_match(self) -> None:
+        data = full_evidence()
+        data.update({"business_chain_match": 1.0, "business_match_partial": True})
+        f4 = next(factor for factor in score_evidence(data).factors if factor.key == "F4")
+        business_match = next(item for item in f4.subfactors if item.key == "business_match")
+        self.assertEqual(business_match.score, 2)
+        self.assertEqual(business_match.status, "部分覆盖")
 
     def test_report_progress_bars_are_bounded_and_complete(self) -> None:
         self.assertEqual(grader._progress_bar(-1, 100, 10), "░" * 10)

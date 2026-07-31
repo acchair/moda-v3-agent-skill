@@ -137,9 +137,12 @@ def _score_f1(evidence: dict[str, Any]) -> FactorResult:
     if track is None:
         items.append(_missing("era_track", "大时代赛道", 10, "缺少可核验的行业、主营或产业标签"))
     else:
+        track_reason = evidence.get("track_reason", "按行业、主营和产业标签匹配")
+        if evidence.get("industry_prosperity_reason"):
+            track_reason = f"{track_reason}；{evidence['industry_prosperity_reason']}"
         items.append(_subfactor(
             evidence, "era_track", "大时代赛道", track * 10, 10,
-            evidence.get("track_reason", "按行业、主营和产业标签匹配"),
+            track_reason,
             ("track_strength",), partial=evidence.get("track_partial", False),
         ))
 
@@ -293,6 +296,12 @@ def _score_f3(evidence: dict[str, Any]) -> FactorResult:
                 details.append(f"商誉占总资产 {ratio:.2%}，{'风险偏高' if value is True else '未触发10%观察线'}")
             else:
                 details.append(f"{label}：{'有' if value is True else '未见'}")
+        extra_supply = []
+        for key, label in (("supply_cr3", "CR3"), ("capacity_expansion_cycle_years", "扩产周期"), ("capacity_utilization_trend", "产能利用率")):
+            if _known(evidence.get(key)):
+                extra_supply.append(f"{label}={evidence[key]}")
+        if extra_supply:
+            reason += "；" + "；".join(extra_supply)
         items.append(_subfactor(
             evidence, "survival_risk", "退市/审计/商誉风险", score, 3, "；".join(details),
             tuple(key for key, _, _ in known_risks), partial=len(known_risks) < len(risk_checks),
@@ -312,7 +321,13 @@ def _score_f4(evidence: dict[str, Any]) -> FactorResult:
     if match is None:
         items.append(_missing("business_match", "主营匹配产业链", 4, "缺少主营构成或产业链匹配结果"))
     else:
-        items.append(_subfactor(evidence, "business_match", "主营匹配产业链", match * 4, 4, evidence.get("business_match_reason", "按主营构成和产业链匹配判断"), ("business_chain_match",), partial=evidence.get("business_match_partial", False)))
+        partial = evidence.get("business_match_partial", False)
+        score = min(match * 4, 2) if partial else match * 4
+        items.append(_subfactor(
+            evidence, "business_match", "主营匹配产业链", score, 4,
+            evidence.get("business_match_reason", "按主营构成和产业链匹配判断"),
+            ("business_chain_match",), partial=partial,
+        ))
 
     stage = evidence.get("chain_stage")
     stage_scores = {"upstream": 4, "midstream": 2, "downstream": 1}
@@ -344,11 +359,20 @@ def _score_f4(evidence: dict[str, Any]) -> FactorResult:
     if not keys:
         items.append(_missing("realization", "订单/产能兑现", 4, "缺少营收、利润、订单或产能兑现数据"))
     else:
-        items.append(_subfactor(evidence, "realization", "订单/产能兑现", realization_score, 4, "；".join(details), keys, partial=len(keys) < 3))
+        industry_financial = evidence.get("industry_financial_signal") if isinstance(evidence.get("industry_financial_signal"), dict) else {}
+        industry_status = industry_financial.get("status")
+        if industry_status:
+            details.append(f"行业财务景气 {industry_status}（仅交叉验证）")
+        conflict = bool(evidence.get("industry_prosperity_conflicts")) or industry_status in {"走弱", "不可用"}
+        items.append(_subfactor(
+            evidence, "realization", "订单/产能兑现", realization_score, 4,
+            "；".join(details), keys,
+            partial=len(keys) < 3 or conflict or evidence.get("industry_prosperity_coverage") not in (None, "完整"),
+        ))
     return _factor("F4", "利润兑现路径", 15, items)
 
 
-def _score_f5(evidence: dict[str, Any]) -> FactorResult:
+def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
     items: list[SubfactorResult] = []
     price = _number(evidence.get("price_percentile_3y"))
     if price is None:
@@ -360,23 +384,38 @@ def _score_f5(evidence: dict[str, Any]) -> FactorResult:
     pe = _number(evidence.get("pe_ttm"))
     peer = _number(evidence.get("peer_pe_ttm_median"))
     pb = _number(evidence.get("pb"))
-    if pe is None and pb is None:
+    pe_percentile = _number(evidence.get("pe_percentile_5y"))
+    pb_percentile = _number(evidence.get("pb_percentile_5y"))
+    if pe is None and pb is None and pe_percentile is None and pb_percentile is None:
         items.append(_missing("valuation", "PE/PB 相对位置", 2, "PE、PB 和同行估值均缺失"))
     else:
-        score, details, keys = 0.0, [], []
+        comparison_scores: list[float] = []
+        details, keys = [], []
         if pe is not None:
             keys.append("pe_ttm")
             details.append(f"TTM PE {pe:.2f}")
             if pe > 0 and peer and peer > 0:
                 keys.append("peer_pe_ttm_median")
                 ratio = pe / peer
-                score += 2 if ratio <= 0.75 else 1 if ratio <= 1 else 0
+                comparison_scores.append(2 if ratio <= 0.75 else 1 if ratio <= 1 else 0)
                 details.append(f"同行中位数 {peer:.2f}")
         if pb is not None:
             keys.append("pb")
-            score += 2 if 0 < pb < 2 else 1 if 0 < pb < 3 else 0
+            comparison_scores.append(2 if 0 < pb < 2 else 1 if 0 < pb < 3 else 0)
             details.append(f"PB {pb:.2f}")
-        items.append(_subfactor(evidence, "valuation", "PE/PB 相对位置", score * 0.5, 2, "；".join(details), keys, partial=peer is None or pe is None or pb is None))
+        if pe_percentile is not None:
+            keys.append("pe_percentile_5y")
+            comparison_scores.append(2 if pe_percentile <= 0.20 else 1.5 if pe_percentile <= 0.35 else 1 if pe_percentile <= 0.50 else 0)
+            details.append(f"五年 PE 分位 {pe_percentile:.1%}")
+        if pb_percentile is not None:
+            keys.append("pb_percentile_5y")
+            comparison_scores.append(2 if pb_percentile <= 0.20 else 1.5 if pb_percentile <= 0.35 else 1 if pb_percentile <= 0.50 else 0)
+            details.append(f"五年 PB 分位 {pb_percentile:.1%}")
+        score = sum(comparison_scores) / len(comparison_scores) if comparison_scores else 0
+        items.append(_subfactor(
+            evidence, "valuation", "PE/PB 相对位置", score, 2, "；".join(details), keys,
+            partial=len(comparison_scores) < 2 or (pe_percentile is None and pb_percentile is None),
+        ))
 
     attention_heat = _number(evidence.get("attention_heat"))
     social_heat = _number(evidence.get("social_heat"))
@@ -385,8 +424,15 @@ def _score_f5(evidence: dict[str, Any]) -> FactorResult:
     if heat is None:
         items.append(_missing("coldness", "行业冰点/市场冷落", 2, "缺少个股关注度、人气排名或行业冷落证据"))
     else:
-        score = 2 if heat <= 0.20 else 1.5 if heat <= 0.40 else 0.5 if heat <= 0.60 else 0
-        items.append(_subfactor(evidence, "coldness", "行业冰点/市场冷落", score, 2, f"关注热度归一值 {heat:.2f}，越低越冷", ("attention_heat",), partial=evidence.get("attention_partial", False)))
+        survival_ok = f3_score >= 8 and evidence.get("st_risk") is not True
+        score = (2 if heat <= 0.20 else 1.5 if heat <= 0.40 else 0.5 if heat <= 0.60 else 0) if survival_ok else 0
+        reason = f"关注热度归一值 {heat:.2f}，越低越冷"
+        if not survival_ok:
+            reason += "；F3 生存门槛未通过，冷门不加分"
+        items.append(_subfactor(
+            evidence, "coldness", "行业冰点/市场冷落", score, 2, reason,
+            ("attention_heat",), partial=evidence.get("attention_partial", False) or not survival_ok,
+        ))
 
     inflection_score, details, keys = 0.0, [], []
     for key, label in (("revenue_yoy", "营收同比"), ("profit_yoy", "利润同比"), ("revenue_yoy_delta", "营收同比改善"), ("profit_yoy_delta", "利润同比改善")):
@@ -398,38 +444,63 @@ def _score_f5(evidence: dict[str, Any]) -> FactorResult:
     if not keys:
         items.append(_missing("inflection", "业绩拐点", 2, "缺少营收、利润及其趋势数据"))
     else:
-        items.append(_subfactor(evidence, "inflection", "业绩拐点", inflection_score * 0.5, 2, "；".join(details), keys, partial=len(keys) < 4))
+        industry_financial = evidence.get("industry_financial_signal") if isinstance(evidence.get("industry_financial_signal"), dict) else {}
+        industry_status = industry_financial.get("status")
+        supply_status = (evidence.get("industry_supply_signal") or {}).get("status") if isinstance(evidence.get("industry_supply_signal"), dict) else None
+        if industry_status:
+            details.append(f"行业财务 {industry_status}（交叉验证）")
+        if supply_status:
+            details.append(f"行业价格/库存供需 {supply_status}（交叉验证）")
+        conflict = bool(evidence.get("industry_prosperity_conflicts")) or industry_status == "走弱"
+        items.append(_subfactor(
+            evidence, "inflection", "业绩拐点", inflection_score * 0.5, 2,
+            "；".join(details), keys,
+            partial=len(keys) < 4 or conflict or evidence.get("industry_prosperity_coverage") not in (None, "完整"),
+        ))
 
-    gap_score, gap_details, gap_keys = 0.0, [], []
+    gap_details, gap_keys = [], []
     track = _number(evidence.get("track_strength"))
+    low_attention = heat is not None and heat <= 0.40
+    strong_track = track is not None and track >= 0.70
     if heat is not None and track is not None:
         gap_keys.extend(("attention_heat", "track_strength"))
-        if heat <= 0.40 and track >= 0.70:
-            gap_score += 1
+        if low_attention and strong_track:
             gap_details.append("关注度偏低但产业逻辑较强")
     order_growth = _number(evidence.get("order_growth"))
     supply_tightening = evidence.get("supply_tightening")
+    company_improvement = False
     if order_growth is not None:
         gap_keys.append("order_growth")
         if order_growth > 0:
-            gap_score += 1
+            company_improvement = True
             gap_details.append("订单已经改善")
     elif supply_tightening is not None:
         gap_keys.append("supply_tightening")
         if supply_tightening:
-            gap_score += 1
+            company_improvement = True
             gap_details.append("供需证据开始改善")
     revenue_delta = _number(evidence.get("revenue_yoy_delta"))
     profit_delta = _number(evidence.get("profit_yoy_delta"))
     if revenue_delta is not None or profit_delta is not None:
         gap_keys.extend(key for key, value in (("revenue_yoy_delta", revenue_delta), ("profit_yoy_delta", profit_delta)) if value is not None)
         if (revenue_delta or 0) > 0 or (profit_delta or 0) > 0:
-            gap_score += 1
+            company_improvement = True
             gap_details.append("财务同比趋势边际改善")
     if not gap_keys:
         items.append(_missing("expectation_gap", "预期差", 1.5, "缺少关注度与产业、订单或财务拐点的交叉证据"))
     else:
-        items.append(_subfactor(evidence, "expectation_gap", "预期差", gap_score * 0.5, 1.5, "；".join(gap_details) or "交叉证据未形成正向预期差", gap_keys, partial=len(set(gap_keys)) < 3))
+        gap_score = 1.5 if low_attention and strong_track and company_improvement and f3_score >= 8 else 0
+        prosperity = evidence.get("industry_prosperity_status")
+        if prosperity:
+            gap_details.append(f"行业景气 {prosperity}（只影响确信度）")
+        if gap_score == 0:
+            gap_details.append("低关注、强产业、公司改善和生存门槛未同时满足")
+        industry_conflict = bool(evidence.get("industry_prosperity_conflicts")) or prosperity == "走弱"
+        items.append(_subfactor(
+            evidence, "expectation_gap", "预期差", gap_score, 1.5,
+            "；".join(gap_details), gap_keys,
+            partial=gap_score == 0 or industry_conflict or evidence.get("industry_prosperity_coverage") not in (None, "完整"),
+        ))
     return _factor("F5", "低位与困境反转", 10, items)
 
 
@@ -542,7 +613,7 @@ def score_evidence(evidence: dict[str, Any]) -> Scorecard:
         _score_f4(evidence),
     )
     adjustments = _adjustments(evidence, core_factors[0].score)
-    f5 = _score_f5(evidence)
+    f5 = _score_f5(evidence, core_factors[2].score)
     f6 = _score_f6(adjustments)
     factors = (*core_factors, f5, f6)
     base_score = round(sum(factor.score for factor in (*core_factors, f5)), 2)
