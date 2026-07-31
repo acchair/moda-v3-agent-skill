@@ -275,17 +275,28 @@ def _score_f3(evidence: dict[str, Any]) -> FactorResult:
     else:
         items.append(_subfactor(evidence, "financial_safety", "财务安全", passed * 1.25, 5, "；".join(details), used_keys, partial=known_checks < len(checks)))
 
-    st_risk = evidence.get("st_risk")
-    audit_risk = evidence.get("audit_risk")
-    if st_risk is None and audit_risk is None:
+    risk_checks = (
+        ("st_risk", "ST/退市风险"),
+        ("audit_risk", "审计重大风险"),
+        ("goodwill_risk", "商誉风险"),
+    )
+    known_risks = [(key, label, evidence.get(key)) for key, label in risk_checks if evidence.get(key) is not None]
+    if not known_risks:
         items.append(_missing("survival_risk", "退市/审计/商誉风险", 3, "缺少 ST、审计或重大风险核验"))
     else:
-        score = 0 if st_risk is True else 2
-        if audit_risk is False:
-            score += 1
-        if audit_risk is True:
-            score = 0
-        items.append(_subfactor(evidence, "survival_risk", "退市/审计/商誉风险", score, 3, f"ST/退市风险：{st_risk}；审计重大风险：{audit_risk}", ("st_risk", "audit_risk"), partial=audit_risk is None))
+        any_risk = any(value is True for _, _, value in known_risks)
+        score = 0 if any_risk else sum(value is False for _, _, value in known_risks)
+        details = []
+        for key, label, value in known_risks:
+            if key == "goodwill_risk" and _number(evidence.get("goodwill_to_assets")) is not None:
+                ratio = _number(evidence.get("goodwill_to_assets"))
+                details.append(f"商誉占总资产 {ratio:.2%}，{'风险偏高' if value is True else '未触发10%观察线'}")
+            else:
+                details.append(f"{label}：{'有' if value is True else '未见'}")
+        items.append(_subfactor(
+            evidence, "survival_risk", "退市/审计/商誉风险", score, 3, "；".join(details),
+            tuple(key for key, _, _ in known_risks), partial=len(known_risks) < len(risk_checks),
+        ))
 
     special = _number(evidence.get("specialized_strength"))
     if special is None:
@@ -341,16 +352,16 @@ def _score_f5(evidence: dict[str, Any]) -> FactorResult:
     items: list[SubfactorResult] = []
     price = _number(evidence.get("price_percentile_3y"))
     if price is None:
-        items.append(_missing("price_position", "价格分位", 5, "缺少至少三年的可比价格序列"))
+        items.append(_missing("price_position", "价格分位", 2.5, "缺少至少三年的可比价格序列"))
     else:
-        score = 5 if price <= 0.20 else 4 if price <= 0.35 else 2.5 if price <= 0.50 else 1 if price <= 0.70 else 0
-        items.append(_subfactor(evidence, "price_position", "价格分位", score, 5, f"三年价格分位 {price:.1%}", ("price_percentile_3y",)))
+        score = 2.5 if price <= 0.20 else 2 if price <= 0.35 else 1.25 if price <= 0.50 else 0.5 if price <= 0.70 else 0
+        items.append(_subfactor(evidence, "price_position", "价格分位", score, 2.5, f"三年价格分位 {price:.1%}", ("price_percentile_3y",)))
 
     pe = _number(evidence.get("pe_ttm"))
     peer = _number(evidence.get("peer_pe_ttm_median"))
     pb = _number(evidence.get("pb"))
     if pe is None and pb is None:
-        items.append(_missing("valuation", "PE/PB 相对位置", 4, "PE、PB 和同行估值均缺失"))
+        items.append(_missing("valuation", "PE/PB 相对位置", 2, "PE、PB 和同行估值均缺失"))
     else:
         score, details, keys = 0.0, [], []
         if pe is not None:
@@ -365,17 +376,17 @@ def _score_f5(evidence: dict[str, Any]) -> FactorResult:
             keys.append("pb")
             score += 2 if 0 < pb < 2 else 1 if 0 < pb < 3 else 0
             details.append(f"PB {pb:.2f}")
-        items.append(_subfactor(evidence, "valuation", "PE/PB 相对位置", score, 4, "；".join(details), keys, partial=peer is None or pe is None or pb is None))
+        items.append(_subfactor(evidence, "valuation", "PE/PB 相对位置", score * 0.5, 2, "；".join(details), keys, partial=peer is None or pe is None or pb is None))
 
     attention_heat = _number(evidence.get("attention_heat"))
     social_heat = _number(evidence.get("social_heat"))
     heat_values = [value for value in (attention_heat, social_heat) if value is not None]
     heat = max(heat_values) if heat_values else None
     if heat is None:
-        items.append(_missing("coldness", "行业冰点/市场冷落", 4, "缺少个股关注度、人气排名或行业冷落证据"))
+        items.append(_missing("coldness", "行业冰点/市场冷落", 2, "缺少个股关注度、人气排名或行业冷落证据"))
     else:
-        score = 4 if heat <= 0.20 else 3 if heat <= 0.40 else 1 if heat <= 0.60 else 0
-        items.append(_subfactor(evidence, "coldness", "行业冰点/市场冷落", score, 4, f"关注热度归一值 {heat:.2f}，越低越冷", ("attention_heat",), partial=evidence.get("attention_partial", False)))
+        score = 2 if heat <= 0.20 else 1.5 if heat <= 0.40 else 0.5 if heat <= 0.60 else 0
+        items.append(_subfactor(evidence, "coldness", "行业冰点/市场冷落", score, 2, f"关注热度归一值 {heat:.2f}，越低越冷", ("attention_heat",), partial=evidence.get("attention_partial", False)))
 
     inflection_score, details, keys = 0.0, [], []
     for key, label in (("revenue_yoy", "营收同比"), ("profit_yoy", "利润同比"), ("revenue_yoy_delta", "营收同比改善"), ("profit_yoy_delta", "利润同比改善")):
@@ -385,9 +396,9 @@ def _score_f5(evidence: dict[str, Any]) -> FactorResult:
             details.append(f"{label} {value * 100:.2f}%")
             inflection_score += 1 if value > 0 else 0
     if not keys:
-        items.append(_missing("inflection", "业绩拐点", 4, "缺少营收、利润及其趋势数据"))
+        items.append(_missing("inflection", "业绩拐点", 2, "缺少营收、利润及其趋势数据"))
     else:
-        items.append(_subfactor(evidence, "inflection", "业绩拐点", inflection_score, 4, "；".join(details), keys, partial=len(keys) < 4))
+        items.append(_subfactor(evidence, "inflection", "业绩拐点", inflection_score * 0.5, 2, "；".join(details), keys, partial=len(keys) < 4))
 
     gap_score, gap_details, gap_keys = 0.0, [], []
     track = _number(evidence.get("track_strength"))
@@ -416,28 +427,47 @@ def _score_f5(evidence: dict[str, Any]) -> FactorResult:
             gap_score += 1
             gap_details.append("财务同比趋势边际改善")
     if not gap_keys:
-        items.append(_missing("expectation_gap", "预期差", 3, "缺少关注度与产业、订单或财务拐点的交叉证据"))
+        items.append(_missing("expectation_gap", "预期差", 1.5, "缺少关注度与产业、订单或财务拐点的交叉证据"))
     else:
-        items.append(_subfactor(evidence, "expectation_gap", "预期差", gap_score, 3, "；".join(gap_details) or "交叉证据未形成正向预期差", gap_keys, partial=len(set(gap_keys)) < 3))
-    return _factor("F5", "低位与困境反转", 20, items)
+        items.append(_subfactor(evidence, "expectation_gap", "预期差", gap_score * 0.5, 1.5, "；".join(gap_details) or "交叉证据未形成正向预期差", gap_keys, partial=len(set(gap_keys)) < 3))
+    return _factor("F5", "低位与困境反转", 10, items)
 
 
-def _adjustments(evidence: dict[str, Any], factors: tuple[FactorResult, ...]) -> tuple[AdjustmentResult, ...]:
-    alpha = _number(evidence.get("alpha_score"))
-    if alpha is None:
-        alpha_result = AdjustmentResult("alpha", "Alpha/技术结构", 0, -3, 3, "需人工确认", "缺少本次 TDX Alpha 评分")
+def _score_f6(adjustments: tuple[AdjustmentResult, ...]) -> FactorResult:
+    items = tuple(
+        SubfactorResult(item.key, item.label, item.score, item.maximum, item.status, item.reason, item.sources)
+        for item in adjustments
+    )
+    return _factor("F6", "修正项", 10, items)
+
+
+def _adjustments(evidence: dict[str, Any], f1_score: float) -> tuple[AdjustmentResult, ...]:
+    crosscheck = evaluate_alpha_crosscheck(evidence)
+    methods = crosscheck.get("methods", [])
+    available = [item for item in methods if item.get("available_checks", 0) >= 3]
+    directions = [int(item.get("direction", 0)) for item in available]
+    direction_sum = sum(directions)
+    institutional_score = {2: 2.0, 1: 1.5, 0: 1.0, -1: 0.5, -2: 0.0}.get(direction_sum, 1.0) if len(available) == 2 else 0.0
+    institutional_label = "看多" if direction_sum > 0 else "看空" if direction_sum < 0 else "中性/分歧"
+    institutional_status = "已验证" if len(available) == 2 else "部分覆盖" if available else "需人工确认"
+    crosscheck["status"] = institutional_label
+    evidence["alpha_crosscheck"] = crosscheck
+    source_map = evidence.setdefault("metric_sources", {})
+    source_map["institutional_direction"] = ["机构方法/量化选股筛选", "机构方法/投资逻辑追踪"]
+    method_text = "；".join(f"{item['method']}={item['label']}（{item['reason']}）" for item in methods)
+    institutional_result = AdjustmentResult(
+        "institutional_direction", "机构方向", institutional_score, 0, 2, institutional_status,
+        f"机构方向{institutional_label}；{method_text}", tuple(source_map["institutional_direction"]),
+    )
+
+    technical_score = _number(evidence.get("technical_structure_score"))
+    if technical_score is None:
+        technical_result = AdjustmentResult("technical_structure", "技术结构", 0, 0, 4, "需人工确认", "技术分析未生成结构化得分")
     else:
-        base_score = 3 if alpha >= 0.40 else 2 if alpha >= 0.20 else 1 if alpha > 0.05 else -3 if alpha <= -0.45 else -2 if alpha <= -0.20 else -1 if alpha < -0.05 else 0
-        crosscheck = evaluate_alpha_crosscheck(evidence, base_score)
-        evidence["alpha_crosscheck"] = crosscheck
-        source_map = evidence.setdefault("metric_sources", {})
-        source_map["alpha_crosscheck"] = ["机构方法/量化选股筛选", "机构方法/投资逻辑追踪"]
-        method_text = "；".join(f"{item['method']}={item['label']}（{item['reason']}）" for item in crosscheck["methods"])
-        status = "已验证" if crosscheck["status"] in {"同向确认", "基础中性"} else "部分覆盖"
-        reason = f"TDX Alpha {alpha:.4f}，原始修正 {base_score:+d}；机构复核：{crosscheck['status']}；{method_text}"
-        alpha_result = AdjustmentResult(
-            "alpha", "Alpha/技术结构", crosscheck["final_score"], -3, 3, status, reason,
-            _sources(evidence, ("alpha_score", "alpha_crosscheck")),
+        technical_result = AdjustmentResult(
+            "technical_structure", "技术结构", _bounded(technical_score, 0, 4), 0, 4, "已验证",
+            str(evidence.get("technical_structure_reason") or "按缠论结构与技术指标综合判断"),
+            _sources(evidence, ("technical_structure_score",)),
         )
 
     price = _number(evidence.get("price_percentile_3y"))
@@ -448,7 +478,6 @@ def _adjustments(evidence: dict[str, Any], factors: tuple[FactorResult, ...]) ->
     congestion = _number(evidence.get("market_congestion"))
     congestion_fresh = evidence.get("market_congestion_fresh") is True
     trap_risk = evidence.get("trap_risk_level")
-    factor_map = {factor.key: factor.score for factor in factors}
     sentiment_keys: list[str] = []
     if price is not None:
         sentiment_keys.append("price_percentile_3y")
@@ -463,26 +492,32 @@ def _adjustments(evidence: dict[str, Any], factors: tuple[FactorResult, ...]) ->
     social_complete = social_checked is not None and social_total is not None and social_checked >= social_total
     trap_complete = evidence.get("trap_risk_level") in {"低", "注意", "高"}
     if not sentiment_keys:
-        sentiment_result = AdjustmentResult("sentiment", "情绪/拥挤度", 0, -3, 3, "需人工确认", "缺少价格位置、个股热度和市场拥挤度证据")
+        sentiment_result = AdjustmentResult("sentiment", "情绪/拥挤度", 0, 0, 2, "需人工确认", "缺少价格位置、个股热度和市场拥挤度证据")
     else:
-        score, reason = 0, "情绪证据未形成明确修正"
+        score, reason = 1, "情绪和拥挤度处于中性区间"
         if trap_risk == "高":
             sentiment_keys.append("trap_risk_level")
-            score, reason = -3, "至少两类独立证据形成高异常推广风险"
+            score, reason = 0, "至少两类独立证据形成高异常推广风险"
         elif price is not None and price > 0.80 and ((heat is not None and heat >= 0.80) or (congestion is not None and congestion_fresh and congestion >= 0.80)):
-            score, reason = -3, "高位叠加个股过热或市场高拥挤"
-        elif price is not None and price <= 0.35 and heat is not None and heat <= 0.35 and factor_map.get("F1", 0) >= 15:
+            score, reason = 0, "高位叠加个股过热或市场高拥挤"
+        elif price is not None and price <= 0.35 and heat is not None and heat <= 0.35 and f1_score >= 15:
             score, reason = 2, "低位冷门且产业逻辑未破"
         fully_covered = len(sentiment_keys) >= 3 and social_complete and trap_complete
-        sentiment_result = AdjustmentResult("sentiment", "情绪/拥挤度", score, -3, 3, "已验证" if fully_covered else "部分覆盖", reason, _sources(evidence, sentiment_keys))
+        sentiment_result = AdjustmentResult("sentiment", "情绪/拥挤度", score, 0, 2, "已验证" if fully_covered else "部分覆盖", reason, _sources(evidence, sentiment_keys))
 
     catalysts = _number(evidence.get("verified_catalyst_count"))
     if catalysts is None:
-        catalyst_result = AdjustmentResult("catalyst", "风口催化", 0, -2, 2, "需人工确认", "缺少公告或研报中的可验证催化")
+        catalyst_result = AdjustmentResult("catalyst", "风口催化", 0, 0, 2, "需人工确认", "缺少公告或研报中的可验证催化")
     else:
         score = min(2, max(0, int(catalysts)))
-        catalyst_result = AdjustmentResult("catalyst", "风口催化", score, -2, 2, "已验证", f"发现 {int(catalysts)} 项可验证催化", _sources(evidence, ("verified_catalyst_count",)))
-    return alpha_result, sentiment_result, catalyst_result
+        status = "已验证" if score > 0 else "部分覆盖"
+        web_done = evidence.get("web_research_status") == "completed"
+        reason = f"发现 {int(catalysts)} 项可验证催化" if score > 0 else (
+            "公告标题未发现可验证催化；网页搜索已执行但未通过证据门槛" if web_done
+            else "公告标题未发现可验证催化；网页搜索后端未完成"
+        )
+        catalyst_result = AdjustmentResult("catalyst", "风口催化", score, 0, 2, status, reason, _sources(evidence, ("verified_catalyst_count",)))
+    return institutional_result, technical_result, sentiment_result, catalyst_result
 
 
 def _base_rating(score: float) -> str:
@@ -500,16 +535,18 @@ def _cap_rating(rating: str, cap: str) -> str:
 
 
 def score_evidence(evidence: dict[str, Any]) -> Scorecard:
-    factors = (
+    core_factors = (
         _score_f1(evidence),
         _score_f2(evidence),
         _score_f3(evidence),
         _score_f4(evidence),
-        _score_f5(evidence),
     )
-    base_score = round(sum(factor.score for factor in factors), 2)
-    adjustments = _adjustments(evidence, factors)
-    adjustment_score = round(sum(item.score for item in adjustments), 2)
+    adjustments = _adjustments(evidence, core_factors[0].score)
+    f5 = _score_f5(evidence)
+    f6 = _score_f6(adjustments)
+    factors = (*core_factors, f5, f6)
+    base_score = round(sum(factor.score for factor in (*core_factors, f5)), 2)
+    adjustment_score = round(f6.score, 2)
     final_score = _bounded(base_score + adjustment_score, 0, 100)
     rating = _base_rating(final_score)
     factor_map = {factor.key: factor.score for factor in factors}
@@ -543,7 +580,12 @@ def score_evidence(evidence: dict[str, Any]) -> Scorecard:
         rating = _cap_rating(rating, "矛")
 
     triggered = [item for item in caps if item["result"] == "已触发"]
-    rating_reason = "；".join(f"{item['condition']}，评级最高为{item['cap']}" for item in triggered) if triggered else f"综合分达到{rating}档且未触发评级上限"
+    base_rating = _base_rating(final_score)
+    if triggered:
+        cap_text = "；".join(f"{item['condition']}，评级最高为{item['cap']}" for item in triggered)
+        rating_reason = f"综合分 {_bounded(final_score, 0, 100):g} 对应{base_rating}；{cap_text}"
+    else:
+        rating_reason = f"综合分 {_bounded(final_score, 0, 100):g} 对应{rating}，且未触发评级上限"
     return Scorecard(
         factors=factors,
         adjustments=adjustments,

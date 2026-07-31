@@ -12,6 +12,10 @@ import numpy as np
 import pandas as pd
 import time, sys, os, argparse, json
 from pathlib import Path
+from ta.momentum import RSIIndicator, WilliamsRIndicator
+from ta.trend import ADXIndicator, MACD
+from ta.volatility import AverageTrueRange, BollingerBands
+from ta.volume import OnBalanceVolumeIndicator
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -486,6 +490,147 @@ class AlphaSorosAnalyzer:
         if isinstance(v, (np.bool_, bool)): return bool(v)
         return v
 
+    def _standard_indicators(self) -> dict:
+        close = pd.to_numeric(self.df["close"], errors="coerce")
+        high = pd.to_numeric(self.df["high"], errors="coerce")
+        low = pd.to_numeric(self.df["low"], errors="coerce")
+        volume = pd.to_numeric(self.df["volume"], errors="coerce")
+
+        obv = OnBalanceVolumeIndicator(close, volume).on_balance_volume()
+        obv_ma20 = obv.rolling(20).mean()
+        obv_state = "资金累积" if obv.iloc[-1] > obv_ma20.iloc[-1] and obv.iloc[-1] > obv.iloc[-6] else "资金流出" if obv.iloc[-1] < obv_ma20.iloc[-1] and obv.iloc[-1] < obv.iloc[-6] else "资金中性"
+
+        ma30 = close.rolling(30).mean()
+        bias30 = (close / ma30 - 1) * 100
+        bias_value = float(bias30.iloc[-1])
+        bias_state = "明显超买" if bias_value >= 12 else "偏热" if bias_value >= 6 else "明显超跌" if bias_value <= -12 else "偏弱" if bias_value <= -6 else "中性"
+
+        macd_calc = MACD(close)
+        macd_line = macd_calc.macd()
+        macd_signal = macd_calc.macd_signal()
+        macd_hist = macd_calc.macd_diff()
+        macd_state = "多头" if macd_line.iloc[-1] > macd_signal.iloc[-1] and macd_hist.iloc[-1] > 0 else "空头" if macd_line.iloc[-1] < macd_signal.iloc[-1] and macd_hist.iloc[-1] < 0 else "中性"
+
+        boll = BollingerBands(close, window=20, window_dev=2)
+        boll_high, boll_low = boll.bollinger_hband(), boll.bollinger_lband()
+        boll_width = float((boll_high.iloc[-1] - boll_low.iloc[-1]) / close.iloc[-1] * 100)
+        boll_position = float((close.iloc[-1] - boll_low.iloc[-1]) / max(boll_high.iloc[-1] - boll_low.iloc[-1], 1e-9))
+        boll_state = "突破上轨" if boll_position > 1 else "跌破下轨" if boll_position < 0 else "上轨区域" if boll_position >= 0.8 else "下轨区域" if boll_position <= 0.2 else "通道中部"
+
+        atr = AverageTrueRange(high, low, close, window=14).average_true_range()
+        atr_pct = float(atr.iloc[-1] / close.iloc[-1] * 100)
+        atr_state = "波动很高" if atr_pct >= 6 else "波动偏高" if atr_pct >= 4 else "波动正常" if atr_pct >= 2 else "波动偏低"
+
+        dmi = ADXIndicator(high, low, close, window=14)
+        adx, plus_di, minus_di = dmi.adx(), dmi.adx_pos(), dmi.adx_neg()
+        dmi_state = "上升趋势成立" if adx.iloc[-1] >= 25 and plus_di.iloc[-1] > minus_di.iloc[-1] else "下降趋势成立" if adx.iloc[-1] >= 25 and minus_di.iloc[-1] > plus_di.iloc[-1] else "趋势未充分成立"
+
+        rsi = RSIIndicator(close, window=14).rsi()
+        rsi_value = float(rsi.iloc[-1])
+        rsi_state = "超买" if rsi_value >= 70 else "超卖" if rsi_value <= 30 else "偏强" if rsi_value >= 55 else "偏弱" if rsi_value <= 45 else "中性"
+
+        wr = WilliamsRIndicator(high, low, close, lbp=14).williams_r()
+        wr_value = float(wr.iloc[-1])
+        wr_state = "超买" if wr_value >= -20 else "超卖" if wr_value <= -80 else "中性"
+
+        return {
+            "obv": {"value": round(float(obv.iloc[-1]), 2), "state": obv_state},
+            "bias30": {"value": round(bias_value, 2), "state": bias_state},
+            "macd": {"value": round(float(macd_hist.iloc[-1]), 4), "state": macd_state},
+            "boll": {"value": round(boll_position, 3), "width_pct": round(boll_width, 2), "state": boll_state},
+            "atr": {"value": round(float(atr.iloc[-1]), 3), "pct": round(atr_pct, 2), "state": atr_state},
+            "dmi": {"adx": round(float(adx.iloc[-1]), 2), "+di": round(float(plus_di.iloc[-1]), 2), "-di": round(float(minus_di.iloc[-1]), 2), "state": dmi_state},
+            "rsi": {"value": round(rsi_value, 2), "state": rsi_state},
+            "wr": {"value": round(wr_value, 2), "state": wr_state},
+        }
+
+    def _chan_structure(self) -> dict:
+        bars = self.df.reset_index(drop=True)
+        fractals: list[dict] = []
+        for i in range(1, len(bars) - 1):
+            prev, current, following = bars.iloc[i - 1], bars.iloc[i], bars.iloc[i + 1]
+            top = current["high"] > prev["high"] and current["high"] > following["high"] and current["low"] > prev["low"] and current["low"] > following["low"]
+            bottom = current["low"] < prev["low"] and current["low"] < following["low"] and current["high"] < prev["high"] and current["high"] < following["high"]
+            if not (top or bottom):
+                continue
+            candidate = {"index": i, "date": str(current["date"])[:10], "type": "顶" if top else "底", "price": float(current["high"] if top else current["low"])}
+            if fractals and fractals[-1]["type"] == candidate["type"]:
+                more_extreme = candidate["price"] > fractals[-1]["price"] if top else candidate["price"] < fractals[-1]["price"]
+                if more_extreme:
+                    fractals[-1] = candidate
+                continue
+            if fractals and candidate["index"] - fractals[-1]["index"] < 4:
+                continue
+            fractals.append(candidate)
+
+        strokes = [
+            {
+                "start": left["date"], "end": right["date"],
+                "direction": "向上" if right["price"] > left["price"] else "向下",
+                "low": min(left["price"], right["price"]), "high": max(left["price"], right["price"]),
+            }
+            for left, right in zip(fractals, fractals[1:])
+        ]
+        close = float(bars.iloc[-1]["close"])
+        recent_fractals = fractals[-30:]
+        supports = [item["price"] for item in recent_fractals if item["type"] == "底" and item["price"] < close]
+        resistances = [item["price"] for item in recent_fractals if item["type"] == "顶" and item["price"] > close]
+        support = max(supports) if supports else float(bars.tail(20)["low"].min())
+        resistance = min(resistances) if resistances else float(bars.tail(20)["high"].max())
+        result = {
+            "status": "可分析" if strokes else "数据不足",
+            "fractal_count": len(fractals), "stroke_count": len(strokes),
+            "current_price": round(close, 2), "support": round(support, 2), "resistance": round(resistance, 2),
+        }
+        if strokes:
+            latest = strokes[-1]
+            result.update({
+                "latest_direction": latest["direction"],
+                "latest_start": latest["start"],
+                "latest_end": latest["end"],
+                "latest_low": round(latest["low"], 2),
+                "latest_high": round(latest["high"], 2),
+            })
+        if len(strokes) >= 3:
+            recent = strokes[-3:]
+            center_low = max(item["low"] for item in recent)
+            center_high = min(item["high"] for item in recent)
+            if center_low < center_high:
+                relation = "中枢上方" if close > center_high else "中枢下方" if close < center_low else "中枢内部"
+                result.update({"center": True, "center_low": round(center_low, 2), "center_high": round(center_high, 2), "relation": relation})
+            else:
+                result.update({"center": False, "relation": "最近三笔无重叠中枢"})
+        return result
+
+    @staticmethod
+    def _technical_structure_score(indicators: dict, chan: dict) -> tuple[float, str]:
+        votes: list[tuple[str, float]] = []
+        chan_direction = chan.get("latest_direction")
+        votes.append((f"缠论{chan_direction}", 1 if chan_direction == "向上" else -1 if chan_direction == "向下" else 0))
+        state_votes = (
+            ("OBV", indicators["obv"]["state"], {"资金累积": 1, "资金流出": -1}),
+            ("MACD", indicators["macd"]["state"], {"多头": 1, "空头": -1}),
+            ("DMI", indicators["dmi"]["state"], {"上升趋势成立": 1, "下降趋势成立": -1}),
+        )
+        for label, state, mapping in state_votes:
+            votes.append((f"{label}{state}", mapping.get(state, 0)))
+        position_votes = (
+            ("BIAS", indicators["bias30"]["state"]),
+            ("BOLL", indicators["boll"]["state"]),
+            ("RSI", indicators["rsi"]["state"]),
+            ("WR", indicators["wr"]["state"]),
+        )
+        for label, state in position_votes:
+            value = 0.25 if state in {"明显超跌", "下轨区域", "跌破下轨", "超卖"} else -0.25 if state in {"明显超买", "上轨区域", "突破上轨", "超买"} else 0
+            votes.append((f"{label}{state}", value))
+        if indicators["atr"]["state"] == "波动很高":
+            votes.append(("ATR波动很高", -0.5))
+        raw = sum(value for _, value in votes)
+        unrounded = max(0.0, min(4.0, 2 + raw * 0.5))
+        score = int(unrounded * 2 + 0.5) / 2
+        reason = "；".join(label for label, value in votes if value != 0)
+        return score, reason or "技术指标方向中性"
+
     # ── 报告 ──
     def generate_report(self) -> str:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -503,6 +648,9 @@ class AlphaSorosAnalyzer:
             if self._last(series):
                 signal = label
                 break
+        indicators = self._standard_indicators()
+        chan = self._chan_structure()
+        technical_score, technical_reason = self._technical_structure_score(indicators, chan)
         technical = {
             "alpha_score": pf,
             "alpha_trend": trend,
@@ -513,6 +661,10 @@ class AlphaSorosAnalyzer:
             "momentum_20d": self._last([momentum_20d]),
             "ma20_slope_5d": self._last([ma20_slope_5d]),
             "volume_ratio_20d": self._last([volume_ratio_20d]),
+            "technical_indicators": indicators,
+            "chan_structure": chan,
+            "technical_structure_score": technical_score,
+            "technical_structure_reason": technical_reason,
         }
         L = [
             f"# 通达信技术分析: {self.name}({self.code})",
@@ -639,8 +791,36 @@ class AlphaSorosAnalyzer:
         if dd: L.append("- ⚠️ **短顶背离**: 10周期级别")
         L.append("")
 
-        # ── 6. 综合判断 ──
-        L += ["## 6. 综合判断", ""]
+        L += ["## 6. 缠论结构与 A 股指标", "", "### 缠论（日线简化结构）", ""]
+        if chan.get("status") == "可分析":
+            L.append(f"- 分型 {chan['fractal_count']} 个，笔 {chan['stroke_count']} 段；最新一笔：{chan.get('latest_direction')}（{chan.get('latest_start')} 至 {chan.get('latest_end')}）")
+            if chan.get("center"):
+                L.append(f"- 最近三笔重叠区间：{chan['center_low']:.2f}-{chan['center_high']:.2f}；当前位于{chan.get('relation')}")
+            else:
+                L.append(f"- 中枢状态：{chan.get('relation', '数据不足')}")
+        else:
+            L.append("- 日 K 分型不足，暂不能形成有效笔结构。")
+        L.append(f"- 当前价 {chan.get('current_price', 'N/A')}；支撑位 {chan.get('support', 'N/A')}；压力位 {chan.get('resistance', 'N/A')}。")
+        L.append(f"- 技术结构得分：{technical_score:.1f}/4；{technical_reason}。")
+        L.append("- 说明：这里只做日线分型、笔与三笔重叠区间识别，不替代完整多级别缠论递归。")
+        L += ["", "### 指标观察", "", "| 排名 | 指标 | 当前值 | 当前判断 | A股适用性 |", "|---|---|---:|---|---:|"]
+        indicator_rows = [
+            ("⭐⭐⭐⭐⭐", "缠论（结构）", f"{chan.get('latest_direction', '方向未定')} / {chan.get('relation', '中枢未形成')}", "结构观察", "10/10"),
+            ("⭐⭐⭐⭐☆", "OBV", f"{indicators['obv']['value']:.0f}", indicators['obv']['state'], "9.5/10"),
+            ("⭐⭐⭐⭐☆", "30日BIAS", f"{indicators['bias30']['value']:.2f}%", indicators['bias30']['state'], "9/10"),
+            ("⭐⭐⭐⭐", "MACD", f"{indicators['macd']['value']:.4f}", indicators['macd']['state'], "8.5/10"),
+            ("⭐⭐⭐⭐", "BOLL", f"位置 {indicators['boll']['value']:.3f}", indicators['boll']['state'], "8/10"),
+            ("⭐⭐⭐☆", "ATR", f"{indicators['atr']['pct']:.2f}%", indicators['atr']['state'], "8/10"),
+            ("⭐⭐⭐☆", "DMI", f"ADX {indicators['dmi']['adx']:.2f}", indicators['dmi']['state'], "7.5/10"),
+            ("⭐⭐⭐", "RSI", f"{indicators['rsi']['value']:.2f}", indicators['rsi']['state'], "7/10"),
+            ("⭐⭐⭐", "WR", f"{indicators['wr']['value']:.2f}", indicators['wr']['state'], "6.5/10"),
+        ]
+        for rank, indicator, value, state, suitability in indicator_rows:
+            L.append(f"| {rank} | {indicator} | {value} | {state} | {suitability} |")
+        L.append("")
+
+        # ── 7. 综合判断 ──
+        L += ["## 7. 综合判断", ""]
         pf_v = pf or 0
         if pf_v > self.JIA_TH and self._last(self.QUSHI_DUO):
             L.append("**趋势+评分共振偏多**：多头排列且评分高于加仓阈值。")

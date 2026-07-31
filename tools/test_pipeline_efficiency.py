@@ -30,7 +30,7 @@ def full_evidence() -> dict:
         "top10_quality": 1.0, "pledge_ratio": 0, "unlock_ratio": 0,
         "background_quality": 1.0, "leadership_strength": 1.0, "net_profit": 1,
         "operating_cashflow": 1, "debt_ratio": 0.3, "cash_to_debt": 0.5,
-        "st_risk": False, "audit_risk": False, "specialized_strength": 1.0,
+        "st_risk": False, "audit_risk": False, "goodwill_risk": False, "specialized_strength": 1.0,
         "business_chain_match": 1.0, "overseas_revenue_ratio": 40,
         "revenue_yoy": 0.2, "profit_yoy": 0.2, "order_growth": 20,
         "price_percentile_3y": 0.1, "pe_ttm": 10, "peer_pe_ttm_median": 20, "pb": 1,
@@ -40,6 +40,10 @@ def full_evidence() -> dict:
         "ma20_slope_5d": 0.03, "volume_ratio_20d": 1.3, "technical_position": 0.3,
         "technical_overheat": False,
         "verified_catalyst_count": 2, "technical_signal": "建仓",
+        "technical_structure_score": 4, "technical_structure_reason": "技术结构明确偏多",
+        "technical_indicators": {},
+        "chan_structure": {"status": "可分析", "latest_direction": "向上", "relation": "中枢上方",
+                           "current_price": 30.0, "support": 28.0, "resistance": 33.0},
     }
     values["metric_sources"] = {key: ["test"] for key in values if key != "metric_sources"}
     return values
@@ -48,10 +52,14 @@ def full_evidence() -> dict:
 class PipelineEfficiencyTest(unittest.TestCase):
     def test_full_framework_reaches_100_and_root(self) -> None:
         card = score_evidence(full_evidence())
-        self.assertEqual(card.base_score, 100)
+        self.assertEqual(card.base_score, 90)
+        self.assertEqual(card.adjustment_score, 10)
         self.assertEqual(card.final_score, 100)
         self.assertEqual(card.rating, "根")
-        self.assertEqual(sum(len(factor.subfactors) for factor in card.factors), 24)
+        self.assertEqual(next(factor for factor in card.factors if factor.key == "F5").score, 10)
+        self.assertEqual(next(factor for factor in card.factors if factor.key == "F6").score, 10)
+        self.assertEqual([factor.key for factor in card.factors], ["F1", "F2", "F3", "F4", "F5", "F6"])
+        self.assertEqual(sum(len(factor.subfactors) for factor in card.factors), 28)
 
     def test_missing_evidence_scores_zero(self) -> None:
         card = score_evidence({"metric_sources": {}})
@@ -59,60 +67,65 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertTrue(all(item.score == 0 for factor in card.factors for item in factor.subfactors))
         self.assertTrue(all(item.status == "需人工确认" for factor in card.factors for item in factor.subfactors))
 
-    def test_adjustment_bounds_are_plus_minus_eight(self) -> None:
+    def test_f5_modifiers_are_bounded_to_ten_points(self) -> None:
         positive = score_evidence(full_evidence())
-        self.assertLessEqual(positive.adjustment_score, 8)
+        self.assertEqual(positive.adjustment_score, 10)
         negative_data = full_evidence()
         negative_data.update({
             "alpha_score": -1, "price_percentile_3y": 0.95, "attention_heat": 0.95,
             "verified_catalyst_count": 0, "trap_risk_level": "高", "ma_structure": "bearish",
             "momentum_20d": -0.10, "ma20_slope_5d": -0.03, "volume_ratio_20d": 1.4,
             "alpha_trend": "下降", "technical_signal": "清仓", "technical_position": 0.9,
-            "technical_overheat": True,
+            "technical_overheat": True, "technical_structure_score": 0,
         })
         negative = score_evidence(negative_data)
-        self.assertGreaterEqual(negative.adjustment_score, -8)
-        self.assertEqual(negative.adjustment_score, -6)
+        self.assertGreaterEqual(negative.adjustment_score, 0)
+        self.assertLessEqual(negative.adjustment_score, 10)
+        self.assertEqual(negative.adjustment_score, 0)
+        self.assertEqual(negative.final_score, negative.base_score)
 
-    def test_alpha_crosscheck_confirmation_keeps_base_score(self) -> None:
+    def test_institutional_direction_uses_two_methods(self) -> None:
         card = score_evidence(full_evidence())
-        alpha = next(item for item in card.adjustments if item.key == "alpha")
-        self.assertEqual(alpha.score, 3)
-        self.assertIn("同向确认", alpha.reason)
+        institutional = next(item for item in card.adjustments if item.key == "institutional_direction")
+        self.assertEqual(institutional.score, 2)
+        self.assertIn("量化选股筛选=看多", institutional.reason)
+        self.assertIn("投资逻辑追踪=看多", institutional.reason)
 
-    def test_alpha_crosscheck_double_conflict_moves_one_point_toward_zero(self) -> None:
+    def test_institutional_direction_is_separate_from_technical_structure(self) -> None:
         data = full_evidence()
         data.update({
             "ma_structure": "bearish", "momentum_20d": -0.10, "ma20_slope_5d": -0.03,
             "volume_ratio_20d": 1.4, "alpha_trend": "下降", "technical_signal": "清仓",
-            "technical_position": 0.9, "technical_overheat": True,
+            "technical_position": 0.9, "technical_overheat": True, "technical_structure_score": 4,
         })
         card = score_evidence(data)
-        alpha = next(item for item in card.adjustments if item.key == "alpha")
-        self.assertEqual(alpha.score, 2)
-        self.assertIn("冲突降级", alpha.reason)
+        adjustments = {item.key: item for item in card.adjustments}
+        self.assertEqual(adjustments["institutional_direction"].score, 0)
+        self.assertEqual(adjustments["technical_structure"].score, 4)
 
-    def test_alpha_crosscheck_never_creates_score_without_tdx_alpha(self) -> None:
+    def test_missing_institutional_methods_do_not_create_score(self) -> None:
         data = full_evidence()
-        data.pop("alpha_score")
+        for key in ("ma_structure", "momentum_20d", "ma20_slope_5d", "volume_ratio_20d",
+                    "alpha_trend", "technical_signal", "technical_position", "technical_overheat"):
+            data.pop(key, None)
         card = score_evidence(data)
-        alpha = next(item for item in card.adjustments if item.key == "alpha")
-        self.assertEqual(alpha.score, 0)
-        self.assertEqual(alpha.status, "需人工确认")
+        institutional = next(item for item in card.adjustments if item.key == "institutional_direction")
+        self.assertEqual(institutional.score, 0)
+        self.assertEqual(institutional.status, "需人工确认")
 
-    def test_high_trap_risk_is_sentiment_minus_three(self) -> None:
+    def test_high_trap_risk_zeros_sentiment_score(self) -> None:
         data = full_evidence()
         data["trap_risk_level"] = "高"
         card = score_evidence(data)
         sentiment = next(item for item in card.adjustments if item.key == "sentiment")
-        self.assertEqual(sentiment.score, -3)
+        self.assertEqual(sentiment.score, 0)
 
     def test_social_heat_alone_is_not_treated_as_positive_or_negative(self) -> None:
         data = full_evidence()
         data.update({"price_percentile_3y": 0.5, "attention_heat": 0.9, "social_heat": 0.9})
         card = score_evidence(data)
         sentiment = next(item for item in card.adjustments if item.key == "sentiment")
-        self.assertEqual(sentiment.score, 0)
+        self.assertEqual(sentiment.score, 1)
 
     def test_low_price_cold_attention_and_sound_f1_is_plus_two(self) -> None:
         data = full_evidence()
@@ -120,6 +133,13 @@ class PipelineEfficiencyTest(unittest.TestCase):
         card = score_evidence(data)
         sentiment = next(item for item in card.adjustments if item.key == "sentiment")
         self.assertEqual(sentiment.score, 2)
+
+    def test_zero_announcement_catalysts_remain_partial_without_web_confirmation(self) -> None:
+        data = full_evidence()
+        data["verified_catalyst_count"] = 0
+        catalyst = next(item for item in score_evidence(data).adjustments if item.key == "catalyst")
+        self.assertEqual(catalyst.score, 0)
+        self.assertEqual(catalyst.status, "部分覆盖")
 
     def test_st_hard_cap(self) -> None:
         data = full_evidence()
@@ -188,14 +208,37 @@ class PipelineEfficiencyTest(unittest.TestCase):
         evidence["completed_modules"] = []
         card = score_evidence(evidence)
         report = grader.render_report("300820", "英杰电气", evidence, card, ())
-        for heading in ("## 五层评分卡", "## 修正项", "## 舆情、社交热榜与异常推广风险",
+        for heading in ("## 综合得分", "## 一句话结论与最终判断", "## 技术分析（easy-tdx 日 K）", "## 六层图形概览",
+                        "## 六层评分卡", "## F5 低位与困境反转", "## F6 修正项", "## 舆情、社交热榜与异常推广风险",
                         "## Hard Cap 检查", "## 机构方法交叉验证", "## 睡得着检查"):
             self.assertIn(heading, report)
-        conclusion = report.split("## 最终结论", 1)[1]
+        conclusion = report.split("## 一句话结论与最终判断", 1)[1].split("## 六层图形概览", 1)[0]
         for number in range(1, 7):
             self.assertIn(f"{number}. ", conclusion)
+        self.assertNotIn("## 最终结论", report)
         for forbidden in ("说白了", "他娘的", "我认为", "我觉得"):
             self.assertNotIn(forbidden, conclusion)
+        self.assertLess(report.index("## 一句话结论与最终判断"), report.index("## 技术分析（easy-tdx 日 K）"))
+        self.assertLess(report.index("## 技术分析（easy-tdx 日 K）"), report.index("## 六层图形概览"))
+        self.assertIn("| 指标 | 当前读数 | 当前评价 |", report)
+        self.assertNotIn("| 排名 | 指标", report)
+        self.assertNotIn("A股适用性", report)
+        self.assertIn("当前价格：30.0；支撑位：28.0；压力位：33.0", report)
+        self.assertIn("F6 是独立的第六层，已计入综合分", report)
+
+    def test_report_progress_bars_are_bounded_and_complete(self) -> None:
+        self.assertEqual(grader._progress_bar(-1, 100, 10), "░" * 10)
+        self.assertEqual(grader._progress_bar(50, 100, 10), "█" * 5 + "░" * 5)
+        self.assertEqual(grader._progress_bar(101, 100, 10), "█" * 10)
+
+        evidence = full_evidence()
+        evidence["completed_modules"] = []
+        card = score_evidence(evidence)
+        report = grader.render_report("301128", "强瑞技术", evidence, card, ())
+        overview = report.split("## 六层图形概览", 1)[1].split("## 六层评分卡", 1)[0]
+        for factor in card.factors:
+            self.assertIn(factor.key, overview)
+            self.assertIn(grader._progress_bar(factor.score, factor.maximum), overview)
 
     def test_web_supply_requires_two_domains_categories_and_authority(self) -> None:
         records = [
@@ -225,6 +268,29 @@ class PipelineEfficiencyTest(unittest.TestCase):
         ]
         self.assertEqual(web_research._validate_supply(records)["status"], "证据冲突")
 
+    def test_statutory_disclosure_is_high_confidence(self) -> None:
+        self.assertEqual(web_research._source_role("cninfo.com.cn"), ("法定信息披露", "A"))
+        self.assertEqual(web_research._source_role("www.szse.cn"), ("法定信息披露", "A"))
+        row = web_research._classify({
+            "url": "https://static.cninfo.com.cn/finalpage/example.pdf",
+            "content": "强瑞技术的半导体设备产品用于国产替代，具体产品已经量产",
+        }, "强瑞技术")
+        self.assertEqual(row["source_role"], "法定信息披露")
+        self.assertTrue(row["company_product_relation"])
+
+    def test_financial_forums_are_clue_only_and_cannot_confirm(self) -> None:
+        for domain in ("xueqiu.com", "guba.eastmoney.com", "news.gw.com.cn"):
+            self.assertEqual(web_research._source_role(domain), ("线索来源", "C"))
+        records = [
+            {"fetch_status": "ok", "domain": "cninfo.com.cn", "source_tier": "A",
+             "source_role": "法定信息披露", "supply_categories": ["orders"], "supply_direction": "tightening"},
+            {"fetch_status": "ok", "domain": "xueqiu.com", "source_tier": "C",
+             "source_role": "线索来源", "supply_categories": ["capacity"], "supply_direction": "tightening"},
+        ]
+        result = web_research._validate_supply(records)
+        self.assertEqual(result["status"], "需人工确认")
+        self.assertEqual(result["evidence_count"], 1)
+
     def test_web_chokepoint_requires_company_and_industry_crosscheck(self) -> None:
         records = [
             {"fetch_status": "ok", "domain": "cninfo.com.cn", "source_tier": "A", "company_product_relation": True, "industry_dependency": False},
@@ -233,6 +299,46 @@ class PipelineEfficiencyTest(unittest.TestCase):
         result = web_research._validate_chokepoint(records)
         self.assertEqual(result["status"], "已验证")
         self.assertEqual(result["score"], 80)
+
+    def test_web_risk_requires_company_and_authority_body(self) -> None:
+        records = [
+            {"fetch_status": "ok", "source_tier": "A", "company_named": True,
+             "risk_signals": {"delisting": [], "audit": ["保留意见"], "goodwill": []}},
+            {"fetch_status": "ok", "source_tier": "B", "company_named": True,
+             "risk_signals": {"delisting": ["退市风险警示"], "audit": [], "goodwill": []}},
+        ]
+        result = web_research._validate_risk(records)
+        self.assertEqual(result["status"], "已验证")
+        self.assertTrue(result["audit_risk"])
+        self.assertIsNone(result["st_risk"])
+
+    def test_web_risk_ignores_report_template_and_unqualified_goodwill_text(self) -> None:
+        harmless = web_research._classify({
+            "url": "https://static.cninfo.com.cn/example.pdf",
+            "content": "强瑞技术 非标准审计意见提示 适用 不适用。审计意见为：标准的无保留意见。公司执行商誉减值测试。",
+        }, "强瑞技术")
+        self.assertEqual(harmless["risk_signals"]["audit"], [])
+        self.assertEqual(harmless["risk_signals"]["goodwill"], [])
+
+        risky = web_research._classify({
+            "url": "https://static.cninfo.com.cn/example.pdf",
+            "content": "强瑞技术被出具保留意见，并计提了相关商誉减值准备。",
+        }, "强瑞技术")
+        self.assertTrue(risky["risk_signals"]["audit"])
+        self.assertTrue(risky["risk_signals"]["goodwill"])
+
+    def test_web_specialized_requires_authority_and_company_name(self) -> None:
+        valid = [{"fetch_status": "ok", "source_tier": "A", "company_named": True, "specialized_labels": ["专精特新小巨人"]}]
+        invalid = [{"fetch_status": "ok", "source_tier": "B", "company_named": True, "specialized_labels": ["专精特新小巨人"]}]
+        self.assertEqual(web_research._validate_specialized(valid)["strength"], 1.0)
+        self.assertEqual(web_research._validate_specialized(invalid)["status"], "需人工确认")
+
+    def test_web_catalyst_requires_authority_company_event_and_fresh_date(self) -> None:
+        valid = [{"fetch_status": "ok", "source_tier": "A", "company_named": True,
+                  "catalyst_categories": ["orders"], "evidence_fresh": True}]
+        stale = [{**valid[0], "evidence_fresh": False}]
+        self.assertEqual(web_research._validate_catalysts(valid)["verified_count"], 1)
+        self.assertEqual(web_research._validate_catalysts(stale)["status"], "需人工确认")
 
     def test_search_timeout_and_http_error_degrade_cleanly(self) -> None:
         with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": ""}, clear=False), \
@@ -291,7 +397,20 @@ class PipelineEfficiencyTest(unittest.TestCase):
         })
         analyzer = AlphaSorosAnalyzer(frame, "测试", "000001")
         self.assertIsInstance(analyzer.A_PINGFEN, np.ndarray)
-        self.assertIn("moda_technical", analyzer.generate_report())
+        report = analyzer.generate_report()
+        self.assertIn("moda_technical", report)
+        self.assertIn("缠论（日线简化结构）", report)
+        for indicator in ("OBV", "30日BIAS", "MACD", "BOLL", "ATR", "DMI", "RSI", "WR"):
+            self.assertIn(indicator, report)
+        self.assertIn("当前价", report)
+        self.assertIn("支撑位", report)
+        self.assertIn("压力位", report)
+        self.assertIn("技术结构得分", report)
+
+    def test_finance_metrics_preserve_goodwill_risk_boolean(self) -> None:
+        assets = pd.DataFrame([{"资产总计": 100.0, "负债合计": 20.0, "货币资金": 10.0, "商誉": 5.0}])
+        metrics = finance_data._report_metrics("000001", {}, {}, pd.DataFrame(), pd.DataFrame(), {"fzb": assets})
+        self.assertIs(metrics["goodwill_risk"], False)
 
     def test_company_peers_use_easy_tdx_industry(self) -> None:
         boards = pd.DataFrame([

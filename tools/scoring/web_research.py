@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date, datetime
 from html.parser import HTMLParser
 import ipaddress
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -13,16 +15,23 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import requests
+from pypdf import PdfReader
 
 
 ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "web_research"
 USER_AGENT = "moda-v4-research/1.0"
 MAX_FETCH_BYTES = 600_000
-MAX_PAGES = 12
+MAX_PDF_FETCH_BYTES = 10_000_000
+MAX_PAGES = 30
+MAX_PAGES_PER_PURPOSE = 6
 AUTHORITY_DOMAINS = (
     "gov.cn", "cninfo.com.cn", "sse.com.cn", "szse.cn", "bse.cn",
     "stats.gov.cn", "miit.gov.cn", "ndrc.gov.cn", "customs.gov.cn",
+)
+STATUTORY_DOMAINS = ("cninfo.com.cn", "sse.com.cn", "szse.cn", "bse.cn")
+CLUE_ONLY_DOMAINS = (
+    "xueqiu.com", "eastmoney.com", "gw.com.cn", "dzh.com.cn",
 )
 SUPPLY_CATEGORIES = {
     "price": ("价格", "涨价", "降价", "报价", "基差"),
@@ -35,6 +44,41 @@ LOOSENING_TERMS = ("供过于求", "库存上升", "降价", "产能过剩", "�
 COMPANY_RELATION_TERMS = ("产品", "设备", "业务", "供应商", "客户", "产业化", "量产")
 REPLACEMENT_TERMS = ("国产替代", "进口替代", "自主可控", "国产化")
 DEPENDENCY_TERMS = ("进口依赖", "卡脖子", "受制于人", "海外垄断", "国外垄断", "关键核心技术", "国产化率")
+DELISTING_TERMS = ("退市风险警示", "终止上市", "暂停上市", "重大违法强制退市", "*ST", "ST ")
+AUDIT_RISK_PATTERNS = (
+    r"审计意见(?:为|类型为|[:：])\s*(?:保留意见|无法表示意见|否定意见)",
+    r"(?:被出具|出具了?|形成了?)\s*(?:保留意见|无法表示意见|否定意见)",
+)
+GOODWILL_RISK_PATTERNS = (
+    r"计提(?:了)?[^。；;\n]{0,20}商誉减值",
+    r"商誉减值(?:准备|损失)",
+    r"发生(?:了)?[^。；;\n]{0,12}商誉减值",
+)
+SPECIALIZED_TERMS = ("专精特新小巨人", "专精特新", "制造业单项冠军", "单项冠军")
+CATALYST_CATEGORIES = {
+    "orders": ("中标", "重大合同", "新增订单", "订单增长"),
+    "capacity": ("扩产", "投产", "项目落地", "产线建设"),
+    "performance": ("业绩预增", "扭亏", "利润增长"),
+    "shareholder": ("回购", "增持"),
+    "policy": ("纳入名单", "政策支持", "补贴", "获批"),
+}
+
+
+def _load_local_env() -> None:
+    path = ROOT / ".env"
+    if not path.exists():
+        return
+    allowed = {"MODA_SEARCH_PROVIDER", "SEARXNG_URL", "DDG_MCP_URL"}
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() in allowed:
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_local_env()
 
 
 class _TextExtractor(HTMLParser):
@@ -64,6 +108,25 @@ def _domain(url: str) -> str:
 
 def _is_authority(domain: str) -> bool:
     return any(domain == suffix or domain.endswith("." + suffix) for suffix in AUTHORITY_DOMAINS) or domain.endswith(".org.cn")
+
+
+def _matches_domain(domain: str, suffixes: tuple[str, ...]) -> bool:
+    domain = domain.lower().removeprefix("www.")
+    return any(domain == suffix or domain.endswith("." + suffix) for suffix in suffixes)
+
+
+def _source_role(domain: str) -> tuple[str, str]:
+    if _matches_domain(domain, STATUTORY_DOMAINS):
+        return "法定信息披露", "A"
+    if _matches_domain(domain, CLUE_ONLY_DOMAINS):
+        return "线索来源", "C"
+    if _is_authority(domain):
+        return "权威来源", "A"
+    return "一般来源", "B"
+
+
+def _confirmable(row: dict[str, Any]) -> bool:
+    return row.get("fetch_status") == "ok" and row.get("source_role") != "线索来源"
 
 
 def _safe_public_url(url: str) -> bool:
@@ -190,15 +253,27 @@ def _fetch_page(url: str, timeout: float) -> tuple[str, str]:
                 current = urljoin(current, response.headers.get("location", ""))
                 continue
             response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
+            is_pdf = "application/pdf" in content_type or urlparse(current).path.lower().endswith(".pdf")
+            byte_limit = MAX_PDF_FETCH_BYTES if is_pdf else MAX_FETCH_BYTES
             chunks: list[bytes] = []
             total = 0
             for chunk in response.iter_content(32_768):
                 total += len(chunk)
-                if total > MAX_FETCH_BYTES:
+                if total > byte_limit:
                     break
                 chunks.append(chunk)
+            body = b"".join(chunks)
+            if total > byte_limit:
+                return "document_too_large", ""
+            if is_pdf:
+                try:
+                    text = " ".join((page.extract_text() or "") for page in PdfReader(BytesIO(body)).pages)
+                except Exception as exc:
+                    return f"pdf_{type(exc).__name__}", ""
+                return ("ok", text[:120_000]) if text.strip() else ("pdf_no_text", "")
             encoding = response.encoding or "utf-8"
-            html = b"".join(chunks).decode(encoding, errors="replace")
+            html = body.decode(encoding, errors="replace")
             parser = _TextExtractor()
             parser.feed(html)
             return "ok", " ".join(parser.parts)[:120_000]
@@ -214,20 +289,62 @@ def _classify(record: dict[str, Any], name: str) -> dict[str, Any]:
     loosening = any(term in text for term in LOOSENING_TERMS)
     company_relation = bool(name and name in text and any(term in text for term in COMPANY_RELATION_TERMS) and any(term in text for term in REPLACEMENT_TERMS))
     industry_dependency = any(term in text for term in DEPENDENCY_TERMS) and any(term in text for term in REPLACEMENT_TERMS)
+    company_named = bool(name and name in text)
+    audit_hits = [match.group(0) for pattern in AUDIT_RISK_PATTERNS for match in re.finditer(pattern, text)]
+    goodwill_hits = [match.group(0) for pattern in GOODWILL_RISK_PATTERNS for match in re.finditer(pattern, text)]
+    risk_signals = {
+        "delisting": [term for term in DELISTING_TERMS if term in text],
+        "audit": list(dict.fromkeys(audit_hits)),
+        "goodwill": list(dict.fromkeys(goodwill_hits)),
+    }
+    specialized_labels = [term for term in SPECIALIZED_TERMS if term in text]
+    catalyst_categories = [category for category, terms in CATALYST_CATEGORIES.items() if any(term in text for term in terms)]
+    evidence_date = _extract_evidence_date(record, text)
     domain = _domain(record.get("url", ""))
+    source_role, source_tier = _source_role(domain)
     return {
         **record,
         "domain": domain,
-        "source_tier": "A" if _is_authority(domain) else "B",
+        "source_tier": source_tier,
+        "source_role": source_role,
         "supply_categories": categories,
         "supply_direction": "tightening" if tightening and not loosening else "loosening" if loosening and not tightening else "conflict" if tightening and loosening else "unknown",
         "company_product_relation": company_relation,
         "industry_dependency": industry_dependency,
+        "company_named": company_named,
+        "risk_signals": risk_signals,
+        "specialized_labels": specialized_labels,
+        "catalyst_categories": catalyst_categories,
+        "evidence_date": evidence_date,
+        "evidence_fresh": _is_fresh_date(evidence_date),
     }
 
 
+def _extract_evidence_date(record: dict[str, Any], text: str) -> str:
+    candidates = [str(record.get("date") or ""), text[:6000]]
+    for candidate in candidates:
+        match = re.search(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?", candidate)
+        if not match:
+            continue
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
+        except ValueError:
+            continue
+    return ""
+
+
+def _is_fresh_date(value: str, days: int = 365) -> bool:
+    if not value:
+        return False
+    try:
+        age = (date.today() - datetime.strptime(value, "%Y-%m-%d").date()).days
+    except ValueError:
+        return False
+    return 0 <= age <= days
+
+
 def _validate_supply(records: list[dict[str, Any]]) -> dict[str, Any]:
-    usable = [row for row in records if row.get("fetch_status") == "ok" and row.get("supply_categories") and row.get("supply_direction") in {"tightening", "loosening"}]
+    usable = [row for row in records if _confirmable(row) and row.get("supply_categories") and row.get("supply_direction") in {"tightening", "loosening"}]
     domains = {row["domain"] for row in usable}
     categories = {category for row in usable for category in row["supply_categories"]}
     has_authority = any(row["source_tier"] == "A" for row in usable)
@@ -245,8 +362,8 @@ def _validate_supply(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _validate_chokepoint(records: list[dict[str, Any]]) -> dict[str, Any]:
-    company_rows = [row for row in records if row.get("fetch_status") == "ok" and row.get("company_product_relation")]
-    industry_rows = [row for row in records if row.get("fetch_status") == "ok" and row.get("industry_dependency")]
+    company_rows = [row for row in records if _confirmable(row) and row.get("company_product_relation")]
+    industry_rows = [row for row in records if _confirmable(row) and row.get("industry_dependency")]
     domains = {row["domain"] for row in company_rows + industry_rows}
     has_authority = any(row["source_tier"] == "A" for row in company_rows + industry_rows)
     confirmed = bool(company_rows and industry_rows and len(domains) >= 2 and has_authority)
@@ -261,6 +378,55 @@ def _validate_chokepoint(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _validate_risk(records: list[dict[str, Any]]) -> dict[str, Any]:
+    usable = [
+        row for row in records
+        if _confirmable(row) and row.get("source_tier") == "A" and row.get("company_named")
+        and any(row.get("risk_signals", {}).values())
+    ]
+    return {
+        "status": "已验证" if usable else "需人工确认",
+        "evidence_count": len(usable),
+        "st_risk": any(row.get("risk_signals", {}).get("delisting") for row in usable) or None,
+        "audit_risk": any(row.get("risk_signals", {}).get("audit") for row in usable) or None,
+        "goodwill_risk": any(row.get("risk_signals", {}).get("goodwill") for row in usable) or None,
+        "reason": "权威正文命中公司退市、审计或商誉风险" if usable else "未取得命中公司名称和风险事项的权威正文；不能以无搜索结果证明无风险",
+    }
+
+
+def _validate_specialized(records: list[dict[str, Any]]) -> dict[str, Any]:
+    usable = [
+        row for row in records
+        if _confirmable(row) and row.get("source_tier") == "A"
+        and row.get("company_named") and row.get("specialized_labels")
+    ]
+    labels = sorted({label for row in usable for label in row.get("specialized_labels", [])})
+    strength = 1.0 if any(label in {"专精特新小巨人", "制造业单项冠军", "单项冠军"} for label in labels) else 0.75 if labels else None
+    return {
+        "status": "已验证" if usable else "需人工确认",
+        "evidence_count": len(usable),
+        "labels": labels,
+        "strength": strength,
+        "reason": "政府、协会或交易所权威正文确认公司资质" if usable else "缺少同时包含公司名称和资质名称的权威正文",
+    }
+
+
+def _validate_catalysts(records: list[dict[str, Any]]) -> dict[str, Any]:
+    usable = [
+        row for row in records
+        if _confirmable(row) and row.get("source_tier") == "A"
+        and row.get("company_named") and row.get("catalyst_categories") and row.get("evidence_fresh")
+    ]
+    categories = sorted({category for row in usable for category in row.get("catalyst_categories", [])})
+    return {
+        "status": "已验证" if usable else "需人工确认",
+        "evidence_count": len(usable),
+        "verified_count": min(2, len(categories)) if usable else None,
+        "categories": categories,
+        "reason": "一年内权威正文确认公司具体催化事件" if usable else "缺少公司关系、权威正文、具体事件或有效日期",
+    }
+
+
 def collect(code: str, name: str, context: str, provider: str | None = None, timeout: float = 12) -> dict[str, Any]:
     selected = (provider or os.getenv("MODA_SEARCH_PROVIDER", "auto")).strip().lower()
     if selected not in {"auto", "searxng", "duckduckgo", "off"}:
@@ -268,33 +434,46 @@ def collect(code: str, name: str, context: str, provider: str | None = None, tim
     if selected == "off":
         return {"web_research_status": "disabled", "web_research_provider": "off", "queries": [], "results": [], "errors": []}
 
-    queries = [
-        f"{name} {context} 供不应求 订单 产能 库存",
-        f"{name} {context} 国产替代 核心供应商 进口依赖",
-        f"site:cninfo.com.cn {name} 订单 产能 国产替代",
-        f"site:gov.cn {context} 国产替代 进口依赖 供需",
+    short_context = " ".join(context.split()[:12])
+    query_specs = [
+        ("supply", f"{name} {short_context} 供不应求 订单 产能 库存"),
+        ("chokepoint", f"{name} {short_context} 国产替代 核心供应商 进口依赖"),
+        ("chokepoint", f"site:cninfo.com.cn {name} 订单 产能 国产替代"),
+        ("risk", f"site:cninfo.com.cn {name} 退市 审计意见 商誉减值"),
+        ("risk", f"site:szse.cn {code} {name} 风险警示 审计 商誉"),
+        ("specialized", f"site:gov.cn {name} 专精特新 小巨人 单项冠军"),
+        ("specialized", f"site:miit.gov.cn {name} 专精特新 单项冠军"),
+        ("catalyst", f"site:cninfo.com.cn {name} 中标 合同 扩产 投产 业绩预增 回购 增持"),
+        ("catalyst", f"site:gov.cn {name} 获批 纳入名单 项目落地"),
     ]
+    queries = [query for _, query in query_specs]
     results: list[dict[str, Any]] = []
     errors: list[str] = []
     used_providers: list[str] = []
     seen: set[str] = set()
-    for query in queries:
+    purpose_counts: dict[str, int] = {}
+    for purpose, query in query_specs:
         used, rows, query_errors = _search(selected, query, timeout)
         errors.extend(f"{query[:24]}:{error}" for error in query_errors)
         if used != "none" and used not in used_providers:
             used_providers.append(used)
         for row in rows:
             url = row.get("url", "")
-            if not url or url in seen or len(results) >= MAX_PAGES:
+            if (not url or url in seen or len(results) >= MAX_PAGES
+                    or purpose_counts.get(purpose, 0) >= MAX_PAGES_PER_PURPOSE):
                 continue
             seen.add(url)
+            purpose_counts[purpose] = purpose_counts.get(purpose, 0) + 1
             fetch_status, content = _fetch_page(url, timeout)
-            classified = _classify({**row, "query": query, "fetch_status": fetch_status, "content": content}, name)
+            classified = _classify({**row, "purpose": purpose, "query": query, "fetch_status": fetch_status, "content": content}, name)
             classified.pop("content", None)
             results.append(classified)
 
     supply = _validate_supply(results)
     chokepoint = _validate_chokepoint(results)
+    risk = _validate_risk(results)
+    specialized = _validate_specialized(results)
+    catalysts = _validate_catalysts(results)
     status = "completed" if results else "unavailable"
     return {
         "web_research_status": status,
@@ -304,6 +483,9 @@ def collect(code: str, name: str, context: str, provider: str | None = None, tim
         "errors": errors,
         "web_supply_validation": supply,
         "web_chokepoint_validation": chokepoint,
+        "web_risk_validation": risk,
+        "web_specialized_validation": specialized,
+        "web_catalyst_validation": catalysts,
     }
 
 
@@ -318,22 +500,25 @@ def build_report(code: str, name: str, data: dict[str, Any]) -> str:
         f"- 运行状态：{data.get('web_research_status')}",
         f"- 供需验证：{data.get('web_supply_validation', {}).get('status', '需人工确认')}；{data.get('web_supply_validation', {}).get('reason', '搜索未运行')}",
         f"- 国产替代验证：{data.get('web_chokepoint_validation', {}).get('status', '需人工确认')}；{data.get('web_chokepoint_validation', {}).get('reason', '搜索未运行')}",
+        f"- 退市/审计/商誉验证：{data.get('web_risk_validation', {}).get('status', '需人工确认')}；{data.get('web_risk_validation', {}).get('reason', '搜索未运行')}",
+        f"- 专精特新/单项冠军验证：{data.get('web_specialized_validation', {}).get('status', '需人工确认')}；{data.get('web_specialized_validation', {}).get('reason', '搜索未运行')}",
+        f"- 风口催化验证：{data.get('web_catalyst_validation', {}).get('status', '需人工确认')}；{data.get('web_catalyst_validation', {}).get('reason', '搜索未运行')}",
         "",
-        "| 来源等级 | 标题 | 域名 | 正文 | 查询词 |",
-        "|---|---|---|---|---|",
+        "| 用途 | 来源角色 | 来源等级 | 标题 | 域名 | 正文 | 证据日期 | 查询词 |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for row in data.get("results", []):
         title = str(row.get("title", "")).replace("|", "/")
         query = str(row.get("query", "")).replace("|", "/")
-        lines.append(f"| {row.get('source_tier', 'B')} | [{title}]({row.get('url', '')}) | {row.get('domain', '')} | {row.get('fetch_status', '')} | {query} |")
+        lines.append(f"| {row.get('purpose', '')} | {row.get('source_role', '一般来源')} | {row.get('source_tier', 'B')} | [{title}]({row.get('url', '')}) | {row.get('domain', '')} | {row.get('fetch_status', '')} | {row.get('evidence_date', '') or '未识别'} | {query} |")
     if not data.get("results"):
-        lines.append("| - | 无可核验结果 | - | - | - |")
-    lines += ["", "搜索摘要只用于发现线索；正文未成功读取或未通过交叉验证时不得计分。", ""]
+        lines.append("| - | - | - | 无可核验结果 | - | - | - | - |")
+    lines += ["", "法定信息披露平台正文可作为高确信度证据；雪球、东方财富、大智慧等金融论坛只收集线索，不参与确认或计分。搜索摘要只用于发现线索；正文未成功读取或未通过交叉验证时不得计分。", ""]
     return "\n".join(lines)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Validate supply and chokepoint evidence with optional web search")
+    parser = argparse.ArgumentParser(description="Validate framework evidence with optional web search")
     parser.add_argument("--stock", required=True)
     parser.add_argument("--name", default="")
     parser.add_argument("--context", default="")

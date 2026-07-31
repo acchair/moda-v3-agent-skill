@@ -244,6 +244,16 @@ def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame
     cash = latest("fzb", "货币资金")
     if cash is not None and liabilities and liabilities > 0:
         metrics["cash_to_debt"] = cash / liabilities
+    goodwill = latest("fzb", "商誉")
+    if goodwill is not None:
+        metrics["goodwill"] = goodwill
+        if assets and assets > 0:
+            goodwill_ratio = goodwill / assets
+            metrics["goodwill_to_assets"] = goodwill_ratio
+            if goodwill_ratio <= 0.10:
+                metrics["goodwill_risk"] = False
+            elif goodwill_ratio >= 0.20:
+                metrics["goodwill_risk"] = True
     if not valuation.empty:
         target = valuation[valuation["代码"].eq(code)]
         if not target.empty:
@@ -264,7 +274,9 @@ def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame
     for key, value in metrics.items():
         if value is None:
             continue
-        if isinstance(value, (int, float, np.number)):
+        if isinstance(value, (bool, np.bool_)):
+            clean[key] = bool(value)
+        elif isinstance(value, (int, float, np.number)):
             if np.isfinite(value):
                 clean[key] = float(value)
         else:

@@ -132,29 +132,24 @@ def _thesis_tracker(evidence: dict[str, Any]) -> dict[str, Any]:
     return {"method": "投资逻辑追踪", **_vote(direction, reasons, available)}
 
 
-def evaluate(evidence: dict[str, Any], base_score: int) -> dict[str, Any]:
+def evaluate(evidence: dict[str, Any], base_score: int = 0) -> dict[str, Any]:
     methods = [_quant_screen(evidence), _thesis_tracker(evidence)]
-    base_direction = 1 if base_score > 0 else -1 if base_score < 0 else 0
-    directional = [item["direction"] for item in methods if item["direction"]]
-    confirmations = sum(direction == base_direction for direction in directional) if base_direction else 0
-    conflicts = sum(direction == -base_direction for direction in directional) if base_direction else 0
-
-    final_score = base_score
-    if base_direction and conflicts == len(methods):
-        final_score = base_score - base_direction
-        status = "冲突降级"
-    elif base_direction and confirmations == len(methods):
-        status = "同向确认"
-    elif base_direction:
-        status = "部分覆盖"
+    available = [item for item in methods if item["available_checks"] >= 3]
+    directions = [item["direction"] for item in available]
+    if len(available) < 2:
+        status = "部分覆盖" if available else "证据不足"
+    elif directions == [1, 1]:
+        status = "同向看多"
+    elif directions == [-1, -1]:
+        status = "同向看空"
+    elif directions[0] != directions[1]:
+        status = "方向分歧"
     else:
-        status = "基础中性"
+        status = "方向中性"
 
     return {
         "base_score": base_score,
-        "final_score": final_score,
+        "final_score": base_score,
         "status": status,
-        "confirmations": confirmations,
-        "conflicts": conflicts,
         "methods": methods,
     }

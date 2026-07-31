@@ -30,11 +30,11 @@ def evaluate(evidence: dict[str, Any], card: Scorecard) -> list[dict[str, str]]:
 
     return [
         _row("DCF 估值", "条件适用", "待数据", "需要自由现金流、净债务、总股本和经审查的增长/WACC 假设；禁止用市值反推 FCF"),
-        _row("Comps 同行估值", "高", "已启用" if comps_ready else "待数据", "PE/PB 与同行中位数交叉验证，不改变五因子得分" if comps_ready else "缺少目标或同行可比估值"),
+        _row("Comps 同行估值", "高", "已启用" if comps_ready else "待数据", "PE/PB 与同行中位数交叉验证，不改变六层得分" if comps_ready else "缺少目标或同行可比估值"),
         _row("三表预测", "条件适用", "待数据", "需要完整利润表、资产负债表、现金流量表和资本开支假设"),
         _row("Quick LBO", "低/条件适用", "待场景", "普通 A 股少数股权研究不默认使用；仅在私有化、并购或控股交易场景启用"),
         _row("并购增厚/摊薄", "条件适用", "可启用" if merger_ready else "待事件", "仅在存在明确交易对价、融资结构和标的财务时计算"),
-        _row("首次覆盖报告", "中", "可启用" if factor_ready and valuation_ready else "待数据", "可复用当前五层诊断作为事实底稿，不另造评级体系"),
+        _row("首次覆盖报告", "中", "可启用" if factor_ready and valuation_ready else "待数据", "可复用当前六层诊断作为事实底稿，不另造评级体系"),
         _row("财报 beat/miss 解读", "高", "已启用" if earnings_ready else "待数据", "基于营收、利润及其趋势判断" if earnings_ready else "缺少可比财报趋势或一致预期"),
         _row("催化剂日历", "高", "已启用" if catalyst_checked else "待数据", "公告已核验；只有明确日期和事件才进入日历" if catalyst_checked else "公告模块未完成"),
         _row("投资逻辑追踪", "高", alpha_check.get("status", "待数据"), thesis.get("reason", "缺少 Alpha 趋势、信号和位置证据")),

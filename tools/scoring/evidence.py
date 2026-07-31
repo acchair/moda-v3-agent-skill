@@ -205,7 +205,8 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
         " ".join(str(item) for item in evidence.get("business_items", [])[:30]),
         " ".join(str(item) for item in evidence.get("concepts", [])[:30]),
     ])
-    full_context = structured_context + " " + " ".join(reports.values())
+    searchable_reports = [report for directory, report in reports.items() if directory != "web_research"]
+    full_context = structured_context + " " + " ".join(searchable_reports)
     matched_tracks = [label for label, terms in TRACK_GROUPS.items() if any(term.lower() in structured_context.lower() for term in terms)]
     if matched_tracks:
         strength = 1.0 if len(matched_tracks) >= 2 else 0.8
@@ -271,6 +272,25 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
         _set(evidence, "chokepoint_score", web_chokepoint.get("score"), SOURCE_LABELS["web_research"], overwrite=True)
         evidence["chokepoint_partial"] = False
         evidence["chokepoint_web_fallback"] = True
+
+    web_risk = evidence.get("web_risk_validation") or {}
+    if web_risk.get("status") == "已验证":
+        for key in ("st_risk", "audit_risk", "goodwill_risk"):
+            if web_risk.get(key) is True:
+                _set(evidence, key, True, SOURCE_LABELS["web_research"], overwrite=True)
+
+    web_specialized = evidence.get("web_specialized_validation") or {}
+    if web_specialized.get("status") == "已验证" and ("specialized_strength" not in evidence or evidence.get("specialized_partial") is True):
+        _set(evidence, "specialized_strength", web_specialized.get("strength"), SOURCE_LABELS["web_research"], overwrite=True)
+        evidence["specialized_reason"] = web_specialized.get("reason", "权威网页确认资质")
+        evidence["specialized_partial"] = False
+
+    web_catalyst = evidence.get("web_catalyst_validation") or {}
+    if web_catalyst.get("status") == "已验证":
+        current_catalysts = int(_float(evidence.get("verified_catalyst_count")) or 0)
+        searched_catalysts = int(_float(web_catalyst.get("verified_count")) or 0)
+        if searched_catalysts > current_catalysts:
+            _set(evidence, "verified_catalyst_count", searched_catalysts, SOURCE_LABELS["web_research"], overwrite=True)
 
     promotion_hits = set(str(item) for item in evidence.get("promotional_keyword_hits", []))
     rumor_hits = set(str(item) for item in evidence.get("rumor_keyword_hits", []))

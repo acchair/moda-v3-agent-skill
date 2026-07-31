@@ -23,6 +23,14 @@ def _fmt(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else f"{value:.2f}"
 
 
+def _progress_bar(value: float, maximum: float, width: int = 20) -> str:
+    if width <= 0:
+        return ""
+    ratio = 0.0 if maximum <= 0 else max(0.0, min(float(value) / float(maximum), 1.0))
+    filled = min(width, int(ratio * width + 0.5))
+    return "█" * filled + "░" * (width - filled)
+
+
 def _factor_status(factor: FactorResult) -> str:
     statuses = {item.status for item in factor.subfactors}
     if statuses == {"已验证"}:
@@ -70,16 +78,6 @@ def _sleep_checks(card: Scorecard) -> list[tuple[str, str, str]]:
     ]
 
 
-def _one_line_conclusion(card: Scorecard) -> str:
-    strongest = max(card.factors, key=lambda factor: factor.score / factor.maximum)
-    weakest = min(card.factors, key=lambda factor: factor.score / factor.maximum)
-    return (
-        f"当前最强项是 {strongest.key} {strongest.label}（{_fmt(strongest.score)}/{_fmt(strongest.maximum)}），"
-        f"最大短板是 {weakest.key} {weakest.label}（{_fmt(weakest.score)}/{_fmt(weakest.maximum)}）。"
-        f"综合评级为“{card.rating}”，原因：{card.rating_reason}。"
-    )
-
-
 def _framework_conclusion(card: Scorecard, evidence: dict[str, Any]) -> list[str]:
     subfactors = {item.key: item for factor in card.factors for item in factor.subfactors}
     factors = {factor.key: factor for factor in card.factors}
@@ -94,7 +92,8 @@ def _framework_conclusion(card: Scorecard, evidence: dict[str, Any]) -> list[str
     price = subfactors["price_position"]
     financial = subfactors["financial_safety"]
     background = subfactors["background"]
-    alpha = adjustments["alpha"]
+    institutional = adjustments["institutional_direction"]
+    technical = adjustments["technical_structure"]
     sentiment = adjustments["sentiment"]
     weakest = min(card.factors, key=lambda factor: factor.score / factor.maximum)
     logic_status = "基本成立" if factors["F1"].score >= 20 and factors["F3"].score >= 12 else "尚未完全成立"
@@ -102,25 +101,97 @@ def _framework_conclusion(card: Scorecard, evidence: dict[str, Any]) -> list[str
         f"1. 一句话逻辑：{logic_status}。{name}的核心依据是{track.reason}，但必须以已验证证据为准。",
         f"2. 产业位置：{upstream.reason}；供需判断为{supply.reason}。赛道成立不等于位置合适。",
         f"3. 国产替代与兑现：{chokepoint.reason}；{capex.reason}；{realization.reason}。订单和利润没有共同兑现时，题材不能单独支撑评级。",
-        f"4. 位置与市场态度：{price.reason}；Alpha 修正 {alpha.score:+g}，情绪/拥挤度修正 {sentiment.score:+g}。热榜只代表关注，不代表利好。",
+        f"4. 位置与市场态度：{price.reason}；机构方向 {institutional.score:g}/2，技术结构 {technical.score:g}/4，情绪/拥挤度 {sentiment.score:g}/2。热榜只代表关注，不代表利好。",
         f"5. 安全边际：{financial.reason}；{background.reason}。当前最大短板是 {weakest.key} {weakest.label}（{_fmt(weakest.score)}/{_fmt(weakest.maximum)}）。",
         f"6. 结论：归入“{card.rating}”，{card.rating_reason}。证伪条件是产业需求、订单或资本开支连续两个报告期恶化，或现金流、审计和股东行为明显转坏。",
     ]
 
 
-def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecard, requested_modules: tuple[str, ...]) -> str:
+def _technical_analysis(evidence: dict[str, Any]) -> list[str]:
+    indicators = evidence.get("technical_indicators") if isinstance(evidence.get("technical_indicators"), dict) else {}
+    chan = evidence.get("chan_structure") if isinstance(evidence.get("chan_structure"), dict) else {}
+
+    def value(key: str, field: str = "value", suffix: str = "") -> str:
+        item = indicators.get(key, {})
+        raw = item.get(field) if isinstance(item, dict) else None
+        return f"{raw}{suffix}" if raw is not None else "需人工确认"
+
+    chan_reading = "需人工确认"
+    if chan.get("status") == "可分析":
+        chan_reading = f"{chan.get('latest_direction', '方向未定')}；{chan.get('relation', '中枢未形成')}"
+    rows = [
+        ("缠论（结构）", chan_reading, "结构偏多" if chan.get("latest_direction") == "向上" else "结构偏空" if chan.get("latest_direction") == "向下" else "方向未定"),
+        ("OBV", value("obv"), indicators.get("obv", {}).get("state", "需人工确认")),
+        ("30日BIAS", value("bias30", suffix="%"), indicators.get("bias30", {}).get("state", "需人工确认")),
+        ("MACD", value("macd"), indicators.get("macd", {}).get("state", "需人工确认")),
+        ("BOLL", f"位置 {value('boll')}", indicators.get("boll", {}).get("state", "需人工确认")),
+        ("ATR", value("atr", "pct", "%"), indicators.get("atr", {}).get("state", "需人工确认")),
+        ("DMI", f"ADX {value('dmi', 'adx')}", indicators.get("dmi", {}).get("state", "需人工确认")),
+        ("RSI", value("rsi"), indicators.get("rsi", {}).get("state", "需人工确认")),
+        ("WR", value("wr"), indicators.get("wr", {}).get("state", "需人工确认")),
+    ]
+    current_price = chan.get("current_price", "需人工确认")
+    support = chan.get("support", "需人工确认")
+    resistance = chan.get("resistance", "需人工确认")
+    structure_score = evidence.get("technical_structure_score", "需人工确认")
+    structure_reason = evidence.get("technical_structure_reason", "技术证据不足，需人工确认")
     lines = [
-        f"总分：{_fmt(card.final_score)}/100｜评级：{card.rating}｜技术信号：{card.signal}",
+        "## 技术分析（easy-tdx 日 K）",
         "",
-        f"# {name or code}（{code}）五层诊断",
+        (
+            f"- 当前价格：{current_price}；支撑位：{support}；压力位：{resistance}。"
+        ),
+        f"- 综合判断：技术结构 {structure_score}/4；{structure_reason}；交易信号 {evidence.get('technical_signal', '需人工确认')}。",
+        "- 缠论说明：识别日线分型、笔和最近三笔重叠区间，不替代完整多级别缠论递归。",
+        "",
+        "| 指标 | 当前读数 | 当前评价 |",
+        "|---|---|---|",
+    ]
+    lines.extend(f"| {indicator} | {reading} | {comment} |" for indicator, reading, comment in rows)
+    return lines
+
+
+def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecard, requested_modules: tuple[str, ...]) -> str:
+    adjustments = {item.key: item for item in card.adjustments}
+    lines = [
+        f"# {name or code}（{code}）六层诊断",
         "",
         f"<!-- moda_scorecard: {json.dumps(card.to_dict(), ensure_ascii=False)} -->",
         "",
-        "## 一句话结论",
+        "## 综合得分",
         "",
-        _one_line_conclusion(card),
+        "```text",
+        f"  {_fmt(card.final_score)} / 100  [{_progress_bar(card.final_score, 100)}]",
+        f"  评级：{card.rating}  |  技术信号：{card.signal}",
+        (
+            f"  F6修正：机构方向 {adjustments['institutional_direction'].score:g}/2  |  "
+            f"技术结构 {adjustments['technical_structure'].score:g}/4  |  "
+            f"情绪/拥挤度 {adjustments['sentiment'].score:g}/2  |  "
+            f"风口催化 {adjustments['catalyst'].score:g}/2"
+        ),
+        "```",
         "",
-        "## 五层评分卡",
+        "## 一句话结论与最终判断",
+        "",
+    ]
+    lines.extend(_framework_conclusion(card, evidence))
+    lines += [""]
+    lines.extend(_technical_analysis(evidence))
+    lines += [
+        "",
+        "## 六层图形概览",
+        "",
+        "```text",
+    ]
+    for factor in card.factors:
+        lines.append(
+            f"{factor.key} [{_progress_bar(factor.score, factor.maximum)}] "
+            f"{_fmt(factor.score):>5}/{_fmt(factor.maximum):<3}  {factor.label}"
+        )
+    lines += [
+        "```",
+        "",
+        "## 六层评分卡",
         "",
         "| 因子 | 得分 | 核心判断 | 状态 |",
         "|---|---:|---|---|",
@@ -132,6 +203,15 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
         lines += [
             "",
             f"## {factor.key} {factor.label}（{_fmt(factor.score)}/{_fmt(factor.maximum)}）",
+        ]
+        if factor.key == "F6":
+            lines += [
+                "",
+                f"非修正基础分：{_fmt(card.base_score)}/90｜F6 修正项：{_fmt(card.adjustment_score)}/10｜综合分：{_fmt(card.final_score)}/100",
+                "",
+                "> F6 是独立的第六层，已计入综合分，不再二次加分。",
+            ]
+        lines += [
             "",
             "| 子因子 | 得分 | 判断依据 | 来源 | 状态 |",
             "|---|---:|---|---|---|",
@@ -139,19 +219,6 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
         for item in factor.subfactors:
             reason = item.reason.replace("|", "/")
             lines.append(f"| {item.label} | {_fmt(item.score)}/{_fmt(item.maximum)} | {reason} | {_source_text(item)} | {item.status} |")
-
-    lines += [
-        "",
-        "## 修正项",
-        "",
-        f"基础分：{_fmt(card.base_score)}/100｜修正合计：{card.adjustment_score:+g}｜综合分：{_fmt(card.final_score)}/100",
-        "",
-        "| 修正项 | 分值 | 依据 | 来源 | 状态 |",
-        "|---|---:|---|---|---|",
-    ]
-    for item in card.adjustments:
-        sources = "、".join(f"[{source}]" for source in item.sources) if item.sources else "需人工确认"
-        lines.append(f"| {item.label} | {item.score:+g} | {item.reason} | {sources} | {item.status} |")
 
     lines += [
         "",
@@ -184,7 +251,7 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
         "",
         "## 机构方法交叉验证",
         "",
-        "> hot-money 当前方法索引实际列出 18 项。仅“量化筛选”和“投资逻辑追踪”可在双重冲突时将 Alpha 向 0 收缩 1 分；其余方法不计分，也不改变 Hard Cap。",
+        "> hot-money 当前方法索引实际列出 18 项。本评分只使用“量化选股筛选”和“投资逻辑追踪”判断机构方向，合计 2 分；技术结构由 easy-tdx 独立评分，其他方法不计分，也不改变 Hard Cap。",
         "",
         "| 方法 | 适用价值 | 本次状态 | 说明 |",
         "|---|---|---|---|",
@@ -217,12 +284,6 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
     missing_items = [item.label for factor in card.factors for item in factor.subfactors if item.status == "需人工确认"]
     lines.append("- 需人工确认：" + ("、".join(dict.fromkeys(missing_items)) if missing_items else "无"))
 
-    lines += [
-        "",
-        "## 最终结论",
-        "",
-    ]
-    lines.extend(_framework_conclusion(card, evidence))
     lines += ["", "免责声明：本分析仅供研究参考，不构成投资建议。"]
     return "\n".join(lines) + "\n"
 
@@ -236,7 +297,7 @@ def build_report(code: str, name: str, directories: tuple[str, ...] = REPORTS, s
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="moda-v4 structured five-factor scorer")
+    parser = argparse.ArgumentParser(description="moda-v4 structured six-factor scorer")
     parser.add_argument("--stock", required=True)
     parser.add_argument("--name", default="")
     parser.add_argument("--sources", default=",".join(REPORTS))

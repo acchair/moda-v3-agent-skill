@@ -3,5 +3,7 @@ easy-tdx==1.19.0
 efinance==0.5.8
 numpy==2.4.3
 pandas==2.3.3
+pypdf==6.1.1
 requests==2.32.5
 PyYAML==6.0.3
+ta==0.11.0
