@@ -8,7 +8,7 @@
 
 ## 快速安装
 
-将下面的提示词交给可访问 GitHub 的 Agent：
+将下面的提示词交给Agent：
 
 ```text
 请将 https://github.com/acchair/moda-v3-agent-skill 安装为 moda-v3 Skill：克隆到你的 skills 目录，安装 requirements.txt，读取 SKILL.md，并保持 tools 与 knowledge 的相对目录结构。随后按六层评分框架分析 A 股。
