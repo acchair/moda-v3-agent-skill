@@ -1,118 +1,131 @@
 # moda-v4
 
-![moda-v4](./ChatGPT%20Image%202026%E5%B9%B47%E6%9C%8825%E6%97%A5%2020_24_27.png)
+![moda-v3](./ChatGPT%20Image%202026%E5%B9%B47%E6%9C%8825%E6%97%A5%2020_24_27.png)
 
-本地运行的 A 股五因子研究 Skill。它保留旧版最终评分框架，修复关键词评分上限不足、报告格式漂移、修正项未落地和数据链缺失问题。
+面向 A 股研究的五层评分 Skill，支持数据来源标注、保守硬约束和固定格式输出。
 
-## 核心规则
+> 五层评分 · 来源可追溯 · 缺失数据不猜测 · Hard Cap 风险控制
 
-- 24 个结构化子项组成 100 分基础分。
-- Alpha、情绪/拥挤度、风口催化组成 ±8 修正项。
-- 4 类 Hard Cap 实际参与评级。
-- 数据缺失得 0 分并标记 `需人工确认`。
-- 18 项机构方法按适用条件展示；其中两项只允许对冲突 Alpha 降级，不额外加分。
-- 可选 SearXNG / DuckDuckGo MCP 搜索补缺，正文未核验不计分。
+## 快速安装
 
-## 安装
+将下面的提示词交给可访问 GitHub 的 Agent：
+
+```text
+请将 https://github.com/acchair/moda-v3-agent-skill 安装为 moda-v3 Skill：克隆到你的 skills 目录，安装 requirements.txt，读取 SKILL.md，并保持 tools 与 knowledge 的相对目录结构。随后按五层评分框架分析 A 股。
+```
+
+也可以手动安装：
 
 ```powershell
-cd "C:\Users\Administrator\Desktop\moda v4"
+git clone https://github.com/acchair/moda-v3-agent-skill.git
+cd moda-v3-agent-skill
 python -m pip install -r requirements.txt
 ```
 
-## 运行
+## 使用方法
 
-```powershell
-python tools/run_pipeline.py --stock 300820 --name 英杰电气
-```
-
-### 可选搜索验证
-
-默认不依赖外部搜索服务。需要验证供需失衡和国产替代时，设置以下环境变量：
-
-```powershell
-$env:MODA_SEARCH_PROVIDER="auto"
-$env:SEARXNG_URL="http://127.0.0.1:8888"
-$env:DDG_MCP_URL="http://127.0.0.1:7070/mcp"
-python tools/run_pipeline.py --stock 300820 --name 英杰电气
-```
-
-`auto` 先调用 SearXNG，再降级到 DuckDuckGo MCP。两个 URL 都未配置时，搜索模块只报告 `需人工确认`，不影响其他模块。
-
-DuckDuckGo MCP 可用以下方式启动：
-
-```powershell
-uvx --with "duckduckgo-mcp-server[browser]" duckduckgo-mcp-server --transport streamable-http --host 127.0.0.1 --port 7070
-```
-
-主要结果：
+直接向 Agent 提供股票名称或六位股票代码，例如：
 
 ```text
-knowledge/research/scoring/300820.md
-knowledge/research/scorecards/300820.json
-knowledge/research/pipeline/300820.json
+/moda-v3 中国平安
+/moda-v3 601318
 ```
 
-## 评分框架
+Agent 会确认股票代码并运行基础流水线：
 
-| 因子 | 满分 | 子项数 |
-|---|---:|---:|
-| F1 产业趋势与资本开支 | 30 | 5 |
-| F2 股东与筹码 | 15 | 5 |
-| F3 生存能力与龙头 | 20 | 5 |
-| F4 利润兑现路径 | 15 | 4 |
-| F5 低位与困境反转 | 20 | 5 |
-| 合计 | 100 | 24 |
+```powershell
+python tools/run_pipeline.py --stock 000001 --name 平安银行
+```
 
-评级：`>=85 根`、`70-84 矛`、`55-69 学习仓`、`<55 不碰`。
+流水线会获取行情、财务、技术因子和公告数据，并生成五层评分报告。报告保存在 `knowledge/research/`。
+
+重点报告：
+
+```text
+knowledge/research/finance_data/000001.md
+knowledge/research/tdx_analysis/000001.md
+knowledge/research/announcements/000001.md
+knowledge/research/scoring/000001.md
+```
+
+## 输出格式
+
+最终分析固定按以下顺序输出：
+
+1. 总分、评级与技术信号
+2. 一句话结论
+3. 五层评分卡及 F1-F5 逐项诊断
+4. 修正项
+5. Hard Cap 检查
+6. 睡得着检查
+7. 动态纠错触发器
+8. 数据覆盖与待确认项
+9. 最终结论与免责声明
+
+每个关键判断都标注实际数据来源。报告缺失、接口失败或无法交叉验证的内容统一标记为 `需人工确认`，不会自动转为正面结论。
+
+## 五层评分框架
+
+| 因子 | 满分 | 核心判断 |
+|---|---:|---|
+| F1 产业趋势与资本开支 | 30 | 行业景气、政策、供需、产能和订单 |
+| F2 股东与筹码 | 15 | 增减持、质押、解禁和股东户数 |
+| F3 生存能力与龙头 | 20 | 营收、利润、现金、负债和行业地位 |
+| F4 利润兑现路径 | 15 | 主营、订单、产能、收入和公告兑现 |
+| F5 低位与困境反转 | 20 | PE/PB、价格位置、估值和反转证据 |
+| **合计** | **100** | **仅对有来源的证据评分** |
+
+评级标准：
+
+| 分数 | 评级 |
+|---:|---|
+| `>=85` | 根 |
+| `70-84` | 矛 |
+| `55-69` | 学习仓 |
+| `<55` | 不碰 |
 
 Hard Cap：
 
-- 控股股东/实控人减持：最高学习仓。
-- ST/退市风险：不碰。
-- F1 < 15 或 F3 < 8：最高学习仓。
-- 价格分位 >80% 且新鲜市场拥挤度 >=80%：最高矛。
+- ST 或退市风险：直接评为 `不碰`。
+- 控股股东或实控人减持：最高评为 `学习仓`。
+- F1 低于 15 分或 F3 低于 8 分：最高评为 `学习仓`。
 
-## 数据模块
+## 导出结果
 
-| 模块 | 内容 |
-|---|---|
-| finance_data | 行情、财务、估值、三年价格分位 |
-| business_data | 主营构成、海外收入 |
-| tdx_analysis | Alpha、趋势、技术信号、过热状态 |
-| announcements | 180 日公告、增减持、审计与催化 |
-| market_events | 股东、户数、质押、解禁、概念、研报 |
-| popularity | EastMoney 个股人气排名 |
-| social_sentiment | 微博/知乎/百度/抖音/头条/B站热榜与异常推广词 |
-| congestion | 全市场拥挤度及新鲜度 |
-| supply_demand | 商品现货、基差、库存交叉验证 |
-| macro_policy | LPR、PMI、中国政府网最新政策 |
-| web_research | SearXNG / DuckDuckGo MCP 搜索、正文读取和双来源验证 |
-| scoring | 评分、修正、Hard Cap 和固定格式报告 |
-
-## hot-money 借鉴范围
-
-参考 [godisego/hot-money](https://github.com/godisego/hot-money) 后，v4 采用了多平台独立降级、短缓存、热榜命中明细和异常推广风险交叉验证。没有采用人物角色评分，也没有把简单关键词命中直接当事实。
-
-该项目对机构方法的数量口径并不一致：标题写 17 种，当前索引实际列出 18 种。v4 按实际方法逐项显示状态。量化筛选与投资逻辑追踪仅在同时反向时将 Alpha 向 0 收缩 1 分；其余方法不计分。DCF、LBO、三表、并购、单位经济学和组合再平衡必须满足数据条件才启用。
-
-## 输出顺序
-
-总分与评级 → 五层评分卡 → 24 子项证据 → 修正项 → 舆情与异常推广风险 → Hard Cap → 机构方法交叉验证 → 睡得着检查 → 动态纠错 → 数据覆盖 → 六段莫大框架式结论。
-
-## 验证
+需要保存完整答复时，将最终内容写入 UTF-8 文本并执行：
 
 ```powershell
-python -m unittest discover -s tools -p "test*.py" -v
-python C:\Users\Administrator\.codex\skills\.system\skill-creator\scripts\quick_validate.py "C:\Users\Administrator\Desktop\moda v4"
+python tools/export_skill_output.py --stock 000001 --name 平安银行 --input final.md
 ```
 
-## 安全与免责声明
+默认导出到 `knowledge/output/`。可通过环境变量 `MODA_OUTPUT_DIR` 更改目录。
 
-仓库不保存密码、Token、Cookie、私钥、代理凭据或浏览器登录状态。本项目只用于研究与学习，不构成投资建议，不包含自动交易或账户操作。
+## 平台兼容
+
+| 平台 | 使用方式 | 状态 |
+|---|---|---|
+| Codex | 读取 `SKILL.md` 与 `agents/openai.yaml` | 推荐 |
+| Claude Code | 将仓库放入 Skills 目录并读取 `SKILL.md` | 支持 |
+| Hermes Agent | 使用安装提示词并授予仓库访问权限 | 支持 |
+| OpenMinis | 在手机端下载 Agent 并安装本 Skill | 支持 |
+| 其他支持 `SKILL.md` 的 Agent | 复制仓库到对应 Skills 目录 | 支持 |
+
+### 手机端
+
+[![OpenMinis](https://openminis.app/icon-dark.png)](https://openminis.app/)
+
+访问 [OpenMinis](https://openminis.app/) 下载手机端 Agent，即可安装并使用本 Skill。
+
+## 隐私与安全
+
+仓库不包含浏览器登录状态、Cookie、本机日志或历史分析报告。可选代理凭据只从环境变量读取，禁止写入代码、报告或提交记录。
 
 ## 支持项目
 
-可以前往[雪球主页](https://xueqiu.com/u/1500823973)了解作者的公开研究。
+如果这个项目对选股研究有帮助，可以前往[雪球主页](https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixin&data_type=link&data_model=utl&fix_uid=1500823973)支持作者。
 
-[![支持作者](./_2026-07-31_000022_473.png)](https://xueqiu.com/u/1500823973)
+[![支持作者](./_2026-07-31_000022_473.png)](https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixin&data_type=link&data_model=utl&fix_uid=1500823973)
+
+## 免责声明
+
+本项目仅供研究与学习，不构成任何投资建议。
