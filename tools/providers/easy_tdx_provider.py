@@ -166,10 +166,10 @@ def fetch_realtime_quote(code: str, timeout: float = 3.0) -> dict[str, Any]:
     }
 
 
-def fetch_announcements(code: str, count: int = 30, timeout: float = 8.0) -> pd.DataFrame:
+def fetch_announcements(code: str, count: int = 30, timeout: float = 8.0, page: int = 1) -> pd.DataFrame:
     from easy_tdx.cninfo import CninfoClient
 
-    return CninfoClient(timeout=timeout).get_announcements(str(code).strip(), count=count)
+    return CninfoClient(timeout=timeout).get_announcements(str(code).strip(), count=count, page=page)
 
 
 def fetch_financial_report(

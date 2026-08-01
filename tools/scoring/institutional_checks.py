@@ -15,7 +15,8 @@ def _row(name: str, usefulness: str, status: str, reason: str) -> dict[str, str]
 
 def evaluate(evidence: dict[str, Any], card: Scorecard) -> list[dict[str, str]]:
     subfactors = [item for factor in card.factors for item in factor.subfactors]
-    covered = sum(item.status != "需人工确认" for item in subfactors)
+    unresolved = {"需人工确认", "已搜索未命中", "搜索失败，需人工确认"}
+    covered = sum(item.status not in unresolved for item in subfactors)
     coverage = covered / len(subfactors) if subfactors else 0
     comps_ready = _known(evidence, ("pe_ttm", "peer_pe_ttm_median"))
     earnings_ready = any(_known(evidence, pair) for pair in (("revenue_yoy", "profit_yoy"), ("revenue_yoy_delta", "profit_yoy_delta")))

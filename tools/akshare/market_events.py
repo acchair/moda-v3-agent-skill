@@ -28,11 +28,15 @@ INDUSTRIAL_TERMS = ("产业投资", "产业资本", "控股集团", "实业集�
 
 
 def _safe_fetch(function: Callable[[], pd.DataFrame]) -> pd.DataFrame:
+    return _fetch_result(function)[0]
+
+
+def _fetch_result(function: Callable[[], pd.DataFrame]) -> tuple[pd.DataFrame, bool, str]:
     try:
         frame = function()
-        return frame if frame is not None else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
+        return (frame if frame is not None else pd.DataFrame()), True, ""
+    except Exception as exc:
+        return pd.DataFrame(), False, f"{type(exc).__name__}: {exc}"
 
 
 def fetch_top_holders(code: str, timeout: float = 15) -> list[dict]:
@@ -131,20 +135,47 @@ def _holder_metrics(holders: list[dict]) -> dict:
     }
 
 
+def _security_name(frames: dict[str, pd.DataFrame]) -> str:
+    aliases = ("SECURITY_NAME_ABBR", "SECURITY_NAME", "股票简称", "证券简称", "stock_name")
+    for frame in frames.values():
+        if frame.empty:
+            continue
+        for column in aliases:
+            if column not in frame.columns:
+                continue
+            values = frame[column].dropna().astype(str).str.strip()
+            value = next((item for item in values if item and item.lower() != "nan"), "")
+            if value:
+                return value
+    return ""
+
+
 def collect(code: str) -> tuple[dict, dict[str, pd.DataFrame]]:
-    frames = {
-        "holder_num": _safe_fetch(lambda: provider.holder_num_change(code)),
-        "lockup": _safe_fetch(lambda: provider.lockup_expiry(code)),
-        "concepts": _safe_fetch(lambda: provider.concept_blocks(code)),
-        "research": _safe_fetch(lambda: provider.research_reports(code, max_pages=1)),
-        "pledge": _safe_fetch(lambda: fetch_pledge(code)),
-        "fund_holding": _safe_fetch(lambda: fetch_fund_holding(code)),
+    fetchers = {
+        "holder_num": lambda: provider.holder_num_change(code),
+        "lockup": lambda: provider.lockup_expiry(code),
+        "concepts": lambda: provider.concept_blocks(code),
+        "research": lambda: provider.research_reports(code, max_pages=1),
+        "pledge": lambda: fetch_pledge(code),
+        "fund_holding": lambda: fetch_fund_holding(code),
     }
+    frames: dict[str, pd.DataFrame] = {}
+    fetch_status: dict[str, dict] = {}
+    for key, fetcher in fetchers.items():
+        frame, ok, error = _fetch_result(fetcher)
+        frames[key] = frame
+        fetch_status[key] = {"ok": ok, "error": error}
     try:
         holders = fetch_top_holders(code)
     except Exception:
         holders = []
     structured = _holder_metrics(holders)
+    structured["market_event_fetch_status"] = fetch_status
+    structured["pledge_fetch_ok"] = fetch_status["pledge"]["ok"]
+    structured["unlock_fetch_ok"] = fetch_status["lockup"]["ok"]
+    security_name = _security_name(frames)
+    if security_name:
+        structured["security_name"] = security_name
 
     fund_holding = frames["fund_holding"]
     if not fund_holding.empty:
@@ -156,6 +187,10 @@ def collect(code: str) -> tuple[dict, dict[str, pd.DataFrame]]:
             structured["fund_holding_ratio"] = float(ratios.fillna(0).sum())
         if changes.notna().any():
             structured["fund_holding_change_pct"] = float(changes.fillna(0).sum())
+            change = structured["fund_holding_change_pct"]
+            base_quality = float(structured.get("top10_quality") or 0)
+            fund_quality = 1.0 if change > 0 else 0.5 if change == 0 else 0.0
+            structured["top10_quality"] = min(1.0, base_quality * 0.75 + fund_quality * 0.25)
         if "top10_quality_reason" in structured:
             change = structured.get("fund_holding_change_pct")
             change_text = f"；基金持股比例变化 {change:.2f} 个百分点" if change is not None else "；基金持仓变化需人工确认"
@@ -172,19 +207,28 @@ def collect(code: str) -> tuple[dict, dict[str, pd.DataFrame]]:
             structured["holder_count"] = int(current)
 
     lockup = frames["lockup"]
-    if not lockup.empty:
-        ratios = pd.to_numeric(lockup.get("FREE_RATIO", lockup.get("TOTAL_RATIO")), errors="coerce")
-        structured["unlock_ratio"] = float(ratios.fillna(0).sum())
-    else:
-        structured["unlock_ratio"] = 0.0
+    if fetch_status["lockup"]["ok"]:
+        if lockup.empty:
+            structured["unlock_ratio"] = 0.0
+        else:
+            ratio_column = next((column for column in ("FREE_RATIO", "TOTAL_RATIO") if column in lockup.columns), None)
+            if ratio_column is not None:
+                ratios = pd.to_numeric(lockup[ratio_column], errors="coerce")
+                if ratios.notna().any():
+                    structured["unlock_ratio"] = float(ratios.fillna(0).sum())
 
     pledge = frames["pledge"]
-    if not pledge.empty:
-        active = pledge[~pledge.get("UNFREEZE_STATE", pd.Series(index=pledge.index, dtype=str)).astype(str).str.contains("已解押", na=False)]
-        ratios = pd.to_numeric(active.get("PF_TSR"), errors="coerce") if not active.empty else pd.Series(dtype=float)
-        structured["pledge_ratio"] = float(ratios.fillna(0).sum()) if not ratios.empty else 0.0
-    else:
-        structured["pledge_ratio"] = 0.0
+    if fetch_status["pledge"]["ok"]:
+        if pledge.empty:
+            structured["pledge_ratio"] = 0.0
+        else:
+            active = pledge[~pledge.get("UNFREEZE_STATE", pd.Series(index=pledge.index, dtype=str)).astype(str).str.contains("已解押", na=False)]
+            if active.empty:
+                structured["pledge_ratio"] = 0.0
+            elif "PF_TSR" in active.columns:
+                ratios = pd.to_numeric(active["PF_TSR"], errors="coerce")
+                if ratios.notna().any():
+                    structured["pledge_ratio"] = float(ratios.fillna(0).sum())
 
     concepts = frames["concepts"]
     if not concepts.empty:
@@ -241,9 +285,13 @@ def build_report(code: str, name: str, structured: dict, frames: dict[str, pd.Da
         "",
         "## 未来解禁",
         "",
+        f"- 接口状态：{'成功' if structured.get('unlock_fetch_ok') else '失败，需人工确认'}",
+        "",
         *_frame_table(frames["lockup"], ["FREE_DATE", "CURRENT_FREE_SHARES", "FREE_RATIO", "FREE_SHARES_TYPE"]),
         "",
         "## 股权质押",
+        "",
+        f"- 接口状态：{'成功' if structured.get('pledge_fetch_ok') else '失败，需人工确认'}",
         "",
         *_frame_table(frames["pledge"], ["NOTICE_DATE", "HOLDER_NAME", "PF_TSR", "UNFREEZE_STATE"]),
         "",

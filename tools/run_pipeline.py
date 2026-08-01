@@ -91,7 +91,7 @@ def run_collectors(collectors: list[tuple]) -> list[dict]:
         return list(executor.map(lambda module: run_module(*module), collectors))
 
 
-def current_context(code: str, directories: tuple[str, ...], since: float) -> tuple[str, str]:
+def current_context(code: str, directories: tuple[str, ...], since: float) -> tuple[str, str, str]:
     from tools.scoring.evidence import build_evidence, read_reports
 
     evidence = build_evidence(code, code, read_reports(code, directories, since))
@@ -102,7 +102,28 @@ def current_context(code: str, directories: tuple[str, ...], since: float) -> tu
         " ".join(str(item) for item in evidence.get("business_items", [])),
         " ".join(str(item) for item in evidence.get("concepts", [])),
     ]
-    return industry, " ".join(value for value in values if value).strip()
+    security_name = str(evidence.get("security_name") or "").strip()
+    return industry, " ".join(value for value in values if value).strip(), security_name
+
+
+def unresolved_targets(code: str, name: str, directories: tuple[str, ...], since: float) -> list[dict]:
+    from tools.scoring.evidence import build_evidence, read_reports
+    from tools.scoring.model import score_evidence
+
+    evidence = build_evidence(code, name, read_reports(code, directories, since))
+    card = score_evidence(evidence)
+    return [
+        {
+            "factor_key": factor.key,
+            "subfactor_key": item.key,
+            "label": item.label,
+            "maximum": item.maximum,
+            "original_status": item.status,
+            "original_reason": item.reason,
+        }
+        for factor in card.factors if factor.key != "F6"
+        for item in factor.subfactors if item.status in {"需人工确认", "部分覆盖"}
+    ]
 
 
 def main() -> None:
@@ -127,17 +148,19 @@ def main() -> None:
         ("announcements", "tools/akshare/announcements.py", [*common, "--days", "180"], 120),
         ("market_events", "tools/akshare/market_events.py", common, 90),
         ("popularity", "tools/akshare/popularity.py", common, 30),
-        ("social_sentiment", "tools/akshare/social_sentiment.py", common, 45),
-        ("congestion", "tools/akshare/congestion.py", [*common, *refresh_args], 90),
+        ("social_sentiment", "tools/akshare/social_sentiment.py", common, 90),
     ]
 
     results = run_collectors(first_wave)
     first_sources = tuple(result["label"] for result in results if result.get("ok"))
-    industry, context = current_context(code, first_sources, started_ts)
+    industry, context, discovered_name = current_context(code, first_sources, started_ts)
+    resolved_name = args.name.strip() or discovered_name or code
+    common = ["--stock", code, "--name", resolved_name]
+    congestion = ("congestion", "tools/akshare/congestion.py", [*common, "--industry", industry, *refresh_args], 90)
+    results.append(run_module(*congestion))
     second_wave = [
         ("supply_demand", "tools/scoring/supply_demand.py", [*common, "--context", context], 150),
         ("macro_policy", "tools/akshare/macro_policy.py", [*common, "--industry", industry], 150),
-        ("web_research", "tools/scoring/web_research.py", [*common, "--context", context], 180),
     ]
     results.extend(run_collectors(second_wave))
     prosperity = (
@@ -147,8 +170,13 @@ def main() -> None:
         180,
     )
     results.append(run_module(*prosperity))
+    structured_sources = tuple(result["label"] for result in results if result.get("ok"))
+    targets = unresolved_targets(code, resolved_name, structured_sources, started_ts)
+    web_args = [*common, "--context", context, "--targets-json", json.dumps(targets, ensure_ascii=False)]
+    results.append(run_module("web_research", "tools/scoring/web_research.py", web_args, 300))
     successful_sources = ",".join(result["label"] for result in results if result.get("ok"))
-    requested_sources = ",".join([module[0] for module in first_wave + second_wave + [prosperity]])
+    requested_labels = [module[0] for module in first_wave + [congestion] + second_wave + [prosperity]] + ["web_research"]
+    requested_sources = ",".join(requested_labels)
     scoring_args = [*common, "--sources", successful_sources, "--requested-sources", requested_sources, "--since", str(started_ts)]
     results.append(run_module("scoring", "tools/scoring/grader.py", scoring_args))
     output = ROOT / "knowledge/research/pipeline"

@@ -221,6 +221,16 @@ def _history_percentile(frame: pd.DataFrame) -> float | None:
     return float((values <= current).mean())
 
 
+def _history_median_ratio(frame: pd.DataFrame) -> float | None:
+    if frame is None or frame.empty or "value" not in frame.columns:
+        return None
+    values = pd.to_numeric(frame["value"], errors="coerce").dropna()
+    if len(values) < 60:
+        return None
+    median = float(values.median())
+    return float(values.iloc[-1]) / median if median > 0 else None
+
+
 # ══════════════════════════════════════════════════════
 #  Report Generator
 # ══════════════════════════════════════════════════════
@@ -237,37 +247,83 @@ def _safe_num(v, fmt=".2f"):
 def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame,
                     valuation: pd.DataFrame, financials: dict[str, pd.DataFrame],
                     valuation_history: dict[str, pd.DataFrame] | None = None) -> dict:
-    def latest(report_type: str, column: str):
+    def latest(report_type: str, *columns: str):
         frame = financials.get(report_type, pd.DataFrame())
-        if frame.empty or column not in frame.columns:
+        column = next((candidate for candidate in columns if candidate in frame.columns), None)
+        if frame.empty or column is None:
             return None
         value = pd.to_numeric(pd.Series([frame.iloc[0][column]]), errors="coerce").iloc[0]
         return None if pd.isna(value) else float(value)
+
+    def latest_sum(report_type: str, groups: tuple[tuple[str, ...], ...]) -> tuple[float | None, int]:
+        values = []
+        for aliases in groups:
+            value = latest(report_type, *aliases)
+            if value is not None:
+                values.append(value)
+        return (sum(values), len(values)) if values else (None, 0)
 
     metrics = {
         "industry": info.get("行业") if info else None,
         "latest_price": spot.get("最新价") if spot else None,
         "revenue_yoy": latest("lrb", "营业收入_同比"),
-        "profit_yoy": latest("lrb", "归属于母公司所有者的净利润_同比"),
+        "profit_yoy": latest("lrb", "归属于母公司的净利润_同比", "归属于母公司所有者的净利润_同比"),
         "operating_cashflow": latest("llb", "经营活动产生的现金流量净额"),
-        "net_profit": latest("lrb", "归属于母公司所有者的净利润"),
+        "net_profit": latest("lrb", "归属于母公司的净利润", "归属于母公司所有者的净利润"),
     }
     income = financials.get("lrb", pd.DataFrame())
     if len(income) >= 2:
-        for column, target in (
-            ("营业收入_同比", "revenue_yoy_delta"),
-            ("归属于母公司所有者的净利润_同比", "profit_yoy_delta"),
+        for columns, target in (
+            (("营业收入_同比",), "revenue_yoy_delta"),
+            (("归属于母公司的净利润_同比", "归属于母公司所有者的净利润_同比"), "profit_yoy_delta"),
         ):
-            if column in income.columns:
+            column = next((candidate for candidate in columns if candidate in income.columns), None)
+            if column is not None:
                 values = pd.to_numeric(income[column].head(2), errors="coerce")
                 if len(values) == 2 and values.notna().all():
                     metrics[target] = float(values.iloc[0] - values.iloc[1])
+    revenue = latest("lrb", "营业收入")
     assets, liabilities = latest("fzb", "资产总计"), latest("fzb", "负债合计")
+    cash = latest("fzb", "货币资金")
+    receivables = latest("fzb", "应收账款")
+    short_debt, short_debt_fields = latest_sum("fzb", (
+        ("短期借款",),
+        ("一年内到期的非流动负债", "一年内到期的长期负债"),
+    ))
+    interest_debt, interest_debt_fields = latest_sum("fzb", (
+        ("短期借款",),
+        ("一年内到期的非流动负债", "一年内到期的长期负债"),
+        ("长期借款",),
+        ("应付债券",),
+        ("租赁负债",),
+    ))
+    metrics.update({
+        key: value for key, value in (
+            ("total_revenue", revenue),
+            ("total_assets", assets),
+            ("total_liabilities", liabilities),
+            ("monetary_cash", cash),
+            ("accounts_receivable", receivables),
+            ("short_term_interest_debt", short_debt),
+            ("interest_bearing_debt", interest_debt),
+        ) if value is not None
+    })
+    metrics["short_debt_fields_found"] = short_debt_fields
+    metrics["interest_debt_fields_found"] = interest_debt_fields
     if assets and liabilities is not None:
         metrics["debt_ratio"] = liabilities / assets
-    cash = latest("fzb", "货币资金")
     if cash is not None and liabilities and liabilities > 0:
         metrics["cash_to_debt"] = cash / liabilities
+    if cash is not None and assets and assets > 0 and interest_debt is not None:
+        metrics["net_cash_ratio"] = (cash - interest_debt) / assets
+    if cash is not None and short_debt is not None:
+        metrics["cash_to_short_debt"] = cash / short_debt if short_debt > 0 else 999.0
+    operating_cashflow = metrics.get("operating_cashflow")
+    net_profit = metrics.get("net_profit")
+    if operating_cashflow is not None and net_profit is not None and net_profit > 0:
+        metrics["operating_cashflow_to_net_profit"] = operating_cashflow / net_profit
+    if receivables is not None and assets and assets > 0:
+        metrics["receivables_to_assets"] = receivables / assets
     goodwill = latest("fzb", "商誉")
     if goodwill is not None:
         metrics["goodwill"] = goodwill
@@ -290,13 +346,16 @@ def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame
     valuation_history = valuation_history or {}
     pe_percentile = _history_percentile(valuation_history.get("pe", pd.DataFrame()))
     pb_percentile = _history_percentile(valuation_history.get("pb", pd.DataFrame()))
+    pb_median_ratio = _history_median_ratio(valuation_history.get("pb", pd.DataFrame()))
     if pe_percentile is not None:
         metrics["pe_percentile_5y"] = pe_percentile
     if pb_percentile is not None:
         metrics["pb_percentile_5y"] = pb_percentile
+    if pb_median_ratio is not None:
+        metrics["pb_to_5y_median"] = pb_median_ratio
     if not kline_daily.empty and "close" in kline_daily.columns:
         close = pd.to_numeric(kline_daily["close"], errors="coerce").dropna().tail(800)
-        if len(close) >= 240:
+        if len(close) >= 720:
             latest_close, low, high = float(close.iloc[-1]), float(close.min()), float(close.max())
             if high > low:
                 metrics["price_percentile_3y"] = (latest_close - low) / (high - low)
@@ -369,8 +428,8 @@ def build_report(code: str, name: str,
     # ── 3. 财务摘要 ──
     L += ["## 3. 财务摘要", "", "*来源: easy_tdx/Sina*  ", ""]
     financial_columns = {
-        "利润表": ("lrb", ["报告期", "营业收入", "营业收入_同比", "归属于母公司所有者的净利润", "归属于母公司所有者的净利润_同比", "基本每股收益"]),
-        "资产负债表": ("fzb", ["报告期", "货币资金", "应收账款", "存货", "资产总计", "负债合计", "归属于母公司股东权益合计"]),
+        "利润表": ("lrb", ["报告期", "营业收入", "营业收入_同比", "归属于母公司的净利润", "归属于母公司的净利润_同比", "归属于母公司所有者的净利润", "归属于母公司所有者的净利润_同比", "基本每股收益"]),
+        "资产负债表": ("fzb", ["报告期", "货币资金", "应收账款", "存货", "短期借款", "一年内到期的非流动负债", "长期借款", "应付债券", "租赁负债", "资产总计", "负债合计", "归属于母公司股东权益合计"]),
         "现金流量表": ("llb", ["报告期", "经营活动产生的现金流量净额", "投资活动产生的现金流量净额", "筹资活动产生的现金流量净额"]),
     }
     for title, (report_type, wanted) in financial_columns.items():

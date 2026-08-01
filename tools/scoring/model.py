@@ -95,6 +95,13 @@ def _number(value: Any) -> float | None:
         return None
 
 
+def _fraction(value: Any) -> float | None:
+    number = _number(value)
+    if number is None:
+        return None
+    return number / 100 if abs(number) > 1 else number
+
+
 def _bounded(value: float, minimum: float, maximum: float) -> float:
     return round(min(maximum, max(minimum, value)), 2)
 
@@ -130,24 +137,68 @@ def _factor(key: str, label: str, maximum: float, items: list[SubfactorResult]) 
     return FactorResult(key, label, round(sum(item.score for item in items), 2), maximum, tuple(items))
 
 
+def _apply_web_fallback(factor: FactorResult, evidence: dict[str, Any]) -> FactorResult:
+    if factor.key == "F6":
+        return factor
+    web_results = evidence.get("web_subfactor_results")
+    if not isinstance(web_results, dict):
+        return factor
+    updated: list[SubfactorResult] = []
+    for item in factor.subfactors:
+        result = web_results.get(f"{factor.key}.{item.key}")
+        if item.status not in {"需人工确认", "部分覆盖"} or not isinstance(result, dict):
+            updated.append(item)
+            continue
+        web_status = str(result.get("status") or "搜索失败，需人工确认")
+        if web_status == "网络命中（未核验）":
+            web_score = _bounded(_number(result.get("score")) or 0, 0, item.maximum)
+            score = web_score if item.status == "需人工确认" else max(item.score, web_score)
+            provider = str(result.get("provider") or "web")
+            source = "SearXNG（未核验）" if provider == "searxng" else "DuckDuckGo MCP（未核验）" if provider == "duckduckgo" else "网络搜索（未核验）"
+            reason = f"{item.reason}；网络补缺：{result.get('reason', '命中搜索线索')}" if item.status == "部分覆盖" else str(result.get("reason") or item.reason)
+            sources = tuple(dict.fromkeys((*item.sources, source)))
+            updated.append(SubfactorResult(item.key, item.label, score, item.maximum, web_status, reason, sources))
+        else:
+            reason = f"{item.reason}；{result.get('reason', web_status)}"
+            updated.append(SubfactorResult(item.key, item.label, item.score, item.maximum, web_status, reason, item.sources))
+    return _factor(factor.key, factor.label, factor.maximum, updated)
+
+
 def _score_f1(evidence: dict[str, Any]) -> FactorResult:
     items: list[SubfactorResult] = []
 
+    cagr = _fraction(evidence.get("industry_cagr_3y"))
+    penetration = _fraction(evidence.get("penetration_rate"))
     track = _number(evidence.get("track_strength"))
-    if track is None:
-        items.append(_missing("era_track", "大时代赛道", 10, "缺少可核验的行业、主营或产业标签"))
+    if cagr is not None or penetration is not None:
+        score, details, keys = 0.0, [], []
+        if cagr is not None:
+            keys.append("industry_cagr_3y")
+            score += 5 if cagr > 0.30 else 4 if cagr >= 0.20 else 2.5 if cagr >= 0.10 else 0
+            details.append(f"行业未来三年 CAGR {cagr:.1%}")
+        if penetration is not None:
+            keys.append("penetration_rate")
+            score += 5 if 0.05 <= penetration <= 0.20 else 3 if penetration <= 0.50 else 1
+            details.append(f"产业渗透率 {penetration:.1%}")
+        items.append(_subfactor(evidence, "era_track", "大时代赛道", score, 10, "；".join(details), keys, partial=len(keys) < 2))
+    elif track is None:
+        items.append(_missing("era_track", "大时代赛道", 10, "缺少未来三年 CAGR、产业渗透率或可核验产业趋势"))
     else:
         track_reason = evidence.get("track_reason", "按行业、主营和产业标签匹配")
         if evidence.get("industry_prosperity_reason"):
             track_reason = f"{track_reason}；{evidence['industry_prosperity_reason']}"
         items.append(_subfactor(
             evidence, "era_track", "大时代赛道", track * 10, 10,
-            track_reason,
-            ("track_strength",), partial=evidence.get("track_partial", False),
+            f"关键词兜底：{track_reason}",
+            ("track_strength",), partial=True,
         ))
 
-    stage = evidence.get("chain_stage")
-    stage_scores = {"upstream": 7, "midstream": 4, "downstream": 1}
+    stage = evidence.get("chain_position") or evidence.get("chain_stage")
+    stage_scores = {
+        "resource": 7, "material": 7, "core_equipment": 7, "key_component": 6,
+        "module": 4, "whole_machine": 2, "application": 1,
+        "upstream": 7, "midstream": 4, "downstream": 1,
+    }
     if stage not in stage_scores:
         items.append(_missing("upstream", "上游/卖铲子", 7, "未识别出可靠的产业链位置"))
     else:
@@ -155,25 +206,32 @@ def _score_f1(evidence: dict[str, Any]) -> FactorResult:
         items.append(_subfactor(
             evidence, "upstream", "上游/卖铲子", stage_score, 7,
             f"产业链位置：{evidence.get('chain_name', '未命名产业链')} / {stage}",
-            ("chain_stage",), partial=evidence.get("chain_partial", False),
+            ("chain_stage", "business_chain_revenue_ratio"), partial=evidence.get("chain_partial", False),
         ))
 
     supply_count = _number(evidence.get("supply_evidence_count"))
     supply_tightening = evidence.get("supply_tightening")
-    if supply_count is None:
-        items.append(_missing("supply_gap", "供需失衡", 5, "缺少价格、基差、库存或仓单证据"))
+    cr3 = _number(evidence.get("supply_cr3"))
+    expansion_years = _number(evidence.get("capacity_expansion_cycle_years"))
+    if supply_count is None and cr3 is None and expansion_years is None:
+        items.append(_missing("supply_gap", "供需失衡", 5, "缺少价格、库存、订单、CR3 或扩产周期证据"))
     else:
-        if supply_count >= 2 and supply_tightening is True:
-            score, reason, partial = 5, "至少两类证据共同指向供给趋紧", False
-        elif supply_count >= 2 and supply_tightening is False:
-            score, reason, partial = 0, "至少两类证据未显示供给趋紧", False
-        elif supply_count >= 2:
-            score, reason, partial = 2, "证据覆盖充分，但方向尚不一致", False
-        else:
-            score, reason, partial = 1, "只有一类供需证据，不能确认供需缺口", True
+        score, details, keys = 0.0, [], []
+        if supply_count is not None:
+            keys.extend(("supply_evidence_count", "supply_tightening"))
+            score += 2 if supply_count >= 2 and supply_tightening is True else 0.75 if supply_count >= 1 and supply_tightening is not False else 0
+            details.append(f"价格/库存/订单证据 {supply_count:g} 类，趋紧={supply_tightening}")
+        if cr3 is not None:
+            keys.append("supply_cr3")
+            score += 1.5 if cr3 > 70 else 1 if cr3 >= 50 else 0.5 if cr3 >= 30 else 0
+            details.append(f"供给集中度 CR3 {cr3:g}%")
+        if expansion_years is not None:
+            keys.append("capacity_expansion_cycle_years")
+            score += 1.5 if expansion_years > 3 else 1 if expansion_years >= 1 else 0.5
+            details.append(f"扩产周期 {expansion_years:g} 年")
         items.append(_subfactor(
-            evidence, "supply_gap", "供需失衡", score, 5, reason,
-            ("supply_evidence_count", "supply_tightening"), partial=partial,
+            evidence, "supply_gap", "供需失衡", score, 5, "；".join(details), keys,
+            partial=not all(value is not None for value in (supply_count, cr3, expansion_years)),
         ))
 
     choke = _number(evidence.get("chokepoint_score"))
@@ -187,9 +245,13 @@ def _score_f1(evidence: dict[str, Any]) -> FactorResult:
             partial=evidence.get("chokepoint_partial", False),
         ))
 
+    capex_yoy = _fraction(evidence.get("capex_yoy"))
     capex = _number(evidence.get("capex_strength"))
-    if capex is None:
-        items.append(_missing("capex_wave", "资本开支浪潮", 4, "缺少资本开支、订单或扩产证据"))
+    if capex_yoy is None and capex is None:
+        items.append(_missing("capex_wave", "资本开支浪潮", 4, "缺少资本开支同比、订单或扩产证据"))
+    elif capex_yoy is not None:
+        score = 4 if capex_yoy > 0.30 else 3 if capex_yoy >= 0.10 else 2 if capex_yoy > 0 else 0
+        items.append(_subfactor(evidence, "capex_wave", "资本开支浪潮", score, 4, f"资本开支同比 {capex_yoy:.1%}", ("capex_yoy",)))
     else:
         items.append(_subfactor(
             evidence, "capex_wave", "资本开支浪潮", capex * 4, 4,
@@ -220,14 +282,23 @@ def _score_f2(evidence: dict[str, Any]) -> FactorResult:
     if holder_trend is None:
         items.append(_missing("holder_trend", "股东户数趋势", 3, "缺少可比期间股东户数变化"))
     else:
-        score = 3 if holder_trend <= -5 else 2 if holder_trend < 0 else 1 if holder_trend == 0 else 0
+        score = 3 if holder_trend <= -20 else 2 if holder_trend <= -5 else 1 if holder_trend < 0 else 0
         items.append(_subfactor(evidence, "holder_trend", "股东户数趋势", score, 3, f"股东户数变化 {holder_trend:.2f}%", ("holder_count_change_pct",)))
 
     quality = _number(evidence.get("top10_quality"))
-    if quality is None:
-        items.append(_missing("top10_quality", "前十大股东质量", 2, "缺少前十大股东名单或性质判断"))
+    fund_change = _number(evidence.get("fund_holding_change_pct"))
+    if quality is None and fund_change is None:
+        items.append(_missing("top10_quality", "前十大股东质量", 2, "缺少前十大股东名单、性质或基金季度变化"))
     else:
-        items.append(_subfactor(evidence, "top10_quality", "前十大股东质量", quality * 2, 2, evidence.get("top10_quality_reason", "按国资、产业资本和长期机构占比判断"), ("top10_quality",), partial=evidence.get("top10_partial", False)))
+        score = (quality or 0) * 1.5
+        if fund_change is not None:
+            score += 0.5 if fund_change > 0 else 0.25 if fund_change == 0 else 0
+        items.append(_subfactor(
+            evidence, "top10_quality", "前十大股东质量", score, 2,
+            evidence.get("top10_quality_reason", "按国资、产业资本、长期机构和基金季度变化判断"),
+            ("top10_quality", "fund_holding_change_pct"),
+            partial=evidence.get("top10_partial", False) or quality is None or fund_change is None,
+        ))
 
     pledge = _number(evidence.get("pledge_ratio"))
     unlock = _number(evidence.get("unlock_ratio"))
@@ -257,26 +328,46 @@ def _score_f3(evidence: dict[str, Any]) -> FactorResult:
     else:
         items.append(_subfactor(evidence, "leadership", "龙头/核心供应商", leadership * 5, 5, evidence.get("leadership_reason", "按行业地位证据判断"), ("leadership_strength",), partial=evidence.get("leadership_partial", False)))
 
-    checks = (
-        ("net_profit", lambda value: value > 0, "归母净利润为正"),
-        ("operating_cashflow", lambda value: value > 0, "经营现金流为正"),
-        ("debt_ratio", lambda value: value <= 0.70, "资产负债率不高于70%"),
-        ("cash_to_debt", lambda value: value >= 0.10, "货币资金覆盖负债不低于10%"),
-    )
-    known_checks, passed, details, used_keys = 0, 0, [], []
-    for key, predicate, description in checks:
-        value = _number(evidence.get(key))
-        if value is None:
-            continue
-        known_checks += 1
-        used_keys.append(key)
-        ok = predicate(value)
-        passed += int(ok)
-        details.append(f"{description}{'通过' if ok else '不通过'}")
-    if not known_checks:
-        items.append(_missing("financial_safety", "财务安全", 5, "缺少利润、现金流、负债和现金覆盖数据"))
+    net_cash_ratio = _fraction(evidence.get("net_cash_ratio"))
+    short_cover = _number(evidence.get("cash_to_short_debt"))
+    cash_quality = _number(evidence.get("operating_cashflow_to_net_profit"))
+    operating_cashflow = _number(evidence.get("operating_cashflow"))
+    net_profit = _number(evidence.get("net_profit"))
+    debt_ratio = _fraction(evidence.get("debt_ratio"))
+    receivables_ratio = _fraction(evidence.get("receivables_to_assets"))
+    details, used_keys, financial_score = [], [], 0.0
+    if net_cash_ratio is not None:
+        used_keys.append("net_cash_ratio")
+        financial_score += 2 if net_cash_ratio > 0.20 else 1.5 if net_cash_ratio >= 0.10 else 0.75 if net_cash_ratio >= 0 else 0
+        details.append(f"净现金率 {net_cash_ratio:.1%}")
+    if short_cover is not None:
+        used_keys.append("cash_to_short_debt")
+        financial_score += 1.25 if short_cover > 3 else 0.75 if short_cover >= 1 else 0
+        details.append(f"现金覆盖短债 {short_cover:.2f} 倍")
+    if cash_quality is not None:
+        used_keys.append("operating_cashflow_to_net_profit")
+        financial_score += 1 if cash_quality > 1 else 0.6 if cash_quality >= 0.5 else 0
+        details.append(f"经营现金流/净利润 {cash_quality:.2f}")
+    elif operating_cashflow is not None and net_profit is not None:
+        used_keys.extend(("operating_cashflow", "net_profit"))
+        financial_score += 0.5 if net_profit <= 0 < operating_cashflow else 0
+        details.append("亏损期经营现金流为正" if net_profit <= 0 < operating_cashflow else "经营造血未通过")
+    balance_checks = []
+    if debt_ratio is not None:
+        used_keys.append("debt_ratio")
+        balance_checks.append(debt_ratio <= 0.70)
+        details.append(f"资产负债率 {debt_ratio:.1%}")
+    if receivables_ratio is not None:
+        used_keys.append("receivables_to_assets")
+        balance_checks.append(receivables_ratio <= 0.30)
+        details.append(f"应收账款/总资产 {receivables_ratio:.1%}")
+    if balance_checks:
+        financial_score += 0.75 * sum(balance_checks) / len(balance_checks)
+    if not used_keys:
+        items.append(_missing("financial_safety", "财务安全", 5, "缺少净现金、短债覆盖、经营造血和资产质量数据"))
     else:
-        items.append(_subfactor(evidence, "financial_safety", "财务安全", passed * 1.25, 5, "；".join(details), used_keys, partial=known_checks < len(checks)))
+        coverage_groups = sum((net_cash_ratio is not None, short_cover is not None, cash_quality is not None or (operating_cashflow is not None and net_profit is not None), bool(balance_checks)))
+        items.append(_subfactor(evidence, "financial_safety", "财务安全", financial_score, 5, "；".join(details), used_keys, partial=coverage_groups < 4))
 
     risk_checks = (
         ("st_risk", "ST/退市风险"),
@@ -296,12 +387,6 @@ def _score_f3(evidence: dict[str, Any]) -> FactorResult:
                 details.append(f"商誉占总资产 {ratio:.2%}，{'风险偏高' if value is True else '未触发10%观察线'}")
             else:
                 details.append(f"{label}：{'有' if value is True else '未见'}")
-        extra_supply = []
-        for key, label in (("supply_cr3", "CR3"), ("capacity_expansion_cycle_years", "扩产周期"), ("capacity_utilization_trend", "产能利用率")):
-            if _known(evidence.get(key)):
-                extra_supply.append(f"{label}={evidence[key]}")
-        if extra_supply:
-            reason += "；" + "；".join(extra_supply)
         items.append(_subfactor(
             evidence, "survival_risk", "退市/审计/商誉风险", score, 3, "；".join(details),
             tuple(key for key, _, _ in known_risks), partial=len(known_risks) < len(risk_checks),
@@ -326,7 +411,7 @@ def _score_f4(evidence: dict[str, Any]) -> FactorResult:
         items.append(_subfactor(
             evidence, "business_match", "主营匹配产业链", score, 4,
             evidence.get("business_match_reason", "按主营构成和产业链匹配判断"),
-            ("business_chain_match",), partial=partial,
+            ("business_chain_match", "business_chain_revenue_ratio"), partial=partial,
         ))
 
     stage = evidence.get("chain_stage")
@@ -335,7 +420,7 @@ def _score_f4(evidence: dict[str, Any]) -> FactorResult:
         items.append(_missing("profit_position", "利润分配位置", 4, "未识别产业链利润位置"))
     else:
         stage_score = stage_scores[stage] * (0.5 if evidence.get("chain_partial", False) else 1.0)
-        items.append(_subfactor(evidence, "profit_position", "利润分配位置", stage_score, 4, f"产业链位置为 {stage}", ("chain_stage",), partial=evidence.get("chain_partial", False)))
+        items.append(_subfactor(evidence, "profit_position", "利润分配位置", stage_score, 4, f"产业链位置为 {stage}", ("chain_stage", "business_chain_revenue_ratio"), partial=evidence.get("chain_partial", False)))
 
     overseas = _number(evidence.get("overseas_revenue_ratio"))
     if overseas is None:
@@ -375,18 +460,28 @@ def _score_f4(evidence: dict[str, Any]) -> FactorResult:
 def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
     items: list[SubfactorResult] = []
     price = _number(evidence.get("price_percentile_3y"))
-    if price is None:
-        items.append(_missing("price_position", "价格分位", 2.5, "缺少至少三年的可比价格序列"))
+    product_cycle = _fraction(evidence.get("product_price_to_history_high"))
+    if price is None and product_cycle is None:
+        items.append(_missing("price_position", "价格分位", 2.5, "缺少三年股价分位和产品价格周期"))
     else:
-        score = 2.5 if price <= 0.20 else 2 if price <= 0.35 else 1.25 if price <= 0.50 else 0.5 if price <= 0.70 else 0
-        items.append(_subfactor(evidence, "price_position", "价格分位", score, 2.5, f"三年价格分位 {price:.1%}", ("price_percentile_3y",)))
+        score, details, keys = 0.0, [], []
+        if price is not None:
+            keys.append("price_percentile_3y")
+            score += 1.25 if price <= 0.20 else 1 if price <= 0.35 else 0.625 if price <= 0.50 else 0.25 if price <= 0.70 else 0
+            details.append(f"三年股价分位 {price:.1%}")
+        if product_cycle is not None:
+            keys.append("product_price_to_history_high")
+            score += 1.25 if product_cycle < 0.30 else 0.875 if product_cycle <= 0.50 else 0.375 if product_cycle <= 0.70 else 0
+            details.append(f"产品价格/历史高点 {product_cycle:.1%}")
+        items.append(_subfactor(evidence, "price_position", "价格分位", score, 2.5, "；".join(details), keys, partial=len(keys) < 2))
 
     pe = _number(evidence.get("pe_ttm"))
     peer = _number(evidence.get("peer_pe_ttm_median"))
     pb = _number(evidence.get("pb"))
     pe_percentile = _number(evidence.get("pe_percentile_5y"))
     pb_percentile = _number(evidence.get("pb_percentile_5y"))
-    if pe is None and pb is None and pe_percentile is None and pb_percentile is None:
+    pb_median_ratio = _number(evidence.get("pb_to_5y_median"))
+    if pe is None and pb is None and pe_percentile is None and pb_percentile is None and pb_median_ratio is None:
         items.append(_missing("valuation", "PE/PB 相对位置", 2, "PE、PB 和同行估值均缺失"))
     else:
         comparison_scores: list[float] = []
@@ -407,11 +502,19 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
             keys.append("pe_percentile_5y")
             comparison_scores.append(2 if pe_percentile <= 0.20 else 1.5 if pe_percentile <= 0.35 else 1 if pe_percentile <= 0.50 else 0)
             details.append(f"五年 PE 分位 {pe_percentile:.1%}")
-        if pb_percentile is not None:
+        if pb_median_ratio is not None:
+            keys.append("pb_to_5y_median")
+            comparison_scores.append(2 if pb_median_ratio < 0.50 else 1 if pb_median_ratio <= 1 else 0)
+            details.append(f"PB/五年中位数 {pb_median_ratio:.2f}")
+        elif pb_percentile is not None:
             keys.append("pb_percentile_5y")
             comparison_scores.append(2 if pb_percentile <= 0.20 else 1.5 if pb_percentile <= 0.35 else 1 if pb_percentile <= 0.50 else 0)
             details.append(f"五年 PB 分位 {pb_percentile:.1%}")
         score = sum(comparison_scores) / len(comparison_scores) if comparison_scores else 0
+        has_pe_component = pe is not None or pe_percentile is not None
+        has_pb_component = pb is not None or pb_percentile is not None or pb_median_ratio is not None
+        if has_pe_component != has_pb_component:
+            score = min(score, 1.0)
         items.append(_subfactor(
             evidence, "valuation", "PE/PB 相对位置", score, 2, "；".join(details), keys,
             partial=len(comparison_scores) < 2 or (pe_percentile is None and pb_percentile is None),
@@ -421,29 +524,52 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
     social_heat = _number(evidence.get("social_heat"))
     heat_values = [value for value in (attention_heat, social_heat) if value is not None]
     heat = max(heat_values) if heat_values else None
-    if heat is None:
+    prosperity = evidence.get("industry_prosperity_status")
+    industry_cold_value = evidence.get("industry_cycle_cold")
+    industry_cold = industry_cold_value is True
+    if heat is None and industry_cold_value is None:
         items.append(_missing("coldness", "行业冰点/市场冷落", 2, "缺少个股关注度、人气排名或行业冷落证据"))
     else:
         survival_ok = f3_score >= 8 and evidence.get("st_risk") is not True
-        score = (2 if heat <= 0.20 else 1.5 if heat <= 0.40 else 0.5 if heat <= 0.60 else 0) if survival_ok else 0
-        reason = f"关注热度归一值 {heat:.2f}，越低越冷"
+        attention_score = 1 if heat is not None and heat <= 0.20 else 0.75 if heat is not None and heat <= 0.40 else 0.25 if heat is not None and heat <= 0.60 else 0
+        score = (attention_score + (1 if industry_cold else 0)) if survival_ok else 0
+        reason = f"关注热度 {heat:.2f}" if heat is not None else "个股热度缺失"
+        reason += f"；行业周期 {'处于冰点' if industry_cold else prosperity or '未确认冰点'}"
         if not survival_ok:
             reason += "；F3 生存门槛未通过，冷门不加分"
         items.append(_subfactor(
             evidence, "coldness", "行业冰点/市场冷落", score, 2, reason,
-            ("attention_heat",), partial=evidence.get("attention_partial", False) or not survival_ok,
+            ("attention_heat", "social_heat", "industry_cycle_cold"),
+            partial=heat is None or industry_cold_value is None or evidence.get("attention_partial", False) or evidence.get("social_partial", False) or not survival_ok,
         ))
 
-    inflection_score, details, keys = 0.0, [], []
+    details, keys = [], []
+    values: dict[str, float] = {}
     for key, label in (("revenue_yoy", "营收同比"), ("profit_yoy", "利润同比"), ("revenue_yoy_delta", "营收同比改善"), ("profit_yoy_delta", "利润同比改善")):
         value = _number(evidence.get(key))
         if value is not None:
             keys.append(key)
+            values[key] = value
             details.append(f"{label} {value * 100:.2f}%")
-            inflection_score += 1 if value > 0 else 0
     if not keys:
         items.append(_missing("inflection", "业绩拐点", 2, "缺少营收、利润及其趋势数据"))
     else:
+        revenue = values.get("revenue_yoy")
+        profit = values.get("profit_yoy")
+        revenue_delta = values.get("revenue_yoy_delta")
+        profit_delta = values.get("profit_yoy_delta")
+        cashflow = _number(evidence.get("operating_cashflow"))
+        if cashflow is not None:
+            keys.append("operating_cashflow")
+            details.append(f"经营现金流 {'为正' if cashflow > 0 else '为负'}")
+        early_reversal = revenue is not None and revenue > 0 and profit is not None and profit < 0 and ((profit_delta or 0) > 0 or (cashflow or 0) > 0)
+        confirmed_reversal = revenue is not None and revenue > 0 and profit is not None and profit > 0 and ((revenue_delta or 0) > 0 or (profit_delta or 0) > 0)
+        improving_count = sum(value > 0 for value in values.values())
+        inflection_score = 2 if early_reversal or confirmed_reversal else 1 if improving_count >= 2 or evidence.get("supply_tightening") is True else 0
+        if early_reversal:
+            details.append("营收转正、利润仍弱但造血或利润趋势改善，符合周期底部前兆")
+        elif confirmed_reversal:
+            details.append("营收利润转正且同比趋势改善")
         industry_financial = evidence.get("industry_financial_signal") if isinstance(evidence.get("industry_financial_signal"), dict) else {}
         industry_status = industry_financial.get("status")
         supply_status = (evidence.get("industry_supply_signal") or {}).get("status") if isinstance(evidence.get("industry_supply_signal"), dict) else None
@@ -453,7 +579,7 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
             details.append(f"行业价格/库存供需 {supply_status}（交叉验证）")
         conflict = bool(evidence.get("industry_prosperity_conflicts")) or industry_status == "走弱"
         items.append(_subfactor(
-            evidence, "inflection", "业绩拐点", inflection_score * 0.5, 2,
+            evidence, "inflection", "业绩拐点", inflection_score, 2,
             "；".join(details), keys,
             partial=len(keys) < 4 or conflict or evidence.get("industry_prosperity_coverage") not in (None, "完整"),
         ))
@@ -582,11 +708,7 @@ def _adjustments(evidence: dict[str, Any], f1_score: float) -> tuple[AdjustmentR
     else:
         score = min(2, max(0, int(catalysts)))
         status = "已验证" if score > 0 else "部分覆盖"
-        web_done = evidence.get("web_research_status") == "completed"
-        reason = f"发现 {int(catalysts)} 项可验证催化" if score > 0 else (
-            "公告标题未发现可验证催化；网页搜索已执行但未通过证据门槛" if web_done
-            else "公告标题未发现可验证催化；网页搜索后端未完成"
-        )
+        reason = f"发现 {int(catalysts)} 项可验证催化" if score > 0 else "公告标题未发现可验证催化"
         catalyst_result = AdjustmentResult("catalyst", "风口催化", score, 0, 2, status, reason, _sources(evidence, ("verified_catalyst_count",)))
     return institutional_result, technical_result, sentiment_result, catalyst_result
 
@@ -606,14 +728,11 @@ def _cap_rating(rating: str, cap: str) -> str:
 
 
 def score_evidence(evidence: dict[str, Any]) -> Scorecard:
-    core_factors = (
-        _score_f1(evidence),
-        _score_f2(evidence),
-        _score_f3(evidence),
-        _score_f4(evidence),
-    )
+    core_factors = tuple(_apply_web_fallback(factor, evidence) for factor in (
+        _score_f1(evidence), _score_f2(evidence), _score_f3(evidence), _score_f4(evidence),
+    ))
     adjustments = _adjustments(evidence, core_factors[0].score)
-    f5 = _score_f5(evidence, core_factors[2].score)
+    f5 = _apply_web_fallback(_score_f5(evidence, core_factors[2].score), evidence)
     f6 = _score_f6(adjustments)
     factors = (*core_factors, f5, f6)
     base_score = round(sum(factor.score for factor in (*core_factors, f5)), 2)
@@ -623,13 +742,21 @@ def score_evidence(evidence: dict[str, Any]) -> Scorecard:
     factor_map = {factor.key: factor.score for factor in factors}
     caps: list[dict[str, str]] = []
 
-    if evidence.get("st_risk") is True:
+    web_results = evidence.get("web_subfactor_results") if isinstance(evidence.get("web_subfactor_results"), dict) else {}
+    web_hard_caps = {
+        key for result in web_results.values() if isinstance(result, dict)
+        for key, value in (result.get("hard_cap_signals") or {}).items() if value is True
+    }
+    st_risk = evidence.get("st_risk") is True or (evidence.get("st_risk") is None and "st_risk" in web_hard_caps)
+    if st_risk:
         caps.append({"condition": "ST 或退市风险", "result": "已触发", "cap": "不碰"})
         rating = "不碰"
     else:
         caps.append({"condition": "ST 或退市风险", "result": "未触发" if evidence.get("st_risk") is False else "需人工确认", "cap": "无" if evidence.get("st_risk") is False else "需人工确认"})
 
     controller_action = evidence.get("controller_action")
+    if controller_action is None and "controller_reduction" in web_hard_caps:
+        controller_action = "reduction"
     if controller_action == "reduction":
         caps.append({"condition": "控股股东或实控人减持", "result": "已触发", "cap": "学习仓"})
         rating = _cap_rating(rating, "学习仓")

@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -35,6 +37,12 @@ def _factor_status(factor: FactorResult) -> str:
     statuses = {item.status for item in factor.subfactors}
     if statuses == {"已验证"}:
         return "已验证"
+    if statuses == {"网络命中（未核验）"}:
+        return "网络命中（未核验）"
+    if statuses == {"已搜索未命中"}:
+        return "已搜索未命中"
+    if statuses == {"搜索失败，需人工确认"}:
+        return "搜索失败，需人工确认"
     if all(item.status == "需人工确认" for item in factor.subfactors):
         return "需人工确认"
     return "部分覆盖"
@@ -43,7 +51,7 @@ def _factor_status(factor: FactorResult) -> str:
 def _factor_summary(factor: FactorResult) -> str:
     ranked = sorted(factor.subfactors, key=lambda item: (item.score / item.maximum, item.score), reverse=True)
     positives = [item for item in ranked if item.score > 0]
-    missing = [item.label for item in factor.subfactors if item.status == "需人工确认"]
+    missing = [item.label for item in factor.subfactors if item.status in {"需人工确认", "已搜索未命中", "搜索失败，需人工确认"}]
     if positives:
         summary = f"{positives[0].label}是当前主要得分项"
     else:
@@ -57,16 +65,97 @@ def _source_text(item: SubfactorResult) -> str:
     return "、".join(f"[{source}]" for source in item.sources) if item.sources else "需人工确认"
 
 
+def _table_text(value: Any, limit: int = 110) -> str:
+    text = " ".join(str(value or "需人工确认").replace("|", "/").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _chain_stage_label(stage: str) -> str:
+    return {"upstream": "上游", "midstream": "中游", "downstream": "下游"}.get(stage, "位置待确认")
+
+
+def _chain_rows(evidence: dict[str, Any]) -> list[tuple[str, str, str, str]]:
+    chain_name = str(evidence.get("chain_name") or "未识别产业链")
+    current_stage = str(evidence.get("chain_stage") or evidence.get("chain_position") or "")
+    path = ROOT / "tools" / "scoring" / "chains.yaml"
+    chain: dict[str, Any] = {}
+    if path.exists() and chain_name != "未识别产业链":
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        chain = next((item for item in raw.get("chains", []) if str(item.get("name")) == chain_name), {})
+
+    business = str(evidence.get("main_business") or "").strip()
+    if not business:
+        business_items = evidence.get("business_items") if isinstance(evidence.get("business_items"), list) else []
+        business = "、".join(str(item) for item in business_items[:4]) or "主营产品待确认"
+    ratio = evidence.get("business_chain_revenue_ratio")
+    ratio_text = f"；相关收入占比 {float(ratio):.1%}" if isinstance(ratio, (int, float)) else "；收入占比待确认"
+    order = {"upstream": 0, "midstream": 1, "downstream": 2}
+    current_order = order.get(current_stage)
+    rows: list[tuple[str, str, str, str]] = []
+    for stage in ("upstream", "midstream", "downstream"):
+        node = chain.get(stage, {}) if isinstance(chain, dict) else {}
+        industries = node.get("industries", []) if isinstance(node, dict) else []
+        keywords = node.get("keywords", []) if isinstance(node, dict) else []
+        core = list(dict.fromkeys([*(str(item) for item in industries[:3]), *(str(item) for item in keywords[:7])]))
+        core_text = "、".join(core) or "资料库暂无明确节点"
+        if stage == current_stage:
+            relation = f"公司主营映射到本环节：{business}{ratio_text}"
+            status = "公司所在位置（部分映射）" if evidence.get("chain_partial") else "公司所在位置"
+        elif current_order is None:
+            relation = "公司与该环节的直接关系待确认"
+            status = "产业链资料库"
+        elif order[stage] < current_order:
+            relation = "公司所在环节的上游供给，具体供应商需核对"
+            status = "核心上游"
+        else:
+            relation = "公司产品的下游承接与终端需求，具体客户需核对"
+            status = "核心下游"
+        rows.append((_chain_stage_label(stage), core_text, relation, status))
+    return rows
+
+
+def _moda_overview(card: Scorecard, evidence: dict[str, Any]) -> list[tuple[str, str, str, str]]:
+    factors = {factor.key: factor for factor in card.factors}
+    subfactors = {item.key: item for factor in card.factors for item in factor.subfactors}
+    chain_name = str(evidence.get("chain_name") or "产业链待确认")
+    stage = _chain_stage_label(str(evidence.get("chain_stage") or ""))
+
+    def level(score: float, maximum: float, strong: float, medium: float, strong_text: str, medium_text: str, weak_text: str) -> str:
+        ratio = score / maximum if maximum else 0
+        return strong_text if ratio >= strong else medium_text if ratio >= medium else weak_text
+
+    return [
+        ("产业是不是大方向", f"{_progress_bar(factors['F1'].score, 30, 10)} {_fmt(factors['F1'].score)}/30",
+         level(factors["F1"].score, 30, 0.67, 0.5, "产业趋势较强", "方向有线索，证据还不够硬", "产业逻辑偏弱"),
+         f"行业景气 {evidence.get('industry_prosperity_status', '待确认')}；{subfactors['era_track'].reason}"),
+        ("公司卡位好不好", f"{_progress_bar(subfactors['upstream'].score, 7, 10)} {_fmt(subfactors['upstream'].score)}/7",
+         f"位于{chain_name}{stage}", f"{subfactors['upstream'].reason}；{subfactors['chokepoint'].reason}"),
+        ("增长有没有变成利润", f"{_progress_bar(factors['F4'].score, 15, 10)} {_fmt(factors['F4'].score)}/15",
+         level(factors["F4"].score, 15, 0.67, 0.4, "收入、订单与利润兑现较好", "已有增长，兑现还不完整", "题材尚未落到报表"),
+         subfactors["realization"].reason),
+        ("能不能熬过行业低谷", f"{_progress_bar(factors['F3'].score, 20, 10)} {_fmt(factors['F3'].score)}/20",
+         level(factors["F3"].score, 20, 0.6, 0.4, "生存底盘较稳", "能活，但安全垫一般", "生存与财务安全偏弱"),
+         subfactors["financial_safety"].reason),
+        ("现在是不是低位", f"{_progress_bar(factors['F5'].score, 10, 10)} {_fmt(factors['F5'].score)}/10",
+         level(factors["F5"].score, 10, 0.6, 0.35, "低位反转条件较多", "有部分低位特征", "低位与估值优势不足"),
+         f"{subfactors['price_position'].reason}；{subfactors['valuation'].reason}"),
+        ("交易层是否配合", f"{_progress_bar(factors['F6'].score, 10, 10)} {_fmt(factors['F6'].score)}/10",
+         level(factors["F6"].score, 10, 0.6, 0.35, "技术与资金面配合", "交易面中性", "交易面偏弱"),
+         "F6 只作技术、机构、情绪和公告催化修正，不改变基本面事实"),
+    ]
+
+
 def _sleep_checks(card: Scorecard) -> list[tuple[str, str, str]]:
     factors = {factor.key: factor for factor in card.factors}
     subfactors = {item.key: item for factor in card.factors for item in factor.subfactors}
 
     financial = subfactors["financial_safety"]
-    financing_status = "通过" if financial.score >= 3.75 else "不通过" if financial.status != "需人工确认" else "需人工确认"
+    uncertain = {"需人工确认", "已搜索未命中", "搜索失败，需人工确认"}
+    financing_status = "通过" if financial.score >= 3.75 else "不通过" if financial.status not in uncertain else "需人工确认"
     announcement_status = "通过" if subfactors["business_match"].score >= 3 and subfactors["realization"].score >= 2 else "需人工确认"
-    finance_status = "通过" if financial.score >= 3.75 else "不通过" if financial.status != "需人工确认" else "需人工确认"
+    finance_status = "通过" if financial.score >= 3.75 else "不通过" if financial.status not in uncertain else "需人工确认"
     shareholder = subfactors["controller_action"]
-    shareholder_status = "通过" if shareholder.score >= 4 else "不通过" if shareholder.status != "需人工确认" else "需人工确认"
+    shareholder_status = "通过" if shareholder.score >= 4 else "不通过" if shareholder.status not in uncertain else "需人工确认"
     industry_status = "通过" if factors["F1"].score >= 20 else "不通过" if factors["F1"].score < 15 else "需人工确认"
     return [
         ("不融资也能拿", financing_status, financial.reason),
@@ -95,16 +184,20 @@ def _framework_conclusion(card: Scorecard, evidence: dict[str, Any]) -> list[tup
     institutional = adjustments["institutional_direction"]
     technical = adjustments["technical_structure"]
     sentiment = adjustments["sentiment"]
-    weakest = min(card.factors, key=lambda factor: factor.score / factor.maximum)
-    logic_status = "基本成立" if factors["F1"].score >= 20 and factors["F3"].score >= 12 else "尚未完全成立"
+    weakest = min((factor for factor in card.factors if factor.key != "F6"), key=lambda factor: factor.score / factor.maximum)
+    chain_name = str(evidence.get("chain_name") or "产业链待确认")
+    stage = _chain_stage_label(str(evidence.get("chain_stage") or evidence.get("chain_position") or ""))
+    logic_status = "四项形成共振" if factors["F1"].score >= 20 and factors["F3"].score >= 12 and factors["F4"].score >= 10 and factors["F5"].score >= 5 else "尚未形成共振"
     prosperity = evidence.get("industry_prosperity_status", "需人工确认")
+    web_hits = sum(item.status == "网络命中（未核验）" for factor in card.factors if factor.key != "F6" for item in factor.subfactors)
+    web_note = f"其中 {web_hits} 项来自未核验网络线索，不能当成财报事实。" if web_hits else "当前判断未使用网络补分。"
     return [
-        ("1. 一句话逻辑", f"{logic_status}。{name}的核心依据是{track.reason}，但必须以已验证证据为准。"),
-        ("2. 产业位置", f"{upstream.reason}；供需判断为{supply.reason}；行业景气交叉验证为{prosperity}。赛道成立不等于位置合适。"),
-        ("3. 国产替代与兑现", f"{chokepoint.reason}；{capex.reason}；{realization.reason}。订单和利润没有共同兑现时，题材不能单独支撑评级。"),
-        ("4. 位置与市场态度", f"{price.reason}；机构方向 {institutional.score:g}/2，技术结构 {technical.score:g}/4，情绪/拥挤度 {sentiment.score:g}/2。热榜只代表关注，不代表利好。"),
-        ("5. 安全边际", f"{financial.reason}；{background.reason}。当前最大短板是 {weakest.key} {weakest.label}（{_fmt(weakest.score)}/{_fmt(weakest.maximum)}）。"),
-        ("6. 最终判断", f"归入“{card.rating}”，{card.rating_reason}。证伪条件是产业需求、订单或资本开支连续两个报告期恶化，或现金流、审计和股东行为明显转坏。"),
+        ("1. 一句话逻辑", f"{name}当前归入“{card.rating}”：公司位于{chain_name}{stage}，但莫大逻辑要求的产业趋势、公司卡位、利润兑现和低位安全{logic_status}。最弱一环是 {weakest.label}（{_fmt(weakest.score)}/{_fmt(weakest.maximum)}）。"),
+        ("2. 先看产业", f"大白话说，先判断行业是不是未来三年的大方向，再看资本开支有没有真金白银。当前 F1 为 {_fmt(factors['F1'].score)}/30，行业景气为{prosperity}；{track.reason}；{capex.reason}。{web_note}"),
+        ("3. 再看公司卡位", f"公司不能只沾概念，必须说明自己卖什么、卖给谁、有没有替代价值。当前映射到{chain_name}{stage}；{upstream.reason}；{chokepoint.reason}；供需侧为{supply.reason}。"),
+        ("4. 看产业能否变成利润", f"莫大逻辑最终看收入、订单、产能、利润和现金流是否一起改善。当前 F4 为 {_fmt(factors['F4'].score)}/15；{realization.reason}。只有题材、没有订单和利润兑现，不支撑更高评级。"),
+        ("5. 看能否熬到反转", f"公司先要活过三年行业低谷，低位才有意义。{financial.reason}；{background.reason}；{price.reason}。因此 F3 为 {_fmt(factors['F3'].score)}/20，F5 为 {_fmt(factors['F5'].score)}/10。"),
+        ("6. 最终判断", f"综合归入“{card.rating}”，{card.rating_reason}。F6 仅作交易修正：机构 {institutional.score:g}/2、技术 {technical.score:g}/4、情绪 {sentiment.score:g}/2。继续跟踪的关键是产业需求、订单和资本开支能否连续两个报告期改善；现金流、审计或股东行为转坏则直接证伪。"),
     ]
 
 
@@ -209,9 +302,29 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
         "",
         "## 一句话结论与最终判断",
         "",
+        "### 莫大视角总览",
+        "",
+        "| 核心问题 | 图示 | 大白话结论 | 数据与理由 |",
+        "|---|---|---|---|",
     ]
+    for topic, chart, plain, reason in _moda_overview(card, evidence):
+        lines.append(f"| {topic} | `{chart}` | {_table_text(plain)} | {_table_text(reason)} |")
+    lines += [""]
     for title, body in _framework_conclusion(card, evidence):
         lines += [f"**{title}**", "", body, ""]
+    chain_name = str(evidence.get("chain_name") or "未识别产业链")
+    stage = _chain_stage_label(str(evidence.get("chain_stage") or evidence.get("chain_position") or ""))
+    lines += [
+        "### 核心上下游对应表",
+        "",
+        f"> 产业链：{chain_name}；公司位置：{stage}。表内上下游来自产业链资料库，公司与具体供应商、客户的关系仍以公告和年报为准。",
+        "",
+        "| 环节 | 核心内容 | 与公司的关系 | 判断 |",
+        "|---|---|---|---|",
+    ]
+    for node, core, relation, status in _chain_rows(evidence):
+        lines.append(f"| {node} | {_table_text(core)} | {_table_text(relation)} | {status} |")
+    lines += [""]
     lines.extend(_technical_analysis(evidence))
     lines += [""]
     lines.extend(_industry_prosperity_analysis(evidence))
@@ -263,8 +376,9 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
         "## 舆情、社交热榜与异常推广风险",
         "",
         f"- 个股关注热度：{evidence.get('attention_heat', '需人工确认')}（EastMoney 人气排名归一化）",
-        f"- 市场拥挤度：{evidence.get('market_congestion', '需人工确认')}；今日检查 {evidence.get('market_congestion_checked_date', '需人工确认')}；源数据日期 {evidence.get('market_congestion_date', '需人工确认')}；{'有效' if evidence.get('market_congestion_fresh') is True else '过期或缺失，不计分'}",
+        f"- 市场拥挤度：{evidence.get('market_congestion', '需人工确认')}；申万二级 {evidence.get('market_congestion_industry', '需人工确认')}（{evidence.get('market_congestion_industry_code', '需人工确认')}）；行业强度 {evidence.get('market_congestion_strength', '需人工确认')}；今日检查 {evidence.get('market_congestion_checked_date', '需人工确认')}；源数据日期 {evidence.get('market_congestion_date', '需人工确认')}；{'有效' if evidence.get('market_congestion_fresh') is True else '过期或缺失，不计分'}",
         f"- 社交热榜：命中 {evidence.get('social_hot_hits', '需人工确认')} 条，覆盖 {evidence.get('social_platform_hits', '需人工确认')} 个平台",
+        f"- 个股讨论：{evidence.get('discussion_posts_total', '需人工确认')} 条；来源 {evidence.get('discussion_source_status', '需人工确认')}；情绪 {evidence.get('discussion_sentiment', '需人工确认')}；推广话术 {('、'.join(evidence.get('discussion_promotion_hits', [])) or '无') if isinstance(evidence.get('discussion_promotion_hits'), list) else '需人工确认'}",
         f"- 异常推广风险：{evidence.get('trap_risk_level', '需人工确认')}；命中 {evidence.get('trap_signal_count', '需人工确认')}/8",
         "",
         "| 异常推广信号 | 结果 | 证据 |",
@@ -319,8 +433,12 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
     source_names = [f"{module} [{SOURCE_LABELS.get(module, module)}]" for module in completed]
     lines.append("- 已完成模块：" + ("、".join(source_names) if source_names else "无"))
     lines.append("- 失败或缺失模块：" + ("、".join(missing) if missing else "无"))
-    missing_items = [item.label for factor in card.factors for item in factor.subfactors if item.status == "需人工确认"]
+    missing_items = [item.label for factor in card.factors for item in factor.subfactors if item.status in {"需人工确认", "搜索失败，需人工确认"}]
     lines.append("- 需人工确认：" + ("、".join(dict.fromkeys(missing_items)) if missing_items else "无"))
+    web_hits = [item.label for factor in card.factors for item in factor.subfactors if item.status == "网络命中（未核验）"]
+    no_hits = [item.label for factor in card.factors for item in factor.subfactors if item.status == "已搜索未命中"]
+    lines.append("- 网络命中但未核验：" + ("、".join(dict.fromkeys(web_hits)) if web_hits else "无"))
+    lines.append("- 已搜索未命中：" + ("、".join(dict.fromkeys(no_hits)) if no_hits else "无"))
 
     lines += ["", "免责声明：本分析仅供研究参考，不构成投资建议。"]
     return "\n".join(lines) + "\n"

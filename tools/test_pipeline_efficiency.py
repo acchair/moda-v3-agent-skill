@@ -1,40 +1,52 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
 import numpy as np
 import requests
 
-from tools.akshare import announcements, finance_data
+from tools.akshare import announcements, business_data, finance_data, market_events
 from tools import run_pipeline
 from tools.scoring import grader
 from tools.scoring import evidence as evidence_module
 from tools.scoring.model import score_evidence
 from tools.scoring import web_research
+from tools.scoring import search_rules
+from tools.scoring import stock_discussion
 from tools.providers import axdata_provider
 from tools.tdx.analyzer import AlphaSorosAnalyzer
 
 
 def full_evidence() -> dict:
     values = {
-        "track_strength": 1.0, "chain_stage": "upstream", "supply_evidence_count": 3,
-        "supply_tightening": True, "chokepoint_score": 100, "capex_strength": 1.0,
-        "controller_action": "increase", "top1_holder_pct": 30, "holder_count_change_pct": -8,
-        "top10_quality": 1.0, "pledge_ratio": 0, "unlock_ratio": 0,
+        "track_strength": 1.0, "industry_cagr_3y": 0.35, "penetration_rate": 0.10,
+        "chain_stage": "upstream", "chain_name": "半导体设备产业链", "chain_partial": False,
+        "main_business": "刻蚀设备、薄膜沉积设备", "business_chain_revenue_ratio": 0.6,
+        "supply_evidence_count": 3, "supply_tightening": True,
+        "supply_cr3": 80, "capacity_expansion_cycle_years": 4,
+        "chokepoint_score": 100, "capex_strength": 1.0, "capex_yoy": 0.35,
+        "controller_action": "increase", "top1_holder_pct": 30, "holder_count_change_pct": -20,
+        "top10_quality": 1.0, "fund_holding_change_pct": 1.0, "pledge_ratio": 0, "unlock_ratio": 0,
         "background_quality": 1.0, "leadership_strength": 1.0, "net_profit": 1,
-        "operating_cashflow": 1, "debt_ratio": 0.3, "cash_to_debt": 0.5,
+        "operating_cashflow": 2, "debt_ratio": 0.3, "cash_to_debt": 0.5,
+        "net_cash_ratio": 0.25, "cash_to_short_debt": 4,
+        "operating_cashflow_to_net_profit": 2, "receivables_to_assets": 0.1,
         "st_risk": False, "audit_risk": False, "goodwill_risk": False, "specialized_strength": 1.0,
         "business_chain_match": 1.0, "overseas_revenue_ratio": 40,
         "revenue_yoy": 0.2, "profit_yoy": 0.2, "order_growth": 20,
-        "price_percentile_3y": 0.1, "pe_ttm": 10, "peer_pe_ttm_median": 20, "pb": 1,
-        "attention_heat": 0.1, "revenue_yoy_delta": 0.1, "profit_yoy_delta": 0.1,
+        "price_percentile_3y": 0.1, "product_price_to_history_high": 0.2,
+        "pe_ttm": 10, "peer_pe_ttm_median": 20, "pb": 1, "pb_to_5y_median": 0.4,
+        "attention_heat": 0.1, "industry_cycle_cold": True,
+        "revenue_yoy_delta": 0.1, "profit_yoy_delta": 0.1,
         "alpha_score": 0.5, "market_congestion": 0.3, "market_congestion_fresh": True,
         "alpha_trend": "上升", "ma_structure": "bullish", "momentum_20d": 0.08,
         "ma20_slope_5d": 0.03, "volume_ratio_20d": 1.3, "technical_position": 0.3,
@@ -50,6 +62,142 @@ def full_evidence() -> dict:
 
 
 class PipelineEfficiencyTest(unittest.TestCase):
+    def test_discussion_structured_data_precedes_search(self) -> None:
+        structured = [{"source": "xueqiu", "title": "中石科技订单改善", "text": "订单改善，业绩增长", "status": "结构化接口"}]
+        with patch.object(stock_discussion, "_xueqiu", return_value=structured), \
+             patch.object(stock_discussion, "_eastmoney", return_value=[]), \
+             patch.object(stock_discussion, "_search_fallback", side_effect=AssertionError("must not search")):
+            data = stock_discussion.collect("300684", "中石科技")
+        self.assertEqual(data["discussion_structured_count"], 1)
+        self.assertEqual(data["discussion_source_status"], "结构化接口")
+
+    def test_discussion_search_fallback_is_unverified(self) -> None:
+        row = {"title": "中石科技讨论", "snippet": "可能订单恢复", "url": "https://example.test"}
+        with patch.object(stock_discussion, "_xueqiu", return_value=[]), \
+             patch.object(stock_discussion, "_eastmoney", return_value=[]), \
+             patch.object(stock_discussion, "_search", return_value=("searxng", [row], [])):
+            data = stock_discussion.collect("300684", "中石科技")
+        self.assertEqual(data["discussion_search_count"], 1)
+        self.assertEqual(data["discussion_records"][0]["status"], "网络命中（未核验）")
+
+    def test_moda_f1_uses_cagr_penetration_cr3_expansion_and_capex(self) -> None:
+        data = full_evidence()
+        f1 = next(factor for factor in score_evidence(data).factors if factor.key == "F1")
+        self.assertEqual(f1.score, 30)
+        reasons = "；".join(item.reason for item in f1.subfactors)
+        self.assertIn("CAGR", reasons)
+        self.assertIn("CR3", reasons)
+        self.assertIn("扩产周期", reasons)
+        self.assertIn("资本开支同比", reasons)
+
+    def test_holder_count_uses_stricter_moda_bands(self) -> None:
+        expected = {"deep": 3, "medium": 2, "slight": 1, "increase": 0}
+        for label, change in (("deep", -20), ("medium", -8), ("slight", -2), ("increase", 3)):
+            data = full_evidence()
+            data["holder_count_change_pct"] = change
+            item = next(item for factor in score_evidence(data).factors for item in factor.subfactors if item.key == "holder_trend")
+            self.assertEqual(item.score, expected[label])
+
+    def test_financial_safety_uses_survival_metrics(self) -> None:
+        data = full_evidence()
+        item = next(item for factor in score_evidence(data).factors for item in factor.subfactors if item.key == "financial_safety")
+        self.assertEqual(item.score, 5)
+        self.assertIn("净现金率", item.reason)
+        weak = full_evidence()
+        weak.update({"net_cash_ratio": -0.1, "cash_to_short_debt": 0.5,
+                     "operating_cashflow_to_net_profit": 0.2, "debt_ratio": 0.8,
+                     "receivables_to_assets": 0.4})
+        weak_item = next(item for factor in score_evidence(weak).factors for item in factor.subfactors if item.key == "financial_safety")
+        self.assertEqual(weak_item.score, 0)
+
+    def test_f5_combines_stock_product_cycle_and_early_reversal(self) -> None:
+        data = full_evidence()
+        data.update({"revenue_yoy": 0.1, "profit_yoy": -0.2, "profit_yoy_delta": 0.1,
+                     "operating_cashflow": 1})
+        factors = score_evidence(data).factors
+        price = next(item for factor in factors for item in factor.subfactors if item.key == "price_position")
+        inflection = next(item for factor in factors for item in factor.subfactors if item.key == "inflection")
+        self.assertEqual(price.score, 2.5)
+        self.assertEqual(inflection.score, 2)
+        self.assertIn("周期底部前兆", inflection.reason)
+
+    def test_web_gap_overlay_is_unverified_and_does_not_override_complete_data(self) -> None:
+        missing = {"metric_sources": {}, "web_subfactor_results": {
+            "F1.era_track": {"status": "网络命中（未核验）", "score": 8,
+                               "reason": "CAGR=25%", "provider": "duckduckgo"}
+        }}
+        item = next(item for factor in score_evidence(missing).factors for item in factor.subfactors if item.key == "era_track")
+        self.assertEqual((item.score, item.status), (8, "网络命中（未核验）"))
+        complete = full_evidence()
+        complete["web_subfactor_results"] = missing["web_subfactor_results"]
+        complete_item = next(item for factor in score_evidence(complete).factors for item in factor.subfactors if item.key == "era_track")
+        self.assertEqual((complete_item.score, complete_item.status), (10, "已验证"))
+
+    def test_web_positive_risk_can_trigger_hard_cap_without_overriding_structured_safe_value(self) -> None:
+        missing = full_evidence()
+        missing.pop("controller_action")
+        missing["metric_sources"].pop("controller_action")
+        missing["web_subfactor_results"] = {
+            "F2.controller_action": {"status": "网络命中（未核验）", "score": 0,
+                                       "reason": "控股股东减持", "provider": "duckduckgo",
+                                       "hard_cap_signals": {"controller_reduction": True}}
+        }
+        self.assertEqual(score_evidence(missing).rating, "学习仓")
+        safe = full_evidence()
+        safe["web_subfactor_results"] = missing["web_subfactor_results"]
+        self.assertEqual(score_evidence(safe).rating, "根")
+
+    def test_search_rule_registry_covers_all_f1_to_f5_subfactors(self) -> None:
+        card = score_evidence({"metric_sources": {}})
+        expected = {f"{factor.key}.{item.key}" for factor in card.factors if factor.key != "F6" for item in factor.subfactors}
+        self.assertEqual(set(search_rules.RULES), expected)
+
+    def test_pipeline_targets_manual_and_partial_f1_to_f5_but_not_f6(self) -> None:
+        with patch("tools.scoring.evidence.read_reports", return_value={}), \
+             patch("tools.scoring.evidence.build_evidence", return_value={"metric_sources": {}}):
+            targets = run_pipeline.unresolved_targets("000001", "测试", (), 0)
+        self.assertEqual(len(targets), 24)
+        self.assertNotIn("F6", {item["factor_key"] for item in targets})
+        partial = full_evidence()
+        partial.pop("penetration_rate")
+        partial["metric_sources"].pop("penetration_rate")
+        with patch("tools.scoring.evidence.read_reports", return_value={}), \
+             patch("tools.scoring.evidence.build_evidence", return_value=partial):
+            targets = run_pipeline.unresolved_targets("000001", "测试", (), 0)
+        self.assertIn("F1.era_track", {f"{item['factor_key']}.{item['subfactor_key']}" for item in targets})
+
+    def test_finance_metrics_include_survival_balance_sheet_fields(self) -> None:
+        balance = pd.DataFrame([{
+            "资产总计": 100.0, "负债合计": 40.0, "货币资金": 30.0, "应收账款": 10.0,
+            "短期借款": 5.0, "一年内到期的非流动负债": 5.0, "长期借款": 5.0,
+            "应付债券": 0.0, "租赁负债": 0.0, "商誉": 0.0,
+        }])
+        income = pd.DataFrame([{"营业收入": 50.0, "归属于母公司的净利润": 10.0}])
+        cashflow = pd.DataFrame([{"经营活动产生的现金流量净额": 12.0}])
+        metrics = finance_data._report_metrics(
+            "000001", {}, {}, pd.DataFrame(), pd.DataFrame(),
+            {"fzb": balance, "lrb": income, "llb": cashflow},
+        )
+        self.assertAlmostEqual(metrics["net_cash_ratio"], 0.15)
+        self.assertEqual(metrics["cash_to_short_debt"], 3.0)
+        self.assertEqual(metrics["operating_cashflow_to_net_profit"], 1.2)
+        self.assertEqual(metrics["receivables_to_assets"], 0.1)
+
+    def test_search_auto_prefers_searxng_and_falls_back_to_ddg(self) -> None:
+        row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
+        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "https://ddg.example"}, clear=False), \
+             patch.object(web_research, "_searxng_search", return_value=row), \
+             patch.object(web_research, "_ddg_mcp_search") as ddg:
+            used, rows, _ = web_research._search("auto", "test", 0.1)
+        self.assertEqual((used, rows), ("searxng", row))
+        ddg.assert_not_called()
+        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "https://ddg.example"}, clear=False), \
+             patch.object(web_research, "_searxng_search", side_effect=TimeoutError), \
+             patch.object(web_research, "_ddg_mcp_search", return_value=row):
+            used, rows, errors = web_research._search("auto", "test", 0.1)
+        self.assertEqual((used, rows), ("duckduckgo", row))
+        self.assertIn("searxng:TimeoutError", errors)
+
     def test_full_framework_reaches_100_and_root(self) -> None:
         card = score_evidence(full_evidence())
         self.assertEqual(card.base_score, 90)
@@ -134,12 +282,17 @@ class PipelineEfficiencyTest(unittest.TestCase):
         sentiment = next(item for item in card.adjustments if item.key == "sentiment")
         self.assertEqual(sentiment.score, 2)
 
-    def test_zero_announcement_catalysts_remain_partial_without_web_confirmation(self) -> None:
-        data = full_evidence()
-        data["verified_catalyst_count"] = 0
-        catalyst = next(item for item in score_evidence(data).adjustments if item.key == "catalyst")
-        self.assertEqual(catalyst.score, 0)
-        self.assertEqual(catalyst.status, "部分覆盖")
+    def test_zero_announcement_catalysts_ignore_web_research_status(self) -> None:
+        reasons = set()
+        for web_status in ("completed", "unavailable"):
+            data = full_evidence()
+            data.update({"verified_catalyst_count": 0, "web_research_status": web_status})
+            catalyst = next(item for item in score_evidence(data).adjustments if item.key == "catalyst")
+            self.assertEqual(catalyst.score, 0)
+            self.assertEqual(catalyst.status, "部分覆盖")
+            self.assertNotIn("网页", catalyst.reason)
+            reasons.add(catalyst.reason)
+        self.assertEqual(reasons, {"公告标题未发现可验证催化"})
 
     def test_st_hard_cap(self) -> None:
         data = full_evidence()
@@ -153,8 +306,10 @@ class PipelineEfficiencyTest(unittest.TestCase):
 
     def test_factor_floor_hard_cap(self) -> None:
         data = full_evidence()
-        data.update({"track_strength": 0, "chain_stage": "downstream", "supply_tightening": False,
-                     "chokepoint_score": 0, "capex_strength": 0})
+        data.update({"track_strength": 0, "industry_cagr_3y": 0.05, "penetration_rate": 0.8,
+                     "chain_stage": "downstream", "supply_tightening": False, "supply_cr3": 20,
+                     "capacity_expansion_cycle_years": 0.5, "chokepoint_score": 0,
+                     "capex_strength": 0, "capex_yoy": -0.1})
         self.assertEqual(score_evidence(data).rating, "学习仓")
 
     def test_stale_congestion_does_not_cap(self) -> None:
@@ -227,6 +382,12 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertIn("F6 是独立的第六层，已计入综合分", report)
         self.assertIn("**1. 一句话逻辑**\n\n", report)
         self.assertIn("**6. 最终判断**\n\n", report)
+        self.assertIn("### 莫大视角总览", report)
+        self.assertIn("| 核心问题 | 图示 | 大白话结论 | 数据与理由 |", report)
+        self.assertIn("### 核心上下游对应表", report)
+        self.assertIn("产业链：半导体设备产业链；公司位置：上游", report)
+        self.assertIn("| 环节 | 核心内容 | 与公司的关系 | 判断 |", report)
+        self.assertIn("公司主营映射到本环节：刻蚀设备、薄膜沉积设备；相关收入占比 60.0%", report)
 
     def test_coldness_requires_f3_survival_gate(self) -> None:
         data = full_evidence()
@@ -373,6 +534,15 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertTrue(result["audit_risk"])
         self.assertIsNone(result["st_risk"])
 
+    def test_web_goodwill_keyword_does_not_override_low_current_goodwill(self) -> None:
+        reports = {
+            "finance_data": '<!-- moda_metrics: {"goodwill_to_assets": 0.0, "goodwill_risk": false} -->',
+            "web_research": '<!-- moda_web_research: {"web_risk_validation": {"status": "已验证", "goodwill_risk": true}} -->',
+        }
+        evidence = evidence_module.build_evidence("300179", "四方达", reports)
+        self.assertFalse(evidence["goodwill_risk"])
+        self.assertTrue(evidence["web_goodwill_risk_conflict"])
+
     def test_web_risk_ignores_report_template_and_unqualified_goodwill_text(self) -> None:
         harmless = web_research._classify({
             "url": "https://static.cninfo.com.cn/example.pdf",
@@ -400,6 +570,17 @@ class PipelineEfficiencyTest(unittest.TestCase):
         stale = [{**valid[0], "evidence_fresh": False}]
         self.assertEqual(web_research._validate_catalysts(valid)["verified_count"], 1)
         self.assertEqual(web_research._validate_catalysts(stale)["status"], "需人工确认")
+
+    def test_legacy_web_catalyst_validation_does_not_enter_f6(self) -> None:
+        reports = {
+            "announcements": '<!-- moda_metrics: {"verified_catalyst_count": 0, "announcement_coverage_complete": true} -->',
+            "web_research": '<!-- moda_web_research: {"web_catalyst_validation": {"status": "已验证", "verified_count": 2}} -->',
+        }
+        evidence = evidence_module.build_evidence("300179", "四方达", reports)
+        self.assertEqual(evidence["verified_catalyst_count"], 0)
+        catalyst = next(item for item in score_evidence(evidence).adjustments if item.key == "catalyst")
+        self.assertEqual(catalyst.score, 0)
+        self.assertNotIn("网页", catalyst.reason)
 
     def test_search_timeout_and_http_error_degrade_cleanly(self) -> None:
         with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": ""}, clear=False), \
@@ -473,6 +654,117 @@ class PipelineEfficiencyTest(unittest.TestCase):
         metrics = finance_data._report_metrics("000001", {}, {}, pd.DataFrame(), pd.DataFrame(), {"fzb": assets})
         self.assertIs(metrics["goodwill_risk"], False)
 
+    def test_finance_metrics_accept_current_sina_profit_aliases(self) -> None:
+        income = pd.DataFrame([
+            {"营业收入_同比": 0.20, "归属于母公司的净利润": 12.0, "归属于母公司的净利润_同比": 0.30},
+            {"营业收入_同比": 0.10, "归属于母公司的净利润": 10.0, "归属于母公司的净利润_同比": 0.05},
+        ])
+        metrics = finance_data._report_metrics("000001", {}, {}, pd.DataFrame(), pd.DataFrame(), {"lrb": income})
+        self.assertEqual(metrics["net_profit"], 12.0)
+        self.assertEqual(metrics["profit_yoy"], 0.30)
+        self.assertAlmostEqual(metrics["profit_yoy_delta"], 0.25)
+
+    def test_three_year_price_percentile_requires_720_trading_rows(self) -> None:
+        short = pd.DataFrame({"close": np.linspace(10, 20, 719)})
+        complete = pd.DataFrame({"close": np.linspace(10, 20, 720)})
+        short_metrics = finance_data._report_metrics("000001", {}, {}, short, pd.DataFrame(), {})
+        complete_metrics = finance_data._report_metrics("000001", {}, {}, complete, pd.DataFrame(), {})
+        self.assertNotIn("price_percentile_3y", short_metrics)
+        self.assertIn("price_percentile_3y", complete_metrics)
+
+    def test_single_pb_component_cannot_earn_full_valuation_score(self) -> None:
+        data = full_evidence()
+        for key in ("pe_ttm", "peer_pe_ttm_median", "pe_percentile_5y", "pb_percentile_5y"):
+            data.pop(key, None)
+            data["metric_sources"].pop(key, None)
+        valuation = next(item for factor in score_evidence(data).factors for item in factor.subfactors if item.key == "valuation")
+        self.assertEqual(valuation.score, 1)
+        self.assertEqual(valuation.status, "部分覆盖")
+
+    def test_supply_details_do_not_crash_f3_scoring(self) -> None:
+        data = full_evidence()
+        data.update({"supply_cr3": 65, "capacity_expansion_cycle_years": 2, "capacity_utilization_trend": "上升"})
+        card = score_evidence(data)
+        self.assertEqual(next(factor for factor in card.factors if factor.key == "F3").maximum, 20)
+
+    def test_missing_region_disclosure_does_not_become_zero_overseas_revenue(self) -> None:
+        frame = pd.DataFrame([{
+            "REPORT_DATE": pd.Timestamp("2025-12-31"), "MAINOP_TYPE": "2", "ITEM_NAME": "设备",
+            "MBI_RATIO": 1.0, "GROSS_RPOFIT_RATIO": 0.3,
+        }])
+        self.assertNotIn("overseas_revenue_ratio", business_data.build_structured(frame))
+        domestic = pd.concat([frame, pd.DataFrame([{
+            "REPORT_DATE": pd.Timestamp("2025-12-31"), "MAINOP_TYPE": "3", "ITEM_NAME": "中国大陆",
+            "MBI_RATIO": 1.0, "GROSS_RPOFIT_RATIO": 0.3,
+        }])], ignore_index=True)
+        self.assertEqual(business_data.build_structured(domestic)["overseas_revenue_ratio"], 0.0)
+
+    def test_numeric_name_does_not_prove_non_st_status(self) -> None:
+        evidence = evidence_module.build_evidence("000001", "000001", {})
+        self.assertNotIn("st_risk", evidence)
+        report = '<!-- moda_market_events: {"security_name": "*ST测试"} -->'
+        evidence = evidence_module.build_evidence("000001", "000001", {"market_events": report})
+        self.assertTrue(evidence["st_risk"])
+
+    def test_market_event_failures_do_not_become_verified_zero(self) -> None:
+        empty = pd.DataFrame()
+        with patch.object(market_events.provider, "holder_num_change", return_value=empty), \
+             patch.object(market_events.provider, "lockup_expiry", side_effect=requests.Timeout("timeout")), \
+             patch.object(market_events.provider, "concept_blocks", return_value=empty), \
+             patch.object(market_events.provider, "research_reports", return_value=empty), \
+             patch.object(market_events, "fetch_pledge", side_effect=requests.Timeout("timeout")), \
+             patch.object(market_events, "fetch_fund_holding", return_value=empty), \
+             patch.object(market_events, "fetch_top_holders", return_value=[]):
+            structured, _ = market_events.collect("000001")
+        self.assertFalse(structured["pledge_fetch_ok"])
+        self.assertFalse(structured["unlock_fetch_ok"])
+        self.assertNotIn("pledge_ratio", structured)
+        self.assertNotIn("unlock_ratio", structured)
+
+    def test_successful_empty_pledge_and_unlock_are_verified_zero(self) -> None:
+        empty = pd.DataFrame()
+        with patch.object(market_events.provider, "holder_num_change", return_value=empty), \
+             patch.object(market_events.provider, "lockup_expiry", return_value=empty), \
+             patch.object(market_events.provider, "concept_blocks", return_value=empty), \
+             patch.object(market_events.provider, "research_reports", return_value=empty), \
+             patch.object(market_events, "fetch_pledge", return_value=empty), \
+             patch.object(market_events, "fetch_fund_holding", return_value=empty), \
+             patch.object(market_events, "fetch_top_holders", return_value=[]):
+            structured, _ = market_events.collect("000001")
+        self.assertEqual(structured["pledge_ratio"], 0.0)
+        self.assertEqual(structured["unlock_ratio"], 0.0)
+
+    def test_missing_pledge_and_unlock_ratio_columns_remain_unconfirmed(self) -> None:
+        empty = pd.DataFrame()
+        lockup = pd.DataFrame([{"FREE_DATE": "2026-12-31"}])
+        pledge = pd.DataFrame([{"UNFREEZE_STATE": "未解押"}])
+        with patch.object(market_events.provider, "holder_num_change", return_value=empty), \
+             patch.object(market_events.provider, "lockup_expiry", return_value=lockup), \
+             patch.object(market_events.provider, "concept_blocks", return_value=empty), \
+             patch.object(market_events.provider, "research_reports", return_value=empty), \
+             patch.object(market_events, "fetch_pledge", return_value=pledge), \
+             patch.object(market_events, "fetch_fund_holding", return_value=empty), \
+             patch.object(market_events, "fetch_top_holders", return_value=[]):
+            structured, _ = market_events.collect("000001")
+        self.assertNotIn("pledge_ratio", structured)
+        self.assertNotIn("unlock_ratio", structured)
+
+    def test_f4_and_f5_sources_include_all_metrics_used(self) -> None:
+        data = full_evidence()
+        data["business_chain_revenue_ratio"] = 0.4
+        data["social_heat"] = 0.1
+        data["metric_sources"].update({
+            "business_chain_match": ["chains.yaml"],
+            "business_chain_revenue_ratio": ["EastMoney/F10"],
+            "attention_heat": ["EastMoney/stockrank"],
+            "social_heat": ["公开社交热榜"],
+        })
+        factors = score_evidence(data).factors
+        business_match = next(item for factor in factors for item in factor.subfactors if item.key == "business_match")
+        coldness = next(item for factor in factors for item in factor.subfactors if item.key == "coldness")
+        self.assertEqual(business_match.sources, ("chains.yaml", "EastMoney/F10"))
+        self.assertEqual(coldness.sources, ("EastMoney/stockrank", "公开社交热榜", "test"))
+
     def test_company_peers_use_easy_tdx_industry(self) -> None:
         boards = pd.DataFrame([
             {"board_type": 4, "board_code": "880952", "board_name": "芯片"},
@@ -498,6 +790,53 @@ class PipelineEfficiencyTest(unittest.TestCase):
             result = announcements.fetch_announcements("300820", days=30)
         fetch.assert_called_once()
         self.assertEqual(result["total"], 1)
+        self.assertTrue(result["announcement_fetch_ok"])
+        self.assertTrue(result["announcement_coverage_complete"])
+
+    def test_incomplete_announcement_coverage_cannot_prove_stable_or_audit_safe(self) -> None:
+        frame = pd.DataFrame([{
+            "date": datetime.now().strftime("%Y-%m-%d"), "title": f"普通公告{i}", "type": "PDF", "url": "https://example.test"
+        } for i in range(announcements.ANNOUNCEMENT_PAGE_SIZE)])
+        with patch("tools.providers.easy_tdx_provider.fetch_announcements", return_value=frame), \
+             patch.object(announcements, "ANNOUNCEMENT_MAX_PAGES", 2):
+            data = announcements.fetch_announcements("300820", days=180)
+        self.assertFalse(data["announcement_coverage_complete"])
+        report = announcements.generate_report("300820", "测试", {"qa_list": []}, data)
+        evidence = evidence_module.build_evidence("300820", "测试", {"announcements": report})
+        self.assertNotIn("controller_action", evidence)
+        self.assertNotIn("audit_risk", evidence)
+
+    def test_announcement_page_failure_marks_overall_fetch_failed(self) -> None:
+        frame = pd.DataFrame([{
+            "date": datetime.now().strftime("%Y-%m-%d"), "title": f"普通公告{i}", "type": "PDF", "url": "https://example.test"
+        } for i in range(announcements.ANNOUNCEMENT_PAGE_SIZE)])
+        fallback = SimpleNamespace(fetch_cninfo_announcements=lambda *_args: [])
+        with patch("tools.providers.easy_tdx_provider.fetch_announcements", side_effect=[frame, requests.Timeout("timeout")]), \
+             patch.dict(sys.modules, {"cninfo_backup": fallback}):
+            data = announcements.fetch_announcements("300820", days=180)
+        self.assertFalse(data["announcement_fetch_ok"])
+        self.assertFalse(data["announcement_coverage_complete"])
+
+    def test_authority_capex_requires_two_fresh_independent_domains(self) -> None:
+        records = [
+            {"fetch_status": "ok", "source_role": "权威来源", "source_tier": "A", "domain": "stats.gov.cn", "industry_context_match": True, "evidence_fresh": True, "industry_capex_direction": "up"},
+            {"fetch_status": "ok", "source_role": "权威来源", "source_tier": "A", "domain": "miit.gov.cn", "industry_context_match": True, "evidence_fresh": True, "industry_capex_direction": "up"},
+        ]
+        result = web_research._validate_industry_capex(records)
+        self.assertEqual(result["status"], "已验证")
+        self.assertEqual(result["signal"], "上行")
+
+    def test_verified_web_capex_overrides_unavailable_structured_placeholder(self) -> None:
+        reports = {
+            "announcements": '<!-- moda_announcements: {"announcement_titles": ["扩产项目公告"]} -->',
+            "web_research": '<!-- moda_web_research: {"web_industry_capex_validation": {"status": "已验证", "signal": "上行"}} -->',
+            "industry_prosperity": '<!-- moda_industry_prosperity: {"industry_capex_signal": "不可用"} -->',
+        }
+        evidence = evidence_module.build_evidence("000001", "测试", reports)
+        self.assertEqual(evidence["industry_capex_signal"], "上行")
+        self.assertEqual(evidence["capex_strength"], 1.0)
+        self.assertIn("easy_tdx/CNINFO + AKShare/CNINFO", evidence["metric_sources"]["capex_strength"])
+        self.assertIn("SearXNG + DuckDuckGo MCP", evidence["metric_sources"]["capex_strength"])
 
 if __name__ == "__main__":
     unittest.main()

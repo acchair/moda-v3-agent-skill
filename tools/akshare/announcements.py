@@ -28,6 +28,8 @@ apply_patch()
 import akshare as ak
 import pandas as pd
 OUTPUT_BASE = ROOT / "knowledge/research/announcements"
+ANNOUNCEMENT_PAGE_SIZE = 100
+ANNOUNCEMENT_MAX_PAGES = 5
 OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
 
@@ -85,16 +87,24 @@ def fetch_irm_qa(code: str, name: str = None) -> dict:
 def fetch_announcements(code: str, name: str = None, days: int = 7) -> dict:
     """单次查询个股公告，失败时回退 CloakBrowser。"""
     days = max(1, int(days))
-    print(f"  [公告] CNINFO 单次查询近{days}天公告 ({code}) ...")
+    print(f"  [公告] CNINFO 分页查询近{days}天公告 ({code}) ...")
     ann_list: list[dict] = []
     error = ""
+    fetch_ok = False
+    coverage_complete = False
+    source = "easy_tdx/CNINFO"
     try:
         from tools.providers.easy_tdx_provider import fetch_announcements as fetch_cninfo
 
-        df = fetch_cninfo(code, count=max(30, min(days * 2, 100)))
-        if df is not None and not df.empty:
-            cutoff = pd.Timestamp(datetime.now().date() - timedelta(days=days - 1))
-            dates = pd.to_datetime(df["date"], errors="coerce")
+        cutoff = pd.Timestamp(datetime.now().date() - timedelta(days=days - 1))
+        for page in range(1, ANNOUNCEMENT_MAX_PAGES + 1):
+            df = fetch_cninfo(code, count=ANNOUNCEMENT_PAGE_SIZE, page=page)
+            fetch_ok = True
+            if df is None or df.empty:
+                coverage_complete = True
+                break
+            raw_dates = df["date"] if "date" in df.columns else pd.Series(index=df.index, dtype=str)
+            dates = pd.to_datetime(raw_dates, errors="coerce")
             for _, row in df[dates >= cutoff].iterrows():
                 ann_list.append({
                     "date": str(row.get("date", ""))[:10],
@@ -102,9 +112,14 @@ def fetch_announcements(code: str, name: str = None, days: int = 7) -> dict:
                     "type": str(row.get("type", "")).strip(),
                     "url": str(row.get("url", "")).strip(),
                 })
+            valid_dates = dates.dropna()
+            if len(df) < ANNOUNCEMENT_PAGE_SIZE or (not valid_dates.empty and valid_dates.min() <= cutoff):
+                coverage_complete = True
+                break
         ann_list.sort(key=lambda item: item["date"], reverse=True)
         print(f"  [公告] easy_tdx/CNINFO: {len(ann_list)} 条")
     except Exception as exc:
+        fetch_ok = False
         error = f"{type(exc).__name__}: {exc}"
         print(f"  [公告] easy_tdx/CNINFO失败: {error}")
         try:
@@ -114,11 +129,21 @@ def fetch_announcements(code: str, name: str = None, days: int = 7) -> dict:
             if cninfo_ann:
                 ann_list = cninfo_ann
                 ann_list.sort(key=lambda x: x.get("date", ""), reverse=True)
+                fetch_ok = True
+                source = "CloakBrowser/CNINFO"
                 print(f"  [公告] CloakBrowser备用: {len(ann_list)} 条")
         except Exception as fallback_exc:
             print(f"  [公告] CloakBrowser备用也失败: {fallback_exc}")
 
-    return {"total": len(ann_list), "ann_list": ann_list, "days": days, "error": error}
+    return {
+        "total": len(ann_list),
+        "ann_list": ann_list,
+        "days": days,
+        "error": error,
+        "source": source,
+        "announcement_fetch_ok": fetch_ok,
+        "announcement_coverage_complete": coverage_complete,
+    }
 
 
 def extract_keywords_from_qa(qa_list: list) -> dict:
@@ -162,7 +187,9 @@ def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str
     title_text = " ".join(titles)
     reduction = bool(re.search(r"(?:控股股东|实际控制人|实控人)[^。；\n]{0,35}减持|减持[^。；\n]{0,35}(?:控股股东|实际控制人|实控人)", title_text))
     increase = bool(re.search(r"(?:控股股东|实际控制人|实控人)[^。；\n]{0,35}增持|增持[^。；\n]{0,35}(?:控股股东|实际控制人|实控人)", title_text))
-    controller_checked = not ann_data.get("error")
+    fetch_ok = ann_data.get("announcement_fetch_ok") is True
+    coverage_complete = ann_data.get("announcement_coverage_complete") is True
+    controller_checked = fetch_ok and coverage_complete
     controller_action = "reduction" if reduction else "increase" if increase else "stable" if controller_checked else None
     qa_text = " ".join(f"{item.get('question', '')} {item.get('answer', '')}" for item in irm_data.get("qa_list", []))
     growth_matches = re.findall(r"(?:订单|新增订单)[^\n。]{0,40}?(?:同比(?:增幅)?|增长)[^\d]{0,8}([0-9]+(?:\.[0-9]+)?)%", qa_text)
@@ -170,11 +197,17 @@ def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str
     structured = {
         "announcement_titles": titles,
         "announcement_lookback_days": ann_data.get("days"),
+        "announcement_fetch_ok": fetch_ok,
+        "announcement_coverage_complete": coverage_complete,
         "controller_checked": controller_checked,
         "controller_action": controller_action,
-        "audit_risk": any(term in title_text for term in ("非标准审计", "保留意见", "无法表示意见", "否定意见", "退市风险警示")),
-        "verified_catalyst_count": sum(term in title_text for term in catalyst_terms),
     }
+    audit_risk = any(term in title_text for term in ("非标准审计", "保留意见", "无法表示意见", "否定意见", "退市风险警示"))
+    if audit_risk or coverage_complete:
+        structured["audit_risk"] = audit_risk
+    catalyst_count = sum(term in title_text for term in catalyst_terms)
+    if catalyst_count or coverage_complete:
+        structured["verified_catalyst_count"] = catalyst_count
     if growth_matches:
         structured["order_growth"] = max(float(value) for value in growth_matches)
 
@@ -183,6 +216,7 @@ def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str
         f"",
         f"> 采集时间: {ts}",
         f"> 数据源: easy_tdx/CNINFO 公告 + AKShare/CNINFO 互动易",
+        f"> 公告覆盖: {'完整' if coverage_complete else '部分/失败，未据此反推无风险'}",
         f"",
         "---",
         f"",

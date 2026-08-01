@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import sys
 import time
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -17,8 +18,12 @@ from urllib.parse import urljoin, urlparse
 import requests
 from pypdf import PdfReader
 
-
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from tools.scoring.search_rules import RULES, evaluate as evaluate_gap, queries_for
+
+
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "web_research"
 USER_AGENT = "moda-v4-research/1.0"
 MAX_FETCH_BYTES = 600_000
@@ -62,6 +67,8 @@ CATALYST_CATEGORIES = {
     "shareholder": ("回购", "增持"),
     "policy": ("纳入名单", "政策支持", "补贴", "获批"),
 }
+CAPEX_UP_TERMS = ("投资增长", "投资同比增长", "加快投资", "扩大投资", "新增产能", "扩产", "产能建设", "设备更新")
+CAPEX_DOWN_TERMS = ("投资下降", "投资同比下降", "压减产能", "削减投资", "延缓投资", "停止扩产")
 
 
 def _load_local_env() -> None:
@@ -242,6 +249,97 @@ def _search(provider: str, query: str, timeout: float) -> tuple[str, list[dict[s
     return "none", [], errors
 
 
+def _gap_relevant(row: dict[str, Any], key: str, code: str, name: str, context: str) -> bool:
+    text = " ".join(str(row.get(field) or "") for field in ("title", "snippet"))
+    if name and name in text or code and code in text:
+        return True
+    if key.startswith("F1."):
+        tokens = [token for token in re.split(r"[\s、,，/|]+", context) if len(token) >= 2 and not token.isdigit()]
+        return any(token in text for token in tokens)
+    return False
+
+
+def _collect_gap_targets(code: str, name: str, context: str, targets: list[dict[str, Any]],
+                         provider: str, timeout: float) -> dict[str, Any]:
+    gap_results: list[dict[str, Any]] = []
+    all_results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    used_providers: list[str] = []
+    for target in targets:
+        factor_key = str(target.get("factor_key") or "")
+        subfactor_key = str(target.get("subfactor_key") or "")
+        key = f"{factor_key}.{subfactor_key}"
+        if key not in RULES or factor_key == "F6":
+            continue
+        target_rows: list[dict[str, Any]] = []
+        target_queries = queries_for(key, name, code, context)
+        target_errors: list[str] = []
+        seen: set[str] = set()
+        for query in target_queries:
+            used, rows, query_errors = _search(provider, query, timeout)
+            relevant = [row for row in rows if _gap_relevant(row, key, code, name, context)]
+            if used == "searxng" and not relevant and provider == "auto" and os.getenv("DDG_MCP_URL", "").strip():
+                fallback_used, fallback_rows, fallback_errors = _search("duckduckgo", query, timeout)
+                query_errors.extend(fallback_errors)
+                if fallback_rows:
+                    used, relevant = fallback_used, [row for row in fallback_rows if _gap_relevant(row, key, code, name, context)]
+            target_errors.extend(query_errors)
+            if used != "none" and used not in used_providers:
+                used_providers.append(used)
+            for rank, row in enumerate(relevant[:5], 1):
+                url = str(row.get("url") or "")
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                fetch_status, content = _fetch_page(url, min(timeout, 5)) if rank == 1 else ("not_fetched", "")
+                enriched = {
+                    **row,
+                    "factor_key": factor_key,
+                    "subfactor_key": subfactor_key,
+                    "query": query,
+                    "provider": used,
+                    "rank": rank,
+                    "fetch_status": fetch_status,
+                    "content_excerpt": content[:6000] if content else "",
+                }
+                target_rows.append(enriched)
+                all_results.append({key: value for key, value in enriched.items() if key != "content_excerpt"})
+        if target_rows:
+            assessment = evaluate_gap(key, float(target.get("maximum") or 0), target_rows)
+        else:
+            hard_errors = [error for error in target_errors if not error.endswith(":no_results")]
+            assessment = {
+                "status": "搜索失败，需人工确认" if hard_errors else "已搜索未命中",
+                "score": 0.0,
+                "reason": "；".join(hard_errors[:4]) if hard_errors else "SearXNG 与 DuckDuckGo MCP 均未返回相关结果",
+                "signals": [],
+                "conflict": False,
+            }
+        evidence_rows = [
+            {field: row.get(field) for field in ("title", "url", "snippet", "provider", "rank", "fetch_status", "query")}
+            for row in target_rows[:5]
+        ]
+        gap_result = {
+            **target,
+            **assessment,
+            "queries": target_queries,
+            "provider": next((row.get("provider") for row in target_rows if row.get("provider")), "none"),
+            "evidence": evidence_rows,
+            "errors": target_errors,
+        }
+        gap_results.append(gap_result)
+        errors.extend(f"{key}:{error}" for error in target_errors)
+    return {
+        "web_research_status": "completed" if gap_results else "unavailable",
+        "web_research_provider": ",".join(used_providers) or "none",
+        "web_gap_targets": targets,
+        "web_gap_results": gap_results,
+        "web_subfactor_results": {f"{item['factor_key']}.{item['subfactor_key']}": item for item in gap_results},
+        "results": all_results,
+        "errors": errors,
+    }
+
+
 def _fetch_page(url: str, timeout: float) -> tuple[str, str]:
     current = url
     try:
@@ -282,7 +380,7 @@ def _fetch_page(url: str, timeout: float) -> tuple[str, str]:
         return type(exc).__name__, ""
 
 
-def _classify(record: dict[str, Any], name: str) -> dict[str, Any]:
+def _classify(record: dict[str, Any], name: str, context: str = "") -> dict[str, Any]:
     text = str(record.get("content", ""))
     categories = [category for category, terms in SUPPLY_CATEGORIES.items() if any(term in text for term in terms)]
     tightening = any(term in text for term in TIGHTENING_TERMS)
@@ -302,6 +400,12 @@ def _classify(record: dict[str, Any], name: str) -> dict[str, Any]:
     evidence_date = _extract_evidence_date(record, text)
     domain = _domain(record.get("url", ""))
     source_role, source_tier = _source_role(domain)
+    context_tokens = {
+        token for token in re.split(r"[\s、,，/|]+", context)
+        if len(token) >= 2 and not token.isdigit()
+    }
+    capex_up = any(term in text for term in CAPEX_UP_TERMS)
+    capex_down = any(term in text for term in CAPEX_DOWN_TERMS)
     return {
         **record,
         "domain": domain,
@@ -317,6 +421,8 @@ def _classify(record: dict[str, Any], name: str) -> dict[str, Any]:
         "catalyst_categories": catalyst_categories,
         "evidence_date": evidence_date,
         "evidence_fresh": _is_fresh_date(evidence_date),
+        "industry_context_match": any(token in text for token in context_tokens),
+        "industry_capex_direction": "up" if capex_up and not capex_down else "down" if capex_down and not capex_up else "conflict" if capex_up and capex_down else "unknown",
     }
 
 
@@ -427,12 +533,35 @@ def _validate_catalysts(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def collect(code: str, name: str, context: str, provider: str | None = None, timeout: float = 12) -> dict[str, Any]:
+def _validate_industry_capex(records: list[dict[str, Any]]) -> dict[str, Any]:
+    usable = [
+        row for row in records
+        if _confirmable(row) and row.get("source_tier") == "A"
+        and row.get("industry_context_match") and row.get("evidence_fresh")
+        and row.get("industry_capex_direction") in {"up", "down"}
+    ]
+    domains = {row.get("domain") for row in usable if row.get("domain")}
+    directions = {row["industry_capex_direction"] for row in usable}
+    confirmed = len(domains) >= 2 and len(directions) == 1
+    direction = next(iter(directions)) if confirmed else None
+    return {
+        "status": "已验证" if confirmed else "证据冲突" if len(directions) > 1 else "需人工确认",
+        "evidence_count": len(usable),
+        "domain_count": len(domains),
+        "signal": "上行" if direction == "up" else "下行" if direction == "down" else None,
+        "reason": "两家独立权威来源的一年内正文同向确认行业投资" if confirmed else "未满足行业匹配、有效日期、双权威域名和同向要求",
+    }
+
+
+def collect(code: str, name: str, context: str, provider: str | None = None, timeout: float = 12,
+            targets: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     selected = (provider or os.getenv("MODA_SEARCH_PROVIDER", "auto")).strip().lower()
     if selected not in {"auto", "searxng", "duckduckgo", "off"}:
         selected = "off"
     if selected == "off":
         return {"web_research_status": "disabled", "web_research_provider": "off", "queries": [], "results": [], "errors": []}
+    if targets is not None:
+        return _collect_gap_targets(code, name, context, targets, selected, timeout)
 
     short_context = " ".join(context.split()[:12])
     query_specs = [
@@ -443,8 +572,8 @@ def collect(code: str, name: str, context: str, provider: str | None = None, tim
         ("risk", f"site:szse.cn {code} {name} 风险警示 审计 商誉"),
         ("specialized", f"site:gov.cn {name} 专精特新 小巨人 单项冠军"),
         ("specialized", f"site:miit.gov.cn {name} 专精特新 单项冠军"),
-        ("catalyst", f"site:cninfo.com.cn {name} 中标 合同 扩产 投产 业绩预增 回购 增持"),
-        ("catalyst", f"site:gov.cn {name} 获批 纳入名单 项目落地"),
+        ("capex", f"site:stats.gov.cn {short_context} 固定资产投资 投资增长 产能"),
+        ("capex", f"site:miit.gov.cn OR site:ndrc.gov.cn {short_context} 投资 扩产 设备更新"),
     ]
     queries = [query for _, query in query_specs]
     results: list[dict[str, Any]] = []
@@ -465,7 +594,7 @@ def collect(code: str, name: str, context: str, provider: str | None = None, tim
             seen.add(url)
             purpose_counts[purpose] = purpose_counts.get(purpose, 0) + 1
             fetch_status, content = _fetch_page(url, timeout)
-            classified = _classify({**row, "purpose": purpose, "query": query, "fetch_status": fetch_status, "content": content}, name)
+            classified = _classify({**row, "purpose": purpose, "query": query, "fetch_status": fetch_status, "content": content}, name, context)
             classified.pop("content", None)
             results.append(classified)
 
@@ -473,7 +602,7 @@ def collect(code: str, name: str, context: str, provider: str | None = None, tim
     chokepoint = _validate_chokepoint(results)
     risk = _validate_risk(results)
     specialized = _validate_specialized(results)
-    catalysts = _validate_catalysts(results)
+    industry_capex = _validate_industry_capex(results)
     status = "completed" if results else "unavailable"
     return {
         "web_research_status": status,
@@ -485,11 +614,37 @@ def collect(code: str, name: str, context: str, provider: str | None = None, tim
         "web_chokepoint_validation": chokepoint,
         "web_risk_validation": risk,
         "web_specialized_validation": specialized,
-        "web_catalyst_validation": catalysts,
+        "web_industry_capex_validation": industry_capex,
     }
 
 
 def build_report(code: str, name: str, data: dict[str, Any]) -> str:
+    if data.get("web_gap_results") is not None:
+        lines = [
+            f"# 定向搜索补缺：{name or code}（{code}）",
+            "",
+            f"> 采集时间：{time.strftime('%Y-%m-%d %H:%M:%S')}  |  后端：{data.get('web_research_provider', 'none')}",
+            "",
+            f"<!-- moda_web_research: {json.dumps(data, ensure_ascii=False)} -->",
+            "",
+            "| 因子 | 子因子 | 原状态 | 搜索结果 | 未核验得分 | 后端 | 判断依据 |",
+            "|---|---|---|---|---:|---|---|",
+        ]
+        for item in data.get("web_gap_results", []):
+            reason = str(item.get("reason") or "").replace("|", "/")
+            lines.append(
+                f"| {item.get('factor_key')} | {item.get('label')} | {item.get('original_status')} | "
+                f"{item.get('status')} | {item.get('score', 0):g}/{item.get('maximum', 0):g} | "
+                f"{item.get('provider', 'none')} | {reason} |"
+            )
+        lines += ["", "## 搜索明细", "", "| 子因子 | 标题 | URL | 查询词 | 后端 |", "|---|---|---|---|---|"]
+        for item in data.get("web_gap_results", []):
+            for row in item.get("evidence", []):
+                title = str(row.get("title") or "").replace("|", "/")
+                query = str(row.get("query") or "").replace("|", "/")
+                lines.append(f"| {item.get('factor_key')}.{item.get('subfactor_key')} | {title} | {row.get('url', '')} | {query} | {row.get('provider', '')} |")
+        lines += ["", "搜索结果只用于未核验补缺；结构化数据优先，F6 不使用网页补分。", ""]
+        return "\n".join(lines)
     lines = [
         f"# 搜索交叉验证：{name or code}（{code}）",
         "",
@@ -502,7 +657,7 @@ def build_report(code: str, name: str, data: dict[str, Any]) -> str:
         f"- 国产替代验证：{data.get('web_chokepoint_validation', {}).get('status', '需人工确认')}；{data.get('web_chokepoint_validation', {}).get('reason', '搜索未运行')}",
         f"- 退市/审计/商誉验证：{data.get('web_risk_validation', {}).get('status', '需人工确认')}；{data.get('web_risk_validation', {}).get('reason', '搜索未运行')}",
         f"- 专精特新/单项冠军验证：{data.get('web_specialized_validation', {}).get('status', '需人工确认')}；{data.get('web_specialized_validation', {}).get('reason', '搜索未运行')}",
-        f"- 风口催化验证：{data.get('web_catalyst_validation', {}).get('status', '需人工确认')}；{data.get('web_catalyst_validation', {}).get('reason', '搜索未运行')}",
+        f"- 行业资本开支验证：{data.get('web_industry_capex_validation', {}).get('status', '需人工确认')}；{data.get('web_industry_capex_validation', {}).get('reason', '搜索未运行')}",
         "",
         "| 用途 | 来源角色 | 来源等级 | 标题 | 域名 | 正文 | 证据日期 | 查询词 |",
         "|---|---|---|---|---|---|---|---|",
@@ -523,9 +678,11 @@ def main() -> None:
     parser.add_argument("--name", default="")
     parser.add_argument("--context", default="")
     parser.add_argument("--provider", default=None)
+    parser.add_argument("--targets-json", default="")
     args = parser.parse_args()
     code = args.stock.strip()
-    data = collect(code, args.name or code, args.context, args.provider)
+    targets = json.loads(args.targets_json) if args.targets_json else None
+    data = collect(code, args.name or code, args.context, args.provider, targets=targets)
     OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_BASE / f"{code}.md"
     path.write_text(build_report(code, args.name or code, data), encoding="utf-8")

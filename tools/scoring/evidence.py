@@ -19,8 +19,8 @@ SOURCE_LABELS = {
     "market_events": "EastMoney + Sina",
     "popularity": "EastMoney/stockrank",
     "supply_demand": "AKShare/futures",
-    "congestion": "AKShare/legulegu",
-    "social_sentiment": "公开社交热榜",
+    "congestion": "乐咕乐股/申万二级行业拥挤度",
+    "social_sentiment": "公开社交热榜 + 个股讨论接口/搜索",
     "macro_policy": "AKShare/PBOC + gov.cn",
     "web_research": "SearXNG + DuckDuckGo MCP",
     "industry_prosperity": "乐咕乐股(B级) + AKShare/申万",
@@ -255,12 +255,17 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
     announcement_text = " ".join(str(item) for item in evidence.get("announcement_titles", []))
     capex_hits = [term for term in CAPEX_TERMS if term in announcement_text]
     company_capex = bool(order_growth is not None and order_growth > 0) or bool(capex_hits)
+    web_capex = evidence.get("web_industry_capex_validation") or {}
+    if web_capex.get("status") == "已验证" and web_capex.get("signal") in {"上行", "下行"}:
+        _set(evidence, "industry_capex_signal", web_capex["signal"], SOURCE_LABELS["web_research"], overwrite=True)
     industry_capex = evidence.get("industry_capex_signal") == "上行"
     if company_capex and industry_capex:
-        _set(evidence, "capex_strength", 1.0, "公司公告 + 行业资本开支")
+        _set(evidence, "capex_strength", 1.0, SOURCE_LABELS["announcements"])
+        _set(evidence, "capex_strength", 1.0, SOURCE_LABELS["web_research"])
         evidence["capex_reason"] = "公司订单/扩产与行业资本开支双侧确认"
     elif company_capex or industry_capex:
-        _set(evidence, "capex_strength", 0.5, "公告/主营文本")
+        source = SOURCE_LABELS["web_research"] if industry_capex else SOURCE_LABELS["announcements"]
+        _set(evidence, "capex_strength", 0.5, source)
         detail = f"订单增长 {order_growth:.2f}%" if order_growth is not None and order_growth > 0 else "、".join(capex_hits[:3]) if capex_hits else "行业资本开支上行"
         evidence["capex_reason"] = f"仅单侧资本开支证据：{detail}"
         evidence["capex_partial"] = True
@@ -282,12 +287,13 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
         _set(evidence, "controller_action", "increase", SOURCE_LABELS["announcements"], overwrite=True)
 
     if "st_risk" not in evidence:
-        normalized_name = str(evidence.get("name", "")).upper().replace(" ", "")
-        _set(evidence, "st_risk", normalized_name.startswith(("ST", "*ST")), "证券简称")
+        normalized_name = str(evidence.get("security_name") or evidence.get("name") or "").upper().replace(" ", "")
+        if normalized_name and not normalized_name.isdigit():
+            _set(evidence, "st_risk", normalized_name.startswith(("ST", "*ST")), "证券简称")
     audit_terms = ("非标准审计", "保留意见", "无法表示意见", "否定意见", "退市风险警示")
     if any(term in title_text for term in audit_terms):
         _set(evidence, "audit_risk", True, SOURCE_LABELS["announcements"])
-    elif evidence.get("announcement_lookback_days"):
+    elif evidence.get("announcement_coverage_complete") is True:
         _set(evidence, "audit_risk", False, SOURCE_LABELS["announcements"])
 
     leadership_hits = [term for term in LEADERSHIP_TERMS if term in full_context]
@@ -302,7 +308,7 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
         evidence["specialized_partial"] = True
 
     catalyst_hits = {term for term in CATALYST_TERMS if term in title_text}
-    if title_text:
+    if title_text and (catalyst_hits or evidence.get("announcement_coverage_complete") is True):
         _set(evidence, "verified_catalyst_count", len(catalyst_hits), SOURCE_LABELS["announcements"])
 
     _chain_match(evidence)
@@ -325,6 +331,11 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
     if web_risk.get("status") == "已验证":
         for key in ("st_risk", "audit_risk", "goodwill_risk"):
             if web_risk.get(key) is True:
+                if key == "goodwill_risk":
+                    goodwill_ratio = _float(evidence.get("goodwill_to_assets"))
+                    if goodwill_ratio is not None and goodwill_ratio <= 0.10:
+                        evidence["web_goodwill_risk_conflict"] = True
+                        continue
                 _set(evidence, key, True, SOURCE_LABELS["web_research"], overwrite=True)
 
     web_specialized = evidence.get("web_specialized_validation") or {}
@@ -333,17 +344,15 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
         evidence["specialized_reason"] = web_specialized.get("reason", "权威网页确认资质")
         evidence["specialized_partial"] = False
 
-    web_catalyst = evidence.get("web_catalyst_validation") or {}
-    if web_catalyst.get("status") == "已验证":
-        current_catalysts = int(_float(evidence.get("verified_catalyst_count")) or 0)
-        searched_catalysts = int(_float(web_catalyst.get("verified_count")) or 0)
-        if searched_catalysts > current_catalysts:
-            _set(evidence, "verified_catalyst_count", searched_catalysts, SOURCE_LABELS["web_research"], overwrite=True)
-
     promotion_hits = set(str(item) for item in evidence.get("promotional_keyword_hits", []))
+    promotion_hits.update(str(item) for item in evidence.get("discussion_promotion_hits", []))
     rumor_hits = set(str(item) for item in evidence.get("rumor_keyword_hits", []))
+    rumor_hits.update(str(item) for item in evidence.get("discussion_rumor_hits", []))
     announcement_rumors = {term for term in RUMOR_TERMS if term in title_text}
-    platform_hits = int(_float(evidence.get("social_platform_hits")) or 0)
+    platform_hits = max(
+        int(_float(evidence.get("social_platform_hits")) or 0),
+        int(_float(evidence.get("discussion_source_count")) or 0),
+    )
     attention = _float(evidence.get("attention_heat"))
     social_heat = _float(evidence.get("social_heat"))
     combined_heat = max(value for value in (attention, social_heat) if value is not None) if any(value is not None for value in (attention, social_heat)) else None
@@ -375,7 +384,7 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
     ]
     signal_count = sum(bool(item["hit"]) for item in checks)
     independent_categories = sum((bool(platform_hits or promotion_hits), any(value is not None for value in (profit, profit_yoy, revenue_yoy, price)), bool(announcement_rumors)))
-    if evidence.get("social_platforms_checked") is not None:
+    if evidence.get("social_platforms_checked") is not None or evidence.get("discussion_source_status"):
         _set(evidence, "trap_signal_count", signal_count, SOURCE_LABELS["social_sentiment"])
         _set(evidence, "trap_checks", checks, SOURCE_LABELS["social_sentiment"])
         _set(evidence, "trap_independent_categories", independent_categories, SOURCE_LABELS["social_sentiment"])
@@ -404,4 +413,6 @@ def build_evidence(code: str, name: str, reports: dict[str, str]) -> dict[str, A
                 _set(evidence, key, value, source, overwrite=True)
     _derive_legacy_fields(evidence, reports)
     _derive_framework_fields(evidence, reports)
+    if evidence.get("web_subfactor_results"):
+        evidence["search_evidence_quality"] = "网络命中仅作未核验补缺，结构化数据优先"
     return evidence

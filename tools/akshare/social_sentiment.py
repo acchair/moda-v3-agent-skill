@@ -19,6 +19,8 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Sa
 PROMOTION_TERMS = ("必涨", "稳赚", "翻倍", "内部消息", "老师带", "加群", "主力建仓", "最后上车", "股神", "跟单")
 RUMOR_TERMS = ("谣言", "辟谣", "澄清", "虚假", "操纵", "荐股骗局", "杀猪盘")
 
+DISCUSSION_SCRIPT = ROOT / "tools" / "scoring" / "stock_discussion.py"
+
 
 def _json(url: str, timeout: float = 10) -> dict:
     response = requests.get(url, headers={"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}, timeout=timeout)
@@ -125,6 +127,7 @@ def collect(code: str, name: str) -> dict:
     rumor_hits = [term for term in RUMOR_TERMS if term in matched_text]
     rank_weight = sum(max(0.0, (51 - float(row.get("rank", 50))) / 50) for rows in mentions.values() for row in rows)
     social_heat = min(1.0, (platform_hits / 3) * 0.6 + min(0.4, rank_weight * 0.12)) if checked >= 3 else None
+    discussion = _collect_discussion(code, name)
     return {
         "social_platforms_checked": checked,
         "social_platforms_total": len(FETCHERS),
@@ -137,7 +140,38 @@ def collect(code: str, name: str) -> dict:
         "social_aliases": aliases,
         "social_platform_status": {key: {"ok": value["ok"], "mode": value["mode"], "error": value["error"]} for key, value in results.items()},
         "social_partial": checked < len(FETCHERS),
+        **discussion,
     }
+
+
+def _collect_discussion(code: str, name: str) -> dict:
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("moda_stock_discussion", DISCUSSION_SCRIPT)
+        if spec is None or spec.loader is None:
+            raise ImportError("discussion module unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.collect(code, name)
+    except Exception as exc:
+        return {
+            "discussion_posts_total": 0,
+            "discussion_structured_count": 0,
+            "discussion_search_count": 0,
+            "discussion_source_count": 0,
+            "discussion_source_status": "搜索失败，需人工确认",
+            "discussion_sources": [],
+            "discussion_partial": True,
+            "discussion_records": [],
+            "discussion_search_errors": [f"{type(exc).__name__}: {str(exc)[:120]}"],
+            "discussion_sentiment": None,
+            "discussion_sentiment_score": None,
+            "discussion_positive_count": 0,
+            "discussion_negative_count": 0,
+            "discussion_neutral_count": 0,
+            "discussion_promotion_hits": [],
+            "discussion_rumor_hits": [],
+        }
 
 
 def build_report(code: str, name: str, data: dict) -> str:
@@ -151,8 +185,9 @@ def build_report(code: str, name: str, data: dict) -> str:
         f"- 可用平台：{data['social_platforms_checked']} / {data['social_platforms_total']}",
         f"- 命中：{data['social_hot_hits']} 条，覆盖 {data['social_platform_hits']} 个平台",
         f"- 社交热度：{data['social_heat'] if data['social_heat'] is not None else '需人工确认'}",
-        f"- 推广话术命中：{'、'.join(data['promotional_keyword_hits']) or '无'}",
+        f"- 推广话术命中：{'、'.join(data['promotional_keyword_hits']) or '无'}；个股讨论：{'、'.join(data.get('discussion_promotion_hits') or []) or '无'}",
         f"- 谣言/风险词命中：{'、'.join(data['rumor_keyword_hits']) or '无'}",
+        f"- 个股讨论：{data.get('discussion_posts_total', 0)} 条；情绪 {data.get('discussion_sentiment') or '需人工确认'}；来源 {data.get('discussion_source_status', '需人工确认')}",
         "",
         "## 命中明细",
         "",

@@ -101,12 +101,42 @@ class DailyCacheTest(unittest.TestCase):
     def test_today_cache_does_not_make_old_congestion_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "congestion.json"
-            frame = pd.DataFrame([{"date": "2026-05-21", "congestion": 0.4502}])
-            with patch.object(congestion.ak, "stock_a_congestion_lg", return_value=frame):
-                result = congestion.collect(cache_path=path, now=datetime(2026, 7, 31, 9))
+            payload = {
+                "source": "乐咕乐股/申万二级行业拥挤度",
+                "source_date": "2026-05-21",
+                "rows": [{
+                    "sw_second_name": "电子化学品Ⅱ", "sw_second_code": "801086.SI",
+                    "sw_first_code": "801080.SI", "turnover_percentile": 45,
+                    "amount_ratio_percentile": 45, "congestion": 0.45,
+                    "strength_score": 45, "strength": "中性",
+                }],
+            }
+            with patch.object(congestion, "_fetch_latest", return_value=payload):
+                result = congestion.collect("电子化学品", cache_path=path, now=datetime(2026, 7, 31, 9))
             self.assertEqual(result["market_congestion_checked_date"], "2026-07-31")
             self.assertEqual(result["market_congestion_date"], "2026-05-21")
             self.assertFalse(result["market_congestion_fresh"])
+            self.assertEqual(result["market_congestion_industry"], "电子化学品Ⅱ")
+
+    def test_industry_congestion_cache_is_shared_by_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "congestion.json"
+            payload = {
+                "source": "乐咕乐股/申万二级行业拥挤度", "source_date": "2026-07-31",
+                "rows": [{
+                    "sw_second_name": "专用设备", "sw_second_code": "801074.SI",
+                    "sw_first_code": "801070.SI", "turnover_percentile": 70,
+                    "amount_ratio_percentile": 60, "congestion": 0.65,
+                    "strength_score": 65, "strength": "偏热",
+                }],
+            }
+            with patch.object(congestion, "_fetch_latest", return_value=payload) as fetch:
+                first = congestion.collect("专用设备", cache_path=path, now=datetime(2026, 7, 31, 9))
+                second = congestion.collect("专用设备 / 其他专用设备", cache_path=path, now=datetime(2026, 7, 31, 10))
+            self.assertEqual(fetch.call_count, 1)
+            self.assertFalse(first["market_congestion_cache_hit"])
+            self.assertTrue(second["market_congestion_cache_hit"])
+            self.assertEqual(second["market_congestion_strength"], "偏热")
 
 
 class IndustryProsperityTest(unittest.TestCase):

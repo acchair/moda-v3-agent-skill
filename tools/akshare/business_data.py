@@ -57,15 +57,18 @@ def build_structured(frame: pd.DataFrame) -> dict:
             "gross_margin": None if pd.isna(margin) else round(float(margin), 6),
         })
     region_rows = latest[latest["MAINOP_TYPE"].eq("3")]
-    overseas_rows = region_rows[region_rows["ITEM_NAME"].astype(str).map(lambda value: any(term in value for term in OVERSEAS_TERMS))]
-    overseas_ratio = float(overseas_rows["MBI_RATIO"].sum() * 100) if not overseas_rows.empty else 0.0
-    return {
+    result = {
         "business_report_date": latest_date.strftime("%Y-%m-%d"),
         "business_items": business_items,
         "business_breakdown": breakdown,
         "main_business": "、".join(business_items[:8]),
-        "overseas_revenue_ratio": round(overseas_ratio, 4),
     }
+    if not region_rows.empty:
+        valid_regions = region_rows[region_rows["MBI_RATIO"].notna()]
+        if not valid_regions.empty:
+            overseas_rows = valid_regions[valid_regions["ITEM_NAME"].astype(str).map(lambda value: any(term in value for term in OVERSEAS_TERMS))]
+            result["overseas_revenue_ratio"] = round(float(overseas_rows["MBI_RATIO"].sum() * 100), 4)
+    return result
 
 
 def build_report(code: str, name: str, frame: pd.DataFrame) -> str:
