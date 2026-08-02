@@ -121,6 +121,43 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual(inflection.score, 2)
         self.assertIn("周期底部前兆", inflection.reason)
 
+    def test_f5_low_position_is_inverse_but_does_not_create_reversal(self) -> None:
+        data = full_evidence()
+        data.update({
+            "price_percentile_3y": 0.08,
+            "product_price_to_history_high": 0.20,
+            "attention_heat": 0.80,
+            "industry_cycle_cold": False,
+            "order_growth": -10,
+            "revenue_yoy_delta": -0.10,
+            "profit_yoy_delta": -0.10,
+        })
+        f5 = next(factor for factor in score_evidence(data).factors if factor.key == "F5")
+        price = next(item for item in f5.subfactors if item.key == "price_position")
+        inflection = next(item for item in f5.subfactors if item.key == "inflection")
+        expectation = next(item for item in f5.subfactors if item.key == "expectation_gap")
+        self.assertEqual(price.score, 2.5)
+        self.assertEqual(inflection.score, 0)
+        self.assertEqual(expectation.score, 0)
+        self.assertIn("逆向评分", price.reason)
+        self.assertIn("低位本身不等于反转", inflection.reason)
+
+    def test_industry_web_signal_uses_three_layers_and_independent_domains(self) -> None:
+        from tools.akshare import industry_prosperity
+
+        rows = [
+            {"title": "行业订单增长、业绩改善、行业指数上涨", "snippet": "资金流入，成交放量", "url": "https://static.cninfo.com.cn/a"},
+            {"title": "行业复苏与价格上涨", "snippet": "排产饱满，跑赢市场", "url": "https://www.cls.cn/a"},
+        ]
+        with patch.object(web_research, "_search", return_value=("duckduckgo_html", rows, [])), \
+             patch.object(web_research, "_fetch_page", return_value=("ok", "")):
+            result = industry_prosperity.collect_web_signal("华特气体", "电子化学品", timeout=0.1)
+        self.assertEqual(result["status"], "上行")
+        self.assertEqual(result["coverage"], "完整")
+        self.assertEqual(result["layers"]["financial"]["status"], "上行")
+        self.assertEqual(result["layers"]["supply"]["status"], "上行")
+        self.assertEqual(result["layers"]["market"]["status"], "上行")
+
     def test_web_gap_overlay_is_unverified_and_does_not_override_complete_data(self) -> None:
         missing = {"metric_sources": {}, "web_subfactor_results": {
             "F1.era_track": {"status": "网络命中（未核验）", "score": 8,
@@ -197,6 +234,20 @@ class PipelineEfficiencyTest(unittest.TestCase):
             used, rows, errors = web_research._search("auto", "test", 0.1)
         self.assertEqual((used, rows), ("duckduckgo", row))
         self.assertIn("searxng:TimeoutError", errors)
+
+    def test_china_finance_sources_are_tiered_and_prioritized(self) -> None:
+        self.assertEqual(web_research._source_role("static.cninfo.com.cn"), ("法定信息披露", "A"))
+        self.assertEqual(web_research._source_role("news.cls.cn"), ("财经媒体", "B"))
+        self.assertEqual(web_research._source_role("guba.eastmoney.com"), ("线索来源", "C"))
+        rows = [
+            {"url": "https://xueqiu.com/a", "rank": 1},
+            {"url": "https://www.cls.cn/a", "rank": 2},
+            {"url": "https://static.cninfo.com.cn/a", "rank": 3},
+        ]
+        ordered = web_research._prioritize_search_rows(rows)
+        self.assertEqual([web_research._domain(row["url"]) for row in ordered], [
+            "static.cninfo.com.cn", "cls.cn", "xueqiu.com",
+        ])
 
     def test_full_framework_reaches_100_and_root(self) -> None:
         card = score_evidence(full_evidence())
@@ -439,6 +490,29 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertNotIn("AI 算力与数据中心", evidence["track_reason"])
         self.assertGreaterEqual(evidence["business_chain_revenue_ratio"], 0.3)
         self.assertFalse(evidence["chain_partial"])
+
+    def test_electronic_specialty_gas_prefers_semiconductor_supply_chain(self) -> None:
+        reports = {
+            "finance_data": '<!-- moda_metrics: {"industry": "电子化学品"} -->',
+            "business_data": '<!-- moda_business: {"main_business": "特种气体、光刻及其他混合气体", "business_items": ["特种气体", "光刻及其他混合气体", "氢化物"], "business_breakdown": [{"category": "按产品分类", "item": "光刻及其他混合气体", "revenue_ratio": 0.22}, {"category": "按产品分类", "item": "氢化物", "revenue_ratio": 0.07}]} -->',
+        }
+        evidence = evidence_module.build_evidence("688268", "华特气体", reports)
+        self.assertEqual(evidence["chain_name"], "半导体电子特气产业链")
+        self.assertEqual(evidence["chain_stage"], "upstream")
+        self.assertGreaterEqual(evidence["business_chain_revenue_ratio"], 0.29)
+        self.assertIn("光刻及其他混合气体", evidence["chain_matches"][0]["specific_hits"])
+
+    def test_web_chain_fallback_marks_unverified_semiconductor_position(self) -> None:
+        reports = {
+            "finance_data": '<!-- moda_metrics: {"industry": "电子化学品"} -->',
+            "business_data": '<!-- moda_business: {"main_business": "特种气体", "business_items": ["特种气体"]} -->',
+            "web_research": '<!-- moda_web_research: {"web_subfactor_results": {"F1.upstream": {"status": "网络命中（未核验）", "reason": "主营电子特气属于半导体关键气体供应链", "signals": ["电子特气", "关键供应链"]}}} -->',
+        }
+        evidence = evidence_module.build_evidence("688268", "华特气体", reports)
+        self.assertEqual(evidence["chain_name"], "半导体电子特气产业链")
+        self.assertEqual(evidence["chain_stage"], "upstream")
+        self.assertTrue(evidence["chain_partial"])
+        self.assertIn("SearXNG + DuckDuckGo MCP", evidence["metric_sources"]["chain_name"])
 
     def test_unconfirmed_business_revenue_caps_chain_match(self) -> None:
         data = full_evidence()

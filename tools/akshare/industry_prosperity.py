@@ -34,6 +34,27 @@ METRICS = {
     "roeYoy": "ROE增长率",
     "netProfitYoy": "净利润增长率",
 }
+INDUSTRY_WEB_SITE_GROUP = "(site:cninfo.com.cn OR site:sse.com.cn OR site:szse.cn OR site:bse.cn OR site:eastmoney.com OR site:10jqka.com.cn OR site:stcn.com OR site:cs.com.cn OR site:cnstock.com OR site:yicai.com OR site:cls.cn OR site:jrj.com.cn)"
+INDUSTRY_WEB_LAYERS = {
+    "financial": {
+        "label": "财务确认",
+        "terms": ("营收增长", "利润增长", "盈利改善", "ROE提升", "业绩改善", "景气改善", "业绩拐点", "复苏", "营收下滑", "利润下滑", "亏损扩大", "ROE下降", "景气下行", "需求疲软"),
+        "positive": ("营收增长", "利润增长", "盈利改善", "ROE提升", "业绩改善", "景气改善", "业绩拐点", "复苏"),
+        "negative": ("营收下滑", "利润下滑", "亏损扩大", "ROE下降", "景气下行", "需求疲软"),
+    },
+    "supply": {
+        "label": "供需先行",
+        "terms": ("订单增长", "价格上涨", "库存下降", "供不应求", "产能利用率提升", "排产饱满", "涨价", "订单下降", "价格下跌", "库存上升", "供过于求", "产能过剩", "需求下滑"),
+        "positive": ("订单增长", "价格上涨", "库存下降", "供不应求", "产能利用率提升", "排产饱满", "涨价"),
+        "negative": ("订单下降", "价格下跌", "库存上升", "供过于求", "产能过剩", "需求下滑"),
+    },
+    "market": {
+        "label": "市场验证",
+        "terms": ("行业指数上涨", "跑赢", "资金流入", "成交放量", "强势", "反弹", "估值修复", "行业指数下跌", "跑输", "资金流出", "成交萎缩", "弱势", "破位", "估值压缩"),
+        "positive": ("行业指数上涨", "跑赢", "资金流入", "成交放量", "强势", "反弹", "估值修复"),
+        "negative": ("行业指数下跌", "跑输", "资金流出", "成交萎缩", "弱势", "破位", "估值压缩"),
+    },
+}
 
 
 def _number(value: Any) -> float | None:
@@ -44,6 +65,103 @@ def _number(value: Any) -> float | None:
         return float(text)
     except ValueError:
         return None
+
+
+def _industry_web_queries(name: str, industry: str) -> dict[str, str]:
+    subject = " ".join(item for item in (name, industry) if item).strip()
+    return {
+        key: f"{subject} {layer['label']} {' '.join(layer['terms'][:7])} {INDUSTRY_WEB_SITE_GROUP}"
+        for key, layer in INDUSTRY_WEB_LAYERS.items()
+    }
+
+
+def _web_layer_status(rows: list[dict[str, Any]], layer: dict[str, Any]) -> dict[str, Any]:
+    positive = sum(1 for row in rows if row.get("positive_hits"))
+    negative = sum(1 for row in rows if row.get("negative_hits"))
+    domains = {str(row.get("domain") or "") for row in rows if row.get("domain")}
+    if len(rows) < 2 or len(domains) < 2:
+        status = "需人工确认"
+    elif positive >= 2 and positive > negative:
+        status = "上行"
+    elif negative >= 2 and negative > positive:
+        status = "走弱"
+    else:
+        status = "中性"
+    return {
+        "status": status,
+        "evidence_count": len(rows),
+        "domain_count": len(domains),
+        "positive_count": positive,
+        "negative_count": negative,
+        "evidence": rows[:6],
+        "reason": f"网络旁证正向 {positive} 条、负向 {negative} 条、独立域名 {len(domains)} 个；仅作未核验交叉验证",
+    }
+
+
+def collect_web_signal(name: str, industry: str, timeout: float = 10) -> dict[str, Any]:
+    """Collect unverified industry-side corroboration without changing the structured score."""
+    from tools.scoring import web_research
+
+    queries = _industry_web_queries(name, industry)
+    layers: dict[str, Any] = {}
+    errors: list[str] = []
+    for key, query in queries.items():
+        layer = INDUSTRY_WEB_LAYERS[key]
+        used, rows, query_errors = web_research._search("auto", query, timeout)
+        errors.extend(f"{key}:{item}" for item in query_errors)
+        relevant: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for rank, row in enumerate(rows, 1):
+            url = str(row.get("url") or "")
+            if not url or url in seen:
+                continue
+            text = " ".join(str(row.get(field) or "") for field in ("title", "snippet"))
+            positive_hits = [term for term in layer["positive"] if term in text]
+            negative_hits = [term for term in layer["negative"] if term in text]
+            if not positive_hits and not negative_hits:
+                continue
+            seen.add(url)
+            fetch_status, content = web_research._fetch_page(url, min(timeout, 5)) if rank <= 3 else ("not_fetched", "")
+            full_text = f"{text} {content}"
+            positive_hits = [term for term in layer["positive"] if term in full_text]
+            negative_hits = [term for term in layer["negative"] if term in full_text]
+            domain = web_research._domain(url)
+            role, tier = web_research._source_role(domain)
+            relevant.append({
+                "title": row.get("title", ""),
+                "url": url,
+                "domain": domain,
+                "provider": used,
+                "query": query,
+                "fetch_status": fetch_status,
+                "source_role": role,
+                "source_tier": tier,
+                "positive_hits": positive_hits,
+                "negative_hits": negative_hits,
+            })
+        layers[key] = {"label": layer["label"], **_web_layer_status(relevant, layer)}
+    statuses = [item.get("status") for item in layers.values() if item.get("status") not in {"不可用", "需人工确认"}]
+    positive = sum(item in {"上行", "改善"} for item in statuses)
+    negative = sum(item == "走弱" for item in statuses)
+    if positive >= 2 and layers.get("financial", {}).get("status") == "上行":
+        overall = "上行"
+    elif positive >= 2:
+        overall = "改善"
+    elif negative >= 2:
+        overall = "走弱"
+    elif statuses:
+        overall = "中性"
+    else:
+        overall = "不可用"
+    return {
+        "status": overall,
+        "coverage": "完整" if len(layers) == 3 and all(item.get("status") not in {"不可用", "需人工确认"} for item in layers.values()) else "部分" if any(item.get("evidence_count") for item in layers.values()) else "不可用",
+        "layers": layers,
+        "queries": queries,
+        "errors": errors,
+        "provider": ",".join(sorted({row.get("provider") for item in layers.values() for row in item.get("evidence", []) if row.get("provider")})) or "none",
+        "conflicts": [f"网络旁证{key}层出现正负信号并存" for key, item in layers.items() if item.get("positive_count", 0) and item.get("negative_count", 0)],
+    }
 
 
 def parse_legulegu_metric(html: str, metric_code: str) -> dict[str, Any]:
@@ -357,6 +475,7 @@ def collect(
     code: str,
     industry: str,
     *,
+    name: str = "",
     refresh: bool = False,
     cache_path: Path = CACHE_PATH,
     now: datetime | None = None,
@@ -379,6 +498,8 @@ def collect(
     secondary_complete = market_complete if service_like else market_complete and supply_complete
     coverage = "完整" if usable and mapping.get("status") == "已验证" and financial_complete and secondary_complete else "部分" if usable and parent else "不可用"
     periods = [item.get("period") for item in financial.get("values", {}).values() if item.get("period")]
+    web_signal = collect_web_signal(name or code, industry)
+    all_conflicts = [*conflicts, *web_signal.get("conflicts", [])]
     return {
         "industry_mapping": mapping,
         "industry_prosperity_status": overall,
@@ -388,8 +509,10 @@ def collect(
         "industry_supply_signal": supply,
         "industry_market_signal": market,
         "industry_capex_signal": "不可用",
-        "industry_prosperity_conflicts": conflicts,
-        "industry_prosperity_sources": ["乐咕乐股/申万行业中位数(B级)", "AKShare/申万行业指数", "AKShare/商品供需与宏观"],
+        "industry_prosperity_conflicts": all_conflicts,
+        "industry_prosperity_sources": ["乐咕乐股/申万行业中位数(B级)", "AKShare/申万行业指数", "AKShare/商品供需与宏观", "SearXNG/DuckDuckGo 中国金融网站（未核验旁证）"],
+        "industry_web_signal": web_signal,
+        "industry_cycle_cold": overall == "走弱" if coverage == "完整" else None,
         "industry_prosperity_checked_date": record.get("checked_date"),
         "industry_prosperity_cache_hit": record.get("cache_hit", False),
         "industry_prosperity_cache_status": record.get("status"),
@@ -437,6 +560,7 @@ def build_report(code: str, name: str, data: dict[str, Any]) -> str:
         f"| 财务确认 | {financial.get('status', '不可用')} | 可用 {financial.get('available_metrics', 0)}/6；正向当期 {financial.get('current_positive', 0)}；正向边际 {financial.get('delta_positive', 0)} |",
         f"| 供需先行 | {supply.get('status', '不可用')} | 商品 {supply.get('commodity') or '未匹配'}；证据 {supply.get('evidence_count') or 0} 类；PMI {supply.get('manufacturing_pmi', '需人工确认')} |",
         f"| 市场验证 | {market.get('status', '不可用')} | 20日相对沪深300 {pct(market.get('relative_to_csi300_20d'))}；成交活跃比 {ratio(market.get('turnover_activity_ratio'))}；5日资金流 {market.get('fund_flow_5d') if market.get('fund_flow_5d') is not None else '需人工确认'} |",
+        f"| 网络旁证 | {(data.get('industry_web_signal') or {}).get('status', '不可用')} | 覆盖 {(data.get('industry_web_signal') or {}).get('coverage', '不可用')}；后端 {(data.get('industry_web_signal') or {}).get('provider', 'none')}；仅作未核验交叉验证 |",
         "",
         "## 行业财务中位数",
         "",
@@ -465,6 +589,11 @@ def build_report(code: str, name: str, data: dict[str, Any]) -> str:
         "",
         "- " + ("；".join(data.get("industry_prosperity_conflicts") or []) or "未发现已覆盖指标之间的明确冲突。"),
         "- 行业景气仅交叉验证 F1、F4、F5 的确信度，不独立加分，不替代公司公告和财报。",
+        "- 网络旁证按财务确认、供需先行、市场验证三层搜索；至少两个独立域名且同向才显示层面判断，不能替代结构化数据。",
+        "- 网络三层明细：" + ("；".join(
+            f"{item.get('label', key)}={item.get('status', '需人工确认')}（正向{item.get('positive_count', 0)}/负向{item.get('negative_count', 0)}，域名{item.get('domain_count', 0)}）"
+            for key, item in (data.get('industry_web_signal') or {}).get('layers', {}).items()
+        ) if (data.get('industry_web_signal') or {}).get('layers') else "需人工确认"),
         "- 服务业或导入期产业缺少库存、价格和产能数据时，不按负面处理。",
         "",
     ]
@@ -483,7 +612,7 @@ def main() -> None:
     code = args.stock.strip()
     if len(code) != 6 or not code.isdigit():
         parser.error("--stock must be a 6-digit A-share code")
-    data = collect(code, args.industry, refresh=args.refresh)
+    data = collect(code, args.industry, name=args.name, refresh=args.refresh)
     OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_BASE / f"{code}.md"
     path.write_text(build_report(code, args.name or code, data), encoding="utf-8")

@@ -250,6 +250,7 @@ def _industry_prosperity_analysis(evidence: dict[str, Any]) -> list[str]:
     financial = evidence.get("industry_financial_signal") if isinstance(evidence.get("industry_financial_signal"), dict) else {}
     supply = evidence.get("industry_supply_signal") if isinstance(evidence.get("industry_supply_signal"), dict) else {}
     market = evidence.get("industry_market_signal") if isinstance(evidence.get("industry_market_signal"), dict) else {}
+    web_signal = evidence.get("industry_web_signal") if isinstance(evidence.get("industry_web_signal"), dict) else {}
     conflicts = evidence.get("industry_prosperity_conflicts") if isinstance(evidence.get("industry_prosperity_conflicts"), list) else []
 
     def pct(value: Any) -> str:
@@ -274,9 +275,15 @@ def _industry_prosperity_analysis(evidence: dict[str, Any]) -> list[str]:
         f"| 财务确认 | {financial.get('status', '不可用')} | 可用 {financial.get('available_metrics', 0)}/6；当期正向 {financial.get('current_positive', 0)}；边际正向 {financial.get('delta_positive', 0)} |",
         f"| 供需先行 | {supply.get('status', '不可用')} | 商品 {supply.get('commodity') or '未匹配'}；证据 {supply.get('evidence_count') or 0} 类；PPI 同比 {supply.get('ppi_yoy', '需人工确认')} |",
         f"| 市场验证 | {market.get('status', '不可用')} | 20日相对沪深300 {pct(market.get('relative_to_csi300_20d'))}；成交活跃比 {ratio(market.get('turnover_activity_ratio'))} |",
+        f"| 网络旁证 | {web_signal.get('status', '不可用')} | 覆盖 {web_signal.get('coverage', '不可用')}；后端 {web_signal.get('provider', 'none')}；未核验，不独立改变状态 |",
         "",
         "- 冲突检查：" + ("；".join(conflicts) if conflicts else "未发现已覆盖指标之间的明确冲突。"),
         "- 来源边界：乐咕为 B 级聚合数据；雪球文章仅作 C 级方法线索，均不能单独确认产业景气。",
+        "- 网络旁证分为财务确认、供需先行、市场验证三层；只用于验证结构化判断，不替代财报、公告或行业数据。",
+        "- 网络三层明细：" + ("；".join(
+            f"{item.get('label', key)}={item.get('status', '需人工确认')}（正向{item.get('positive_count', 0)}/负向{item.get('negative_count', 0)}，域名{item.get('domain_count', 0)}）"
+            for key, item in (web_signal.get('layers') or {}).items()
+        ) if web_signal.get('layers') else "需人工确认"),
     ]
 
 

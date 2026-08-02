@@ -16,7 +16,7 @@
 | 社交热榜/个股讨论 | 6 个平台公开接口 + 雪球/东方财富公开接口 + SearXNG/DuckDuckGo MCP | 热榜 5 分钟缓存；讨论直接接口优先，搜索结果标记未核验 |
 | 商品供需 | AKShare | 现货、基差、库存至少两类同向 |
 | 宏观政策 | LPR、PMI、PPI、gov.cn JSON | 只作背景，不因单条标题加分 |
-| 搜索补缺 | SearXNG / DuckDuckGo MCP | 对 F1-F5 缺口定向查询；标题、摘要或正文命中即可形成未核验评分 |
+| 搜索补缺 | SearXNG / DuckDuckGo MCP / 公共 DuckDuckGo HTML | 对 F1-F5 缺口定向查询；额外覆盖巨潮、交易所、东方财富、同花顺及主流财经媒体；标题、摘要或正文命中仍只形成未核验线索 |
 
 ## hot-money 评估
 

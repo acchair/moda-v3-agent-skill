@@ -473,7 +473,7 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
             keys.append("product_price_to_history_high")
             score += 1.25 if product_cycle < 0.30 else 0.875 if product_cycle <= 0.50 else 0.375 if product_cycle <= 0.70 else 0
             details.append(f"产品价格/历史高点 {product_cycle:.1%}")
-        items.append(_subfactor(evidence, "price_position", "价格分位", score, 2.5, "；".join(details), keys, partial=len(keys) < 2))
+        items.append(_subfactor(evidence, "price_position", "价格分位（逆向）", score, 2.5, "逆向评分：价格位置越低越有利；" + "；".join(details), keys, partial=len(keys) < 2))
 
     pe = _number(evidence.get("pe_ttm"))
     peer = _number(evidence.get("peer_pe_ttm_median"))
@@ -496,7 +496,7 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
                 details.append(f"同行中位数 {peer:.2f}")
         if pb is not None:
             keys.append("pb")
-            comparison_scores.append(2 if 0 < pb < 2 else 1 if 0 < pb < 3 else 0)
+            comparison_scores.append(2 if 0 < pb <= 1 else 1 if pb <= 1.5 else 0.5 if pb <= 2 else 0)
             details.append(f"PB {pb:.2f}")
         if pe_percentile is not None:
             keys.append("pe_percentile_5y")
@@ -516,7 +516,7 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
         if has_pe_component != has_pb_component:
             score = min(score, 1.0)
         items.append(_subfactor(
-            evidence, "valuation", "PE/PB 相对位置", score, 2, "；".join(details), keys,
+            evidence, "valuation", "PE/PB 相对位置（逆向）", score, 2, "逆向评分：估值分位越低越有利；" + "；".join(details), keys,
             partial=len(comparison_scores) < 2 or (pe_percentile is None and pb_percentile is None),
         ))
 
@@ -533,7 +533,7 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
         survival_ok = f3_score >= 8 and evidence.get("st_risk") is not True
         attention_score = 1 if heat is not None and heat <= 0.20 else 0.75 if heat is not None and heat <= 0.40 else 0.25 if heat is not None and heat <= 0.60 else 0
         score = (attention_score + (1 if industry_cold else 0)) if survival_ok else 0
-        reason = f"关注热度 {heat:.2f}" if heat is not None else "个股热度缺失"
+        reason = f"逆向评分：关注热度越低越有利；当前 {heat:.2f}" if heat is not None else "逆向评分：个股热度缺失"
         reason += f"；行业周期 {'处于冰点' if industry_cold else prosperity or '未确认冰点'}"
         if not survival_ok:
             reason += "；F3 生存门槛未通过，冷门不加分"
@@ -558,14 +558,18 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
         profit = values.get("profit_yoy")
         revenue_delta = values.get("revenue_yoy_delta")
         profit_delta = values.get("profit_yoy_delta")
+        order_growth = _number(evidence.get("order_growth"))
         cashflow = _number(evidence.get("operating_cashflow"))
         if cashflow is not None:
             keys.append("operating_cashflow")
             details.append(f"经营现金流 {'为正' if cashflow > 0 else '为负'}")
         early_reversal = revenue is not None and revenue > 0 and profit is not None and profit < 0 and ((profit_delta or 0) > 0 or (cashflow or 0) > 0)
         confirmed_reversal = revenue is not None and revenue > 0 and profit is not None and profit > 0 and ((revenue_delta or 0) > 0 or (profit_delta or 0) > 0)
-        improving_count = sum(value > 0 for value in values.values())
-        inflection_score = 2 if early_reversal or confirmed_reversal else 1 if improving_count >= 2 or evidence.get("supply_tightening") is True else 0
+        improving_count = sum(
+            value > 0 for key, value in values.items() if key in {"revenue_yoy_delta", "profit_yoy_delta"}
+        )
+        supply_improving = evidence.get("supply_tightening") is True and (order_growth is None or order_growth > 0)
+        inflection_score = 2 if early_reversal or confirmed_reversal else 1 if improving_count >= 2 or supply_improving else 0
         if early_reversal:
             details.append("营收转正、利润仍弱但造血或利润趋势改善，符合周期底部前兆")
         elif confirmed_reversal:
@@ -580,7 +584,7 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
         conflict = bool(evidence.get("industry_prosperity_conflicts")) or industry_status == "走弱"
         items.append(_subfactor(
             evidence, "inflection", "业绩拐点", inflection_score, 2,
-            "；".join(details), keys,
+            "反转确认：低位本身不等于反转；" + "；".join(details), keys,
             partial=len(keys) < 4 or conflict or evidence.get("industry_prosperity_coverage") not in (None, "完整"),
         ))
 
@@ -620,7 +624,7 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
         if prosperity:
             gap_details.append(f"行业景气 {prosperity}（只影响确信度）")
         if gap_score == 0:
-            gap_details.append("低关注、强产业、公司改善和生存门槛未同时满足")
+            gap_details.append("低关注、强产业、公司改善和生存门槛未同时满足；低位只提供赔率，不替代反转证据")
         industry_conflict = bool(evidence.get("industry_prosperity_conflicts")) or prosperity == "走弱"
         items.append(_subfactor(
             evidence, "expectation_gap", "预期差", gap_score, 1.5,

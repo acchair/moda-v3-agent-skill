@@ -35,9 +35,17 @@ AUTHORITY_DOMAINS = (
     "stats.gov.cn", "miit.gov.cn", "ndrc.gov.cn", "customs.gov.cn",
 )
 STATUTORY_DOMAINS = ("cninfo.com.cn", "sse.com.cn", "szse.cn", "bse.cn")
-CLUE_ONLY_DOMAINS = (
-    "xueqiu.com", "eastmoney.com", "gw.com.cn", "dzh.com.cn",
+FINANCE_MEDIA_DOMAINS = (
+    "eastmoney.com", "10jqka.com.cn", "stcn.com", "cs.com.cn", "cnstock.com",
+    "yicai.com", "cls.cn", "jrj.com.cn",
 )
+CLUE_ONLY_DOMAINS = (
+    "xueqiu.com", "guba.eastmoney.com", "caifuhao.eastmoney.com", "gw.com.cn", "dzh.com.cn",
+)
+CHINA_FINANCE_SITE_GROUPS = {
+    "disclosure": "(site:cninfo.com.cn OR site:sse.com.cn OR site:szse.cn OR site:bse.cn)",
+    "market": "(site:eastmoney.com OR site:10jqka.com.cn OR site:stcn.com OR site:cs.com.cn OR site:cnstock.com OR site:yicai.com OR site:cls.cn OR site:jrj.com.cn)",
+}
 SUPPLY_CATEGORIES = {
     "price": ("价格", "涨价", "降价", "报价", "基差"),
     "inventory": ("库存", "仓单", "去库存"),
@@ -129,7 +137,36 @@ def _source_role(domain: str) -> tuple[str, str]:
         return "线索来源", "C"
     if _is_authority(domain):
         return "权威来源", "A"
+    if _matches_domain(domain, FINANCE_MEDIA_DOMAINS):
+        return "财经媒体", "B"
     return "一般来源", "B"
+
+
+def _search_rank(row: dict[str, Any]) -> tuple[int, int]:
+    """Prefer disclosure and mainstream financial sources without trusting them automatically."""
+    role, tier = _source_role(_domain(str(row.get("url") or "")))
+    priority = {
+        ("法定信息披露", "A"): 0,
+        ("权威来源", "A"): 1,
+        ("财经媒体", "B"): 2,
+        ("一般来源", "B"): 3,
+        ("线索来源", "C"): 4,
+    }.get((role, tier), 5)
+    return priority, int(row.get("rank") or 999)
+
+
+def _prioritize_search_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=_search_rank)
+
+
+def _china_finance_query(key: str, name: str, code: str, context: str) -> str:
+    short_context = " ".join(context.split()[:12])
+    market_keys = {
+        "F1.era_track", "F1.supply_gap", "F1.capex_wave",
+        "F5.price_position", "F5.coldness", "F5.inflection", "F5.expectation_gap",
+    }
+    site_group = CHINA_FINANCE_SITE_GROUPS["market"] if key in market_keys else CHINA_FINANCE_SITE_GROUPS["disclosure"]
+    return f"{name} {code} {short_context} {site_group} {key.replace('.', ' ')}".strip()
 
 
 def _confirmable(row: dict[str, Any]) -> bool:
@@ -174,7 +211,7 @@ def _searxng_search(base_url: str, query: str, timeout: float) -> list[dict[str,
     )
     response.raise_for_status()
     rows = response.json().get("results", [])
-    return [
+    return _prioritize_search_rows([
         {
             "title": str(row.get("title") or "").strip(),
             "url": str(row.get("url") or "").strip(),
@@ -182,9 +219,9 @@ def _searxng_search(base_url: str, query: str, timeout: float) -> list[dict[str,
             "date": str(row.get("publishedDate") or "").strip(),
             "engine": ",".join(row.get("engines") or [str(row.get("engine") or "")]),
         }
-        for row in rows[:8]
+        for row in rows
         if row.get("url")
-    ]
+    ])[:8]
 
 
 def _parse_ddg_text(text: str) -> list[dict[str, Any]]:
@@ -193,10 +230,10 @@ def _parse_ddg_text(text: str) -> list[dict[str, Any]]:
         r"(?:\n\s*(?:\*\*)?Summary:(?:\*\*)?\s*(.*?))?(?=\n\s*(?:##\s*)?\d+\.|\Z)",
         re.S,
     )
-    return [
+    return _prioritize_search_rows([
         {"title": title.strip(), "url": url.strip(), "snippet": (snippet or "").strip(), "date": "", "engine": "DuckDuckGo"}
         for title, url, snippet in pattern.findall(text)
-    ]
+    ])
 
 
 def _ddg_mcp_search(url: str, query: str, timeout: float) -> list[dict[str, Any]]:
@@ -248,7 +285,7 @@ def _duckduckgo_html_search(query: str, timeout: float) -> list[dict[str, Any]]:
         rows.append({"title": title, "url": href, "snippet": "", "date": "", "engine": "DuckDuckGo HTML"})
         if len(rows) >= 8:
             break
-    return rows
+    return _prioritize_search_rows(rows)
 
 
 def _search(provider: str, query: str, timeout: float) -> tuple[str, list[dict[str, Any]], list[str]]:
@@ -289,10 +326,14 @@ def _gap_relevant(row: dict[str, Any], key: str, code: str, name: str, context: 
     text = " ".join(str(row.get(field) or "") for field in ("title", "snippet"))
     if name and name in text or code and code in text:
         return True
+    tokens = [token for token in re.split(r"[\s、,，/|]+", context) if len(token) >= 2 and not token.isdigit()]
+    rule = RULES.get(key, {})
+    terms = tuple(rule.get("positive", ())) + tuple(rule.get("negative", ()))
+    context_hit = any(token in text for token in tokens)
+    rule_hit = any(term and term.lower() in text.lower() for term in terms)
     if key.startswith("F1."):
-        tokens = [token for token in re.split(r"[\s、,，/|]+", context) if len(token) >= 2 and not token.isdigit()]
-        return any(token in text for token in tokens)
-    return False
+        return context_hit or rule_hit
+    return context_hit or rule_hit
 
 
 def _collect_gap_targets(code: str, name: str, context: str, targets: list[dict[str, Any]],
@@ -309,6 +350,7 @@ def _collect_gap_targets(code: str, name: str, context: str, targets: list[dict[
             continue
         target_rows: list[dict[str, Any]] = []
         target_queries = queries_for(key, name, code, context)
+        target_queries.append(_china_finance_query(key, name, code, context))
         target_errors: list[str] = []
         seen: set[str] = set()
         for query in target_queries:
@@ -610,6 +652,8 @@ def collect(code: str, name: str, context: str, provider: str | None = None, tim
         ("specialized", f"site:miit.gov.cn {name} 专精特新 单项冠军"),
         ("capex", f"site:stats.gov.cn {short_context} 固定资产投资 投资增长 产能"),
         ("capex", f"site:miit.gov.cn OR site:ndrc.gov.cn {short_context} 投资 扩产 设备更新"),
+        ("finance_disclosure", f"{name} {short_context} {CHINA_FINANCE_SITE_GROUPS['disclosure']} 年报 季报 公告 主营业务"),
+        ("finance_market", f"{name} {short_context} {CHINA_FINANCE_SITE_GROUPS['market']} 订单 价格 产能 估值"),
     ]
     queries = [query for _, query in query_specs]
     results: list[dict[str, Any]] = []

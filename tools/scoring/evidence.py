@@ -143,7 +143,11 @@ def _chain_match(evidence: dict[str, Any]) -> None:
     concept_context = " ".join(str(item) for item in evidence.get("concepts", [])[:30]).lower()
     if not context.strip():
         return
-    best: tuple[float, str, str] | None = None
+    candidates: list[dict[str, Any]] = []
+    specific_terms = (
+        "电子特气", "半导体特气", "光刻气", "光刻及其他混合气体",
+        "氢化物", "氮氧化合物", "半导体材料",
+    )
     for chain in raw.get("chains", []):
         chain_name = str(chain.get("name", ""))
         aliases = [str(item).lower() for item in chain.get("aliases", [])]
@@ -159,20 +163,43 @@ def _chain_match(evidence: dict[str, Any]) -> None:
             if primary_score <= 0:
                 continue
             score = primary_score + 0.25 * sum(item and item in concept_context and item not in context for item in keywords)
-            candidate = (score, chain_name, stage)
-            if score > 0 and (best is None or candidate[0] > best[0]):
-                best = candidate
+            keyword_hits = [item for item in keywords if item and item in context]
+            specific_hits = [term for term in specific_terms if term.lower() in context and term.lower() in keywords]
+            specificity = len(specific_hits) * 2 + len(keyword_hits)
+            if any(term in chain_name.lower() for term in ("半导体", "电子特气")) and specific_hits:
+                score += 3
+                specificity += 3
+            candidates.append({
+                "score": score,
+                "chain_name": chain_name,
+                "stage": stage,
+                "specificity": specificity,
+                "keyword_hits": keyword_hits,
+                "specific_hits": specific_hits,
+            })
+    candidates.sort(key=lambda item: (item["score"], item["specificity"], len(item["specific_hits"])), reverse=True)
+    best = candidates[0] if candidates else None
     if best:
         source = "chains.yaml"
-        _set(evidence, "chain_stage", best[2], source)
-        _set(evidence, "chain_name", best[1], source)
-        _set(evidence, "business_chain_match", min(1.0, best[0] / 3), source)
+        _set(evidence, "chain_stage", best["stage"], source)
+        _set(evidence, "chain_name", best["chain_name"], source)
+        _set(evidence, "business_chain_match", min(1.0, best["score"] / 3), source)
+        evidence["chain_matches"] = [
+            {
+                "chain_name": item["chain_name"],
+                "stage": item["stage"],
+                "score": round(item["score"], 2),
+                "specific_hits": item["specific_hits"],
+                "keyword_hits": item["keyword_hits"][:8],
+            }
+            for item in candidates[:5]
+        ]
         breakdown = evidence.get("business_breakdown") if isinstance(evidence.get("business_breakdown"), list) else []
         product_rows = [item for item in breakdown if item.get("category") == "按产品分类"]
         revenue_rows = product_rows or [item for item in breakdown if item.get("category") == "按行业分类"]
         matched_ratio = 0.0
-        chain = next((item for item in raw.get("chains", []) if str(item.get("name")) == best[1]), {})
-        stage_data = chain.get(best[2], {}) or {}
+        chain = next((item for item in raw.get("chains", []) if str(item.get("name")) == best["chain_name"]), {})
+        stage_data = chain.get(best["stage"], {}) or {}
         revenue_terms = [str(item).lower() for item in stage_data.get("keywords", [])]
         for row in revenue_rows:
             item_name = str(row.get("item") or "").lower()
@@ -182,11 +209,12 @@ def _chain_match(evidence: dict[str, Any]) -> None:
         if matched_ratio > 0:
             _set(evidence, "business_chain_revenue_ratio", min(1.0, matched_ratio), "EastMoney/F10")
         revenue_confirmed = matched_ratio >= 0.30
-        partial = best[0] < 3 or not revenue_confirmed
+        partial = best["score"] < 3 or not revenue_confirmed
         evidence["chain_partial"] = partial
         evidence["business_match_partial"] = partial
         ratio_text = f"，主营收入支持 {matched_ratio:.1%}" if matched_ratio > 0 else "，缺少收入占比确认"
-        evidence["business_match_reason"] = f"匹配 {best[1]}，位置为 {best[2]}{ratio_text}"
+        specific_text = f"；具体命中：{'、'.join(best['specific_hits'])}" if best["specific_hits"] else ""
+        evidence["business_match_reason"] = f"匹配 {best['chain_name']}，位置为 {best['stage']}{ratio_text}{specific_text}"
 
 
 def _chokepoint_match(evidence: dict[str, Any]) -> None:
@@ -272,8 +300,15 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
 
     prosperity = evidence.get("industry_prosperity_status")
     coverage = evidence.get("industry_prosperity_coverage")
+    web_prosperity = evidence.get("industry_web_signal") if isinstance(evidence.get("industry_web_signal"), dict) else {}
     if prosperity:
         evidence["industry_prosperity_reason"] = f"行业景气 {prosperity}（{coverage or '覆盖未知'}）"
+        if web_prosperity.get("status"):
+            evidence["industry_prosperity_reason"] += f"；网络旁证 {web_prosperity['status']}（{web_prosperity.get('coverage', '覆盖未知')}，未核验）"
+        for conflict in web_prosperity.get("conflicts", []) if isinstance(web_prosperity.get("conflicts"), list) else []:
+            evidence.setdefault("industry_prosperity_conflicts", [])
+            if conflict not in evidence["industry_prosperity_conflicts"]:
+                evidence["industry_prosperity_conflicts"].append(conflict)
         if prosperity in {"走弱", "不可用"} or coverage != "完整":
             evidence["track_partial"] = True
 
@@ -343,6 +378,27 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
         _set(evidence, "specialized_strength", web_specialized.get("strength"), SOURCE_LABELS["web_research"], overwrite=True)
         evidence["specialized_reason"] = web_specialized.get("reason", "权威网页确认资质")
         evidence["specialized_partial"] = False
+
+    web_results = evidence.get("web_subfactor_results") if isinstance(evidence.get("web_subfactor_results"), dict) else {}
+    web_chain_hits: list[str] = []
+    for key in ("F1.upstream", "F4.business_match", "F4.profit_position", "F3.leadership"):
+        result = web_results.get(key) if isinstance(web_results, dict) else None
+        if not isinstance(result, dict) or result.get("status") != "网络命中（未核验）":
+            continue
+        text = " ".join([
+            str(result.get("reason") or ""),
+            " ".join(str(item) for item in result.get("signals", [])),
+        ])
+        if any(term in text for term in ("电子特气", "半导体特气", "光刻气", "半导体材料", "关键气体")):
+            web_chain_hits.append(key)
+    if web_chain_hits and (not evidence.get("chain_name") or evidence.get("chain_partial") is True):
+        _set(evidence, "chain_name", "半导体电子特气产业链", SOURCE_LABELS["web_research"], overwrite=True)
+        _set(evidence, "chain_stage", "upstream", SOURCE_LABELS["web_research"], overwrite=True)
+        _set(evidence, "business_chain_match", 0.75, SOURCE_LABELS["web_research"], overwrite=True)
+        evidence["chain_partial"] = True
+        evidence["business_match_partial"] = True
+        evidence["business_match_reason"] = "网络搜索命中半导体电子特气关键供应链线索，主营收入占比仍需披露确认"
+        evidence["web_chain_fallback"] = True
 
     promotion_hits = set(str(item) for item in evidence.get("promotional_keyword_hits", []))
     promotion_hits.update(str(item) for item in evidence.get("discussion_promotion_hits", []))
