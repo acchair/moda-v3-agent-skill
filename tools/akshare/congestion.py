@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.daily_cache import load_daily_json, shanghai_now
+from tools.industry_aliases import aliases_for, normalize_industry
 
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "congestion"
 CACHE_PATH = ROOT / "knowledge" / "research" / "pipeline" / "cache" / "sw_congestion_daily.json"
@@ -30,7 +31,7 @@ def _token(now: datetime) -> str:
 
 
 def _normalize(value: Any) -> str:
-    return re.sub(r"[\s行业ⅠⅡⅢIVV]+", "", str(value or "")).replace("其他", "")
+    return normalize_industry(str(value or ""))
 
 
 def _strength(value: float) -> str:
@@ -110,14 +111,16 @@ def _number(value: Any) -> float | None:
 
 
 def _map_industry(industry: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
-    value = _normalize(industry)
+    values = aliases_for(industry)
+    value = values[0] if values else _normalize(industry)
     if not value:
         return {"status": "不可用", "input": industry}
     candidates = []
     for row in rows:
         name = _normalize(row.get("sw_second_name"))
-        if name and (value == name or value in name or name in value):
-            candidates.append((min(len(value), len(name)), row))
+        if name and any(alias == name or alias in name or name in alias for alias in values):
+            matched = max((alias for alias in values if alias == name or alias in name or name in alias), key=len)
+            candidates.append((min(len(matched), len(name)), row))
     if not candidates:
         return {"status": "不可用", "input": industry}
     row = max(candidates, key=lambda item: item[0])[1]

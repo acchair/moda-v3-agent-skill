@@ -1,4 +1,4 @@
 interface:
   display_name: "莫大 V4 A 股分析"
   short_description: "运行五层评分、舆情风险与来源核验"
-  default_prompt: "Use $moda-v4 to analyze an A-share stock with the fixed five-factor report."
+  default_prompt: "Use $moda-v4 to analyze an A-share stock with the fixed six-factor report."

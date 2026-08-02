@@ -583,18 +583,37 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertNotIn("网页", catalyst.reason)
 
     def test_search_timeout_and_http_error_degrade_cleanly(self) -> None:
-        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": ""}, clear=False), \
+        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off"}, clear=False), \
              patch.object(web_research, "_searxng_search", side_effect=TimeoutError):
             used, rows, errors = web_research._search("auto", "test", 0.1)
         self.assertEqual(used, "none")
         self.assertEqual(rows, [])
         self.assertIn("searxng:TimeoutError", errors)
 
-        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": ""}, clear=False), \
+        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off"}, clear=False), \
              patch.object(web_research, "_searxng_search", side_effect=requests.HTTPError("403 Forbidden")):
             used, rows, errors = web_research._search("auto", "test", 0.1)
         self.assertEqual((used, rows), ("none", []))
         self.assertIn("searxng:HTTPError", errors)
+
+    def test_public_search_fallback_is_used_without_local_backend(self) -> None:
+        row = [{"title": "公开搜索结果", "url": "https://example.com", "snippet": "测试"}]
+        with patch.dict(os.environ, {"SEARXNG_URL": "", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "auto"}, clear=False), \
+             patch.object(web_research, "_duckduckgo_html_search", return_value=row):
+            used, rows, errors = web_research._search("auto", "test", 0.1)
+        self.assertEqual((used, rows), ("duckduckgo_html", row))
+        self.assertEqual(errors, [])
+
+    def test_industry_alias_maps_non_shenwan_label(self) -> None:
+        from tools.akshare import congestion, industry_prosperity
+
+        raw = {"sw_second": [{"行业名称": "软件开发", "行业代码": "801080", "上级行业": "计算机"}],
+               "sw_first": [{"行业名称": "计算机", "行业代码": "801080"}]}
+        mapped = industry_prosperity.map_industry("软件服务 / 行业应用软件", raw)
+        self.assertEqual(mapped["status"], "已验证")
+        self.assertEqual(mapped["sw_second_name"], "软件开发")
+        rows = [{"sw_second_name": "软件开发", "sw_second_code": "801080", "sw_first_code": "801080"}]
+        self.assertEqual(congestion._map_industry("软件服务", rows)["status"], "已验证")
 
     def test_duckduckgo_mcp_numbered_results_are_parsed(self) -> None:
         text = "Found 2 search results:\n\n1. 标题一\n   URL: https://example.com/a\n   Summary: 摘要一\n\n2. 标题二\n   URL: https://example.org/b\n   Summary: 摘要二\n"

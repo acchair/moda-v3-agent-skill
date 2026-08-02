@@ -24,7 +24,7 @@ PROMOTION_TERMS = ("必涨", "稳赚", "翻倍", "内部消息", "老师带", "�
 RUMOR_TERMS = ("谣言", "辟谣", "澄清", "虚假", "操纵", "荐股骗局", "杀猪盘")
 
 
-def _json_get(url: str, params: dict[str, Any] | None = None, timeout: float = 12) -> Any:
+def _json_get(url: str, params: dict[str, Any] | None = None, timeout: float = 5) -> Any:
     response = requests.get(url, params=params, headers={"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}, timeout=timeout)
     response.raise_for_status()
     return response.json()
@@ -76,7 +76,7 @@ def _eastmoney(code: str, count: int = 20) -> list[dict[str, Any]]:
     ]
     for url in urls:
         try:
-            response = requests.get(url, headers={"User-Agent": UA}, timeout=12)
+            response = requests.get(url, headers={"User-Agent": UA}, timeout=5)
             response.raise_for_status()
             html = response.text
         except Exception:
@@ -152,7 +152,7 @@ def _score(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def collect(code: str, name: str, timeout: float = 12) -> dict[str, Any]:
+def collect(code: str, name: str, timeout: float = 8) -> dict[str, Any]:
     structured: list[dict[str, Any]] = []
     xueqiu = _xueqiu(code, name)
     eastmoney = _eastmoney(code)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from pathlib import Path
 import time
@@ -15,14 +15,16 @@ ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "social_sentiment"
 CACHE_BASE = ROOT / "knowledge" / "research" / "pipeline" / "cache" / "social_hot"
 CACHE_TTL = 300
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+FETCH_TIMEOUT = 5
+COLLECT_DEADLINE = 35
+UA = "moda-v4-social/1.1"
 PROMOTION_TERMS = ("必涨", "稳赚", "翻倍", "内部消息", "老师带", "加群", "主力建仓", "最后上车", "股神", "跟单")
 RUMOR_TERMS = ("谣言", "辟谣", "澄清", "虚假", "操纵", "荐股骗局", "杀猪盘")
 
 DISCUSSION_SCRIPT = ROOT / "tools" / "scoring" / "stock_discussion.py"
 
 
-def _json(url: str, timeout: float = 10) -> dict:
+def _json(url: str, timeout: float = FETCH_TIMEOUT) -> dict:
     response = requests.get(url, headers={"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}, timeout=timeout)
     response.raise_for_status()
     return response.json()
@@ -111,9 +113,29 @@ def collect(code: str, name: str) -> dict:
         except Exception as exc:
             return platform, {"ok": False, "mode": "failed", "items": [], "error": f"{type(exc).__name__}: {str(exc)[:100]}"}
 
-    with ThreadPoolExecutor(max_workers=len(FETCHERS)) as executor:
-        for platform, result in executor.map(one, FETCHERS.items()):
-            results[platform] = result
+    started = time.monotonic()
+    executor = ThreadPoolExecutor(max_workers=len(FETCHERS))
+    futures = {executor.submit(one, item): item[0] for item in FETCHERS.items()}
+    try:
+        remaining = max(1.0, COLLECT_DEADLINE - (time.monotonic() - started))
+        for future in as_completed(futures, timeout=remaining):
+            platform = futures[future]
+            try:
+                result_platform, result = future.result()
+            except Exception as exc:
+                result_platform = platform
+                result = {"ok": False, "mode": "failed", "items": [], "error": f"{type(exc).__name__}: {str(exc)[:100]}"}
+            results[result_platform] = result
+    except TimeoutError:
+        for future, platform in futures.items():
+            if not future.done():
+                future.cancel()
+                results[platform] = {"ok": False, "mode": "timeout", "items": [], "error": "platform deadline exceeded"}
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    for platform in FETCHERS:
+        results.setdefault(platform, {"ok": False, "mode": "timeout", "items": [], "error": "platform deadline exceeded"})
 
     aliases = _aliases(name, code)
     mentions: dict[str, list[dict]] = {}
@@ -127,7 +149,7 @@ def collect(code: str, name: str) -> dict:
     rumor_hits = [term for term in RUMOR_TERMS if term in matched_text]
     rank_weight = sum(max(0.0, (51 - float(row.get("rank", 50))) / 50) for rows in mentions.values() for row in rows)
     social_heat = min(1.0, (platform_hits / 3) * 0.6 + min(0.4, rank_weight * 0.12)) if checked >= 3 else None
-    discussion = _collect_discussion(code, name)
+    discussion = _collect_discussion(code, name, timeout=max(2.0, COLLECT_DEADLINE - (time.monotonic() - started)))
     return {
         "social_platforms_checked": checked,
         "social_platforms_total": len(FETCHERS),
@@ -144,7 +166,7 @@ def collect(code: str, name: str) -> dict:
     }
 
 
-def _collect_discussion(code: str, name: str) -> dict:
+def _collect_discussion(code: str, name: str, timeout: float = 8) -> dict:
     try:
         import importlib.util
         spec = importlib.util.spec_from_file_location("moda_stock_discussion", DISCUSSION_SCRIPT)
@@ -152,7 +174,7 @@ def _collect_discussion(code: str, name: str) -> dict:
             raise ImportError("discussion module unavailable")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.collect(code, name)
+        return module.collect(code, name, timeout=timeout)
     except Exception as exc:
         return {
             "discussion_posts_total": 0,

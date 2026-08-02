@@ -16,7 +16,7 @@
 
 也可以手动安装：
 
-```powershell
+```bash
 git clone https://github.com/acchair/moda-v3-agent-skill.git
 cd moda-v3-agent-skill
 python -m pip install -r requirements.txt
@@ -33,7 +33,7 @@ python -m pip install -r requirements.txt
 
 Agent 会确认股票代码并运行基础流水线：
 
-```powershell
+```bash
 python tools/run_pipeline.py --stock 000001 --name 平安银行
 ```
 
@@ -112,14 +112,23 @@ python tools/export_skill_output.py --stock 000001 --name 平安银行 --input f
 | Codex | 读取 `SKILL.md` 与 `agents/openai.yaml` | 推荐 |
 | Claude Code | 将仓库放入 Skills 目录并读取 `SKILL.md` | 支持 |
 | Hermes Agent | 使用安装提示词并授予仓库访问权限 | 支持 |
-| OpenMinis | 在手机端下载 Agent 并安装本 Skill | 支持 |
+| OpenMinis | 在手机端安装本 Skill；使用 Python/Linux 沙箱执行数据模块 | 支持 |
 | 其他支持 `SKILL.md` 的 Agent | 复制仓库到对应 Skills 目录 | 支持 |
 
 ### 手机端
 
 [![OpenMinis](https://openminis.app/icon-dark.png)](https://openminis.app/)
 
-访问 [OpenMinis](https://openminis.app/) 下载手机端 Agent，即可安装并使用本 Skill。
+访问 [OpenMinis](https://openminis.app/) 下载手机端 Agent，即可安装并使用本 Skill。移动端不依赖 PowerShell、Windows 路径或本机浏览器登录状态；缺少本地搜索服务时自动降级到公共搜索，并保留来源状态。
+
+### 跨平台运行
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 tools/run_pipeline.py --stock 300085 --name 银之杰
+```
+
+Windows 使用 `python` 也可以。Apple/macOS 和 OpenMinis 使用 `python3`；Apple 移动端应将仓库放入 Agent 的工作区，由 Agent 的 Linux 沙箱执行。所有报告仍写入 `knowledge/research/`，不依赖 Windows 专用路径。
 
 ## 隐私与安全
 

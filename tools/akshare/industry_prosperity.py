@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.daily_cache import load_daily_json, shanghai_now
+from tools.industry_aliases import aliases_for, normalize_industry
 
 
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "industry_prosperity"
@@ -126,12 +127,12 @@ def fetch_legulegu_tables(timeout: float = 20) -> dict[str, Any]:
 
 
 def _normalize_industry(value: str) -> str:
-    return re.sub(r"[\s行业ⅠⅡⅢIVV]+", "", str(value)).replace("其他", "")
+    return normalize_industry(value)
 
 
 def map_industry(industry: str, raw: dict[str, Any]) -> dict[str, Any]:
     tokens = [item for item in re.split(r"[\s,/，、;；]+", industry) if len(item) >= 2]
-    normalized_tokens = [_normalize_industry(item) for item in tokens]
+    normalized_tokens = [alias for item in tokens for alias in aliases_for(item)]
     second = raw.get("sw_second") or []
     first = raw.get("sw_first") or []
 
@@ -139,9 +140,10 @@ def map_industry(industry: str, raw: dict[str, Any]) -> dict[str, Any]:
     for row in second:
         name = str(row.get("行业名称") or "")
         normalized = _normalize_industry(name)
-        for token, source_token in zip(normalized_tokens, tokens):
-            if token and normalized and (token == normalized or token in normalized or normalized in token):
-                candidates.append((min(len(token), len(normalized)), row, source_token))
+        for source_token in tokens:
+            for token in aliases_for(source_token):
+                if token and normalized and (token == normalized or token in normalized or normalized in token):
+                    candidates.append((min(len(token), len(normalized)), row, source_token))
     if candidates:
         _, row, source_token = max(candidates, key=lambda item: item[0])
         parent = str(row.get("上级行业") or "")

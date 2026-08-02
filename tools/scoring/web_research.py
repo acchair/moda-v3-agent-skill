@@ -13,7 +13,7 @@ import socket
 import sys
 import time
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from pypdf import PdfReader
@@ -224,6 +224,33 @@ def _ddg_mcp_search(url: str, query: str, timeout: float) -> list[dict[str, Any]
     return _parse_ddg_text(text)
 
 
+def _duckduckgo_html_search(query: str, timeout: float) -> list[dict[str, Any]]:
+    """Use DuckDuckGo's public HTML endpoint when no local service exists."""
+    response = requests.get(
+        "https://html.duckduckgo.com/html/",
+        params={"q": query, "kl": "cn-zh"},
+        headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    pattern = re.compile(
+        r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.I | re.S
+    )
+    rows: list[dict[str, Any]] = []
+    for href, title_html in pattern.findall(response.text):
+        title = re.sub(r"<[^>]+>", " ", title_html)
+        title = re.sub(r"\s+", " ", title).strip()
+        parsed = urlparse(href)
+        if parsed.hostname and parsed.hostname.endswith("duckduckgo.com"):
+            href = parse_qs(parsed.query).get("uddg", [""])[0] or href
+        if not href.startswith(("http://", "https://")):
+            continue
+        rows.append({"title": title, "url": href, "snippet": "", "date": "", "engine": "DuckDuckGo HTML"})
+        if len(rows) >= 8:
+            break
+    return rows
+
+
 def _search(provider: str, query: str, timeout: float) -> tuple[str, list[dict[str, Any]], list[str]]:
     errors: list[str] = []
     searxng = os.getenv("SEARXNG_URL", "").strip()
@@ -244,7 +271,16 @@ def _search(provider: str, query: str, timeout: float) -> tuple[str, list[dict[s
             errors.append("duckduckgo:no_results")
         except Exception as exc:
             errors.append(f"duckduckgo:{type(exc).__name__}")
-    if not searxng and not ddg:
+    public_search = os.getenv("MODA_PUBLIC_SEARCH", "auto").strip().lower()
+    if provider in {"auto", "duckduckgo"} and public_search not in {"0", "false", "off", "no"}:
+        try:
+            rows = _duckduckgo_html_search(query, timeout)
+            if rows:
+                return "duckduckgo_html", rows, errors
+            errors.append("duckduckgo_html:no_results")
+        except Exception as exc:
+            errors.append(f"duckduckgo_html:{type(exc).__name__}")
+    if not searxng and not ddg and not errors:
         errors.append("search_backend_not_configured")
     return "none", [], errors
 

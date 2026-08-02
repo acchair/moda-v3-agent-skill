@@ -10,15 +10,17 @@ description: 使用 moda-v4 六层框架分析中国 A 股，采集财务、主�
 1. 股票名称先用本地适配器解析代码；结果为空或有歧义时再明确说明，不猜代码。
 2. 在本目录运行：
 
-如果 `.env` 配置本地 DuckDuckGo MCP，先确保服务已启动：
+如果 `.env` 配置本地 DuckDuckGo MCP，可以先启动；没有本地搜索服务时，流水线会使用公共 DuckDuckGo HTML 回退：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File tools/start_ddg_search.ps1
+```bash
+python3 tools/start_ddg_search.py
 ```
 
-```powershell
+```bash
 python tools/run_pipeline.py --stock {六位代码} --name {股票名称}
 ```
+
+Windows 可将 `python3` 替换为 `python`。PowerShell 启动脚本 `tools/start_ddg_search.ps1` 仍保留为兼容入口，但不再是必需项。
 
 只有需要强制重新检查当天共享的市场拥挤度和行业景气原始表时，追加 `--refresh`。
 
@@ -61,7 +63,7 @@ python tools/run_pipeline.py --stock {六位代码} --name {股票名称}
 - 未命中异常推广词不等于安全，必须保留这项限制说明。
 - 宏观和政策只采用量化宏观数据及政府网公开政策标题，不因单条标题直接改变个股得分。
 - 市场拥挤度来自乐咕乐股申万二级行业页面，先映射个股所属申万二级行业，再读取全量行业日缓存；按上海自然日每日检查一次并共享。报告必须显示行业、行业代码、换手率分位数、成交额拥挤度分位数、行业强度、检查日期和真实源数据日期。旧数据或刷新失败的备用缓存不得计分。
-- 个股讨论优先使用雪球、东方财富公开接口；直接接口无结果后才使用 SearXNG → DuckDuckGo MCP。搜索命中统一标记 `网络命中（未核验）`，不使用 CloakBrowser。
+- 个股讨论优先使用雪球、东方财富公开接口；直接接口无结果后才使用 SearXNG → DuckDuckGo MCP → 公共 DuckDuckGo HTML。搜索命中统一标记 `网络命中（未核验）`，不使用 CloakBrowser。
 
 ## 行业景气度
 
@@ -73,7 +75,7 @@ python tools/run_pipeline.py --stock {六位代码} --name {股票名称}
 ## 搜索验证
 
 - 初评后，F1-F5 中 `需人工确认` 和 `部分覆盖` 的子因子逐项生成定向查询；F6 不进入搜索补分。
-- SearXNG 优先，失败、无结果或无相关结果时使用 DuckDuckGo MCP；两者都无结果标记 `已搜索未命中`，后端异常标记 `搜索失败，需人工确认`。
+- SearXNG 优先，失败、无结果或无相关结果时使用 DuckDuckGo MCP；没有本地后端时自动尝试公共 DuckDuckGo HTML。全部无结果标记 `已搜索未命中`，后端异常标记 `搜索失败，需人工确认`。
 - 标题、摘要或正文命中公司/行业与目标指标即可形成未核验线索，不要求来源等级、双域名或完整正文。
 - 搜索线索可补充分数，但必须显示实际后端和 `网络命中（未核验）`；结构化已验证值不得被网页结果覆盖。
 - 多条结果冲突时按同向数量判断，数量相同时采用排名最高结果并显示冲突。
