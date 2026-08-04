@@ -16,7 +16,7 @@ RULES: dict[str, dict[str, Any]] = {
     "F2.top10_quality": {"queries": ["{code} {name} 前十大股东 国资 产业资本 基金 持仓变化"], "positive": ("国资", "产业资本", "社保", "基金增持", "保险", "长期机构"), "negative": ("基金减持", "机构退出")},
     "F2.pledge_unlock": {"queries": ["{code} {name} 股权质押比例 未来解禁比例"], "positive": ("无质押", "零质押", "无解禁"), "negative": ("高比例质押", "大额解禁", "质押风险")},
     "F3.background": {"queries": ["{name} 控股股东 实际控制人 国资 央企 产业资本 背景"], "positive": ("央企", "国资", "国有控股", "产业资本", "产业龙头", "战略股东"), "negative": ("无实际控制人", "股权分散", "资金占用")},
-    "F3.leadership": {"queries": ["{name} 全球龙头 国内龙头 市占率 核心供应商"], "positive": ("全球龙头", "国内龙头", "市占率第一", "核心供应商", "行业领先", "隐形冠军"), "negative": ("市占率低", "边缘供应商")},
+    "F3.leadership": {"queries": ["{name} 市场份额 市占率 排名 销量 出货量 用户数 客户覆盖 核心供应商"], "positive": ("市场份额", "市占率", "排名", "销量", "出货量", "用户数", "核心供应商", "客户覆盖", "技术领先", "专利", "牌照", "标准"), "negative": ("市占率低", "边缘供应商", "客户流失")},
     "F3.financial_safety": {"queries": ["{code} {name} 净现金 短期债务 经营现金流 应收账款 资产负债率"], "positive": ("净现金为正", "现金流为正", "低负债", "现金充足", "短债覆盖"), "negative": ("现金流为负", "高负债", "债务逾期", "应收账款异常", "流动性风险")},
     "F3.survival_risk": {"queries": ["{code} {name} ST 退市 审计意见 商誉减值 持续经营风险"], "positive": ("标准无保留意见", "无退市风险", "未触发风险警示"), "negative": ("退市风险警示", "保留意见", "无法表示意见", "否定意见", "商誉减值", "持续经营重大不确定性")},
     "F3.specialized": {"queries": ["{name} 专精特新 小巨人 制造业单项冠军"], "positive": ("专精特新", "小巨人", "制造业单项冠军", "单项冠军"), "negative": ()},
@@ -29,6 +29,29 @@ RULES: dict[str, dict[str, Any]] = {
     "F5.coldness": {"queries": ["{name} 行业冰点 市场关注度 机构覆盖 冷门"], "positive": ("行业冰点", "低关注", "冷门", "机构覆盖少", "无人问津"), "negative": ("热门股", "高关注", "拥挤")},
     "F5.inflection": {"queries": ["{name} 营收增长 利润下降 现金流改善 库存下降 订单恢复 困境反转"], "positive": ("困境反转", "现金流改善", "订单恢复", "库存下降", "扭亏", "利润改善"), "negative": ("持续恶化", "现金流恶化", "订单下降")},
     "F5.expectation_gap": {"queries": ["{name} 预期差 低关注 订单改善 产业趋势"], "positive": ("预期差", "低关注", "尚未充分定价", "订单改善", "业绩超预期"), "negative": ("充分定价", "一致预期过高", "交易拥挤")},
+}
+
+LEADERSHIP_SEARCH_DIMENSIONS = {
+    "市场份额/排名": (
+        r"(市场份额|市场占有率|市占率|行业排名)[^。；\n]{0,35}(第一|首位|排名|领先|第[一二三四五六七八九十\d]+|[1-9]\d?(?:\.\d+)?%)",
+        r"(?:排名|位列|份额)[^。；\n]{0,28}(?:第一|首位|前[三五十\d]+|第[一二三四五六七八九十\d]+|[1-9]\d?(?:\.\d+)?%)",
+    ),
+    "销量/出货/规模": (
+        r"(销量|出货量|装机量|用户数|保有量|产量|资产规模|储量)[^。；\n]{0,35}(同比|达到|超过|领先|第一|排名|万|亿|%)",
+    ),
+    "客户/核心供应关系": (
+        r"(核心|关键|主要|指定)供应商[^。；\n]{0,35}(供货|配套|量产|定点|客户|供应链|订单)",
+        r"(量产供货|客户定点|进入|配套)[^。；\n]{0,35}(供应链|头部客户|核心客户|主机厂|订单|客户)",
+    ),
+    "技术/专利壁垒": (
+        r"(核心技术|发明专利|核心专利|自主可控|不可替代|技术领先|首创|独家|唯一|核心工艺)[^。；\n]{0,35}(领先|第一|数量|标准|认证|产品|量产|应用|客户|工艺)",
+    ),
+    "牌照/批件/标准资质": (
+        r"(牌照|批件|注册证|国家标准|行业标准|标准制定|认证|资质|行业准入)[^。；\n]{0,35}(取得|获得|覆盖|牵头|参与|核心|领先|第一|产品|业务)",
+    ),
+    "渠道/区域/资源覆盖": (
+        r"(全球|全国|国内|海外|区域)[^。；\n]{0,35}(客户|渠道|网点|门店|用户|基地|覆盖|产能|储量)",
+    ),
 }
 
 
@@ -108,6 +131,17 @@ def _numeric_ratio(key: str, text: str) -> tuple[float | None, list[str]]:
     return None, signals
 
 
+def _leadership_search_ratio(text: str) -> tuple[float | None, list[str]]:
+    dimensions = [
+        label for label, patterns in LEADERSHIP_SEARCH_DIMENSIONS.items()
+        if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+    ]
+    if not dimensions:
+        return None, []
+    ratio = 1.0 if len(dimensions) >= 3 else 0.75 if len(dimensions) == 2 else 0.4
+    return ratio, dimensions
+
+
 def evaluate(key: str, maximum: float, rows: list[dict[str, Any]]) -> dict[str, Any]:
     rule = RULES[key]
     ranked = []
@@ -118,13 +152,23 @@ def evaluate(key: str, maximum: float, rows: list[dict[str, Any]]) -> dict[str, 
         positives = [term for term in rule.get("positive", ()) if term.lower() in text.lower()]
         negatives = [term for term in rule.get("negative", ()) if term.lower() in text.lower()]
         numeric_ratio, numeric_signals = _numeric_ratio(key, text)
+        leadership_ratio, leadership_signals = _leadership_search_ratio(text) if key == "F3.leadership" else (None, [])
+        if leadership_signals:
+            numeric_signals.extend(leadership_signals)
         all_signals.extend(numeric_signals)
-        direction = 1 if len(positives) > len(negatives) else -1 if len(negatives) > len(positives) else 0
+        if key == "F3.leadership":
+            direction = -1 if negatives and not leadership_signals else 1 if leadership_signals else 0
+        else:
+            direction = 1 if len(positives) > len(negatives) else -1 if len(negatives) > len(positives) else 0
         if numeric_ratio is not None:
             direction = 1 if numeric_ratio > 0 else -1
         directions.append(direction)
         generic_ratio = 1.0 if len(positives) >= 3 else 0.75 if len(positives) == 2 else 0.5 if len(positives) == 1 else 0.0
-        ratio = numeric_ratio if numeric_ratio is not None else (0.0 if direction < 0 else generic_ratio)
+        ratio = (
+            leadership_ratio if key == "F3.leadership" and leadership_ratio is not None
+            else numeric_ratio if numeric_ratio is not None
+            else 0.0 if direction < 0 else generic_ratio
+        )
         ranked.append((direction, ratio, index, positives, negatives, row))
     positive_count = sum(direction > 0 for direction in directions)
     negative_count = sum(direction < 0 for direction in directions)

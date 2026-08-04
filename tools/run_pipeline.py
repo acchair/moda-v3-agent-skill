@@ -49,7 +49,8 @@ def run_module(label: str, script: str, args: list[str], timeout: int = 180) -> 
                 "coverage": _report_coverage(label, report) if fresh else 0,
                 "elapsed_seconds": round((datetime.now() - started).total_seconds(), 1)}
     except subprocess.TimeoutExpired:
-        return {"label": label, "ok": False, "error": f"timeout after {timeout}s"}
+        return {"label": label, "ok": False, "error": f"timeout after {timeout}s",
+                "elapsed_seconds": round((datetime.now() - started).total_seconds(), 1)}
 
 
 def _report_coverage(label: str, path: Path) -> int:
@@ -112,7 +113,7 @@ def unresolved_targets(code: str, name: str, directories: tuple[str, ...], since
 
     evidence = build_evidence(code, name, read_reports(code, directories, since))
     card = score_evidence(evidence)
-    return [
+    targets = [
         {
             "factor_key": factor.key,
             "subfactor_key": item.key,
@@ -124,6 +125,17 @@ def unresolved_targets(code: str, name: str, directories: tuple[str, ...], since
         for factor in card.factors if factor.key != "F6"
         for item in factor.subfactors if item.status in {"需人工确认", "部分覆盖"}
     ]
+    if evidence.get("classification_db_specialized") is True:
+        targets = [
+            item for item in targets
+            if not (item["factor_key"] == "F3" and item["subfactor_key"] == "specialized")
+        ]
+    if evidence.get("classification_db_leadership") is True or evidence.get("classification_db_core_supplier") is True:
+        targets = [
+            item for item in targets
+            if not (item["factor_key"] == "F3" and item["subfactor_key"] == "leadership")
+        ]
+    return targets
 
 
 def main() -> None:
@@ -132,12 +144,16 @@ def main() -> None:
     parser.add_argument("--name", default="")
     parser.add_argument("--refresh", action="store_true", help="Force shared daily data caches to refresh")
     args = parser.parse_args()
-    code = args.stock.strip()
-    if len(code) != 6 or not code.isdigit():
-        parser.error("--stock must be a 6-digit A-share code")
+    from tools.stock_resolver import resolve_stock_input
+
+    try:
+        code, resolved_input_name = resolve_stock_input(args.stock, args.name)
+    except ValueError as exc:
+        parser.error(str(exc))
+    input_name = args.name.strip() or resolved_input_name
 
     started_ts = time.time()
-    common = ["--stock", code, "--name", args.name or code]
+    common = ["--stock", code, "--name", input_name or code]
     refresh_args = ["--refresh"] if args.refresh else []
     kline_path = prepare_kline(code)
     kline_args = ["--kline-file", str(kline_path)] if kline_path else []
@@ -154,26 +170,27 @@ def main() -> None:
     results = run_collectors(first_wave)
     first_sources = tuple(result["label"] for result in results if result.get("ok"))
     industry, context, discovered_name = current_context(code, first_sources, started_ts)
-    resolved_name = args.name.strip() or discovered_name or code
+    resolved_name = args.name.strip() or discovered_name or resolved_input_name or code
     common = ["--stock", code, "--name", resolved_name]
     congestion = ("congestion", "tools/akshare/congestion.py", [*common, "--industry", industry, *refresh_args], 90)
-    results.append(run_module(*congestion))
     second_wave = [
         ("supply_demand", "tools/scoring/supply_demand.py", [*common, "--context", context], 150),
         ("macro_policy", "tools/akshare/macro_policy.py", [*common, "--industry", industry], 150),
     ]
-    results.extend(run_collectors(second_wave))
     prosperity = (
         "industry_prosperity",
         "tools/akshare/industry_prosperity.py",
         [*common, "--industry", industry, *refresh_args],
         180,
     )
-    results.append(run_module(*prosperity))
+    # These modules share the resolved industry/context and have no dependency
+    # on one another; overlap their network waits while preserving ordering of
+    # the resulting report list.
+    results.extend(run_collectors([congestion, *second_wave, prosperity]))
     structured_sources = tuple(result["label"] for result in results if result.get("ok"))
     targets = unresolved_targets(code, resolved_name, structured_sources, started_ts)
-    web_args = [*common, "--context", context, "--targets-json", json.dumps(targets, ensure_ascii=False)]
-    results.append(run_module("web_research", "tools/scoring/web_research.py", web_args, 300))
+    web_args = [*common, "--context", context, "--targets-json", json.dumps(targets, ensure_ascii=False), *refresh_args]
+    results.append(run_module("web_research", "tools/scoring/web_research.py", web_args, 120))
     successful_sources = ",".join(result["label"] for result in results if result.get("ok"))
     requested_labels = [module[0] for module in first_wave + [congestion] + second_wave + [prosperity]] + ["web_research"]
     requested_sources = ",".join(requested_labels)

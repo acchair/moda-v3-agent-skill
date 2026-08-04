@@ -14,6 +14,7 @@ import sys
 import time
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
+from hashlib import sha256
 
 import requests
 from pypdf import PdfReader
@@ -21,6 +22,7 @@ from pypdf import PdfReader
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from tools.scoring.classification_db import has_category, lookup
 from tools.scoring.search_rules import RULES, evaluate as evaluate_gap, queries_for
 
 
@@ -30,6 +32,26 @@ MAX_FETCH_BYTES = 600_000
 MAX_PDF_FETCH_BYTES = 10_000_000
 MAX_PAGES = 30
 MAX_PAGES_PER_PURPOSE = 6
+MAX_GAP_TARGETS = 12
+MAX_GAP_QUERIES_PER_TARGET = 2
+MAX_GAP_BUDGET_SECONDS = 75.0
+MIN_TARGET_BUDGET_SECONDS = 3.0
+GAP_PRIORITY = {
+    "F2.controller_action": 120,
+    "F3.survival_risk": 115,
+    "F3.leadership": 108,
+    "F1.capex_wave": 106,
+    "F1.era_track": 102,
+    "F1.chokepoint": 100,
+    "F1.supply_gap": 98,
+    "F4.realization": 96,
+    "F4.business_match": 94,
+    "F4.profit_position": 92,
+    "F5.inflection": 88,
+    "F5.expectation_gap": 84,
+    "F3.background": 82,
+}
+CACHE_PATH = ROOT / "knowledge" / "research" / "pipeline" / "cache" / "web_search_daily.json"
 AUTHORITY_DOMAINS = (
     "gov.cn", "cninfo.com.cn", "sse.com.cn", "szse.cn", "bse.cn",
     "stats.gov.cn", "miit.gov.cn", "ndrc.gov.cn", "customs.gov.cn",
@@ -77,6 +99,11 @@ CATALYST_CATEGORIES = {
 }
 CAPEX_UP_TERMS = ("投资增长", "投资同比增长", "加快投资", "扩大投资", "新增产能", "扩产", "产能建设", "设备更新")
 CAPEX_DOWN_TERMS = ("投资下降", "投资同比下降", "压减产能", "削减投资", "延缓投资", "停止扩产")
+CAPEX_CATEGORIES = {
+    "investment": ("固定资产投资", "投资增长", "投资同比增长", "设备投资"),
+    "capacity": ("新增产能", "扩产", "产能建设", "投产"),
+    "equipment": ("设备更新", "设备采购", "产线建设"),
+}
 
 
 def _load_local_env() -> None:
@@ -288,7 +315,13 @@ def _duckduckgo_html_search(query: str, timeout: float) -> list[dict[str, Any]]:
     return _prioritize_search_rows(rows)
 
 
-def _search(provider: str, query: str, timeout: float) -> tuple[str, list[dict[str, Any]], list[str]]:
+def _search(provider: str, query: str, timeout: float, cache_scope: str = "") -> tuple[str, list[dict[str, Any]], list[str]]:
+    cache_enabled = os.getenv("MODA_SEARCH_CACHE", "on").strip().lower() not in {"0", "false", "off", "no"}
+    cache_key = _search_cache_key(provider, query, cache_scope) if cache_scope and cache_enabled else ""
+    if cache_key:
+        cached = _load_search_cache().get(cache_key)
+        if cached and cached.get("date") == datetime.now().date().isoformat() and cached.get("rows"):
+            return str(cached.get("used") or "none"), list(cached.get("rows") or []), []
     errors: list[str] = []
     searxng = os.getenv("SEARXNG_URL", "").strip()
     ddg = os.getenv("DDG_MCP_URL", "").strip()
@@ -296,6 +329,8 @@ def _search(provider: str, query: str, timeout: float) -> tuple[str, list[dict[s
         try:
             rows = _searxng_search(searxng, query, timeout)
             if rows:
+                if cache_key:
+                    _save_search_cache(cache_key, "searxng", rows)
                 return "searxng", rows, errors
             errors.append("searxng:no_results")
         except Exception as exc:
@@ -304,6 +339,8 @@ def _search(provider: str, query: str, timeout: float) -> tuple[str, list[dict[s
         try:
             rows = _ddg_mcp_search(ddg, query, timeout)
             if rows:
+                if cache_key:
+                    _save_search_cache(cache_key, "duckduckgo", rows)
                 return "duckduckgo", rows, errors
             errors.append("duckduckgo:no_results")
         except Exception as exc:
@@ -313,6 +350,8 @@ def _search(provider: str, query: str, timeout: float) -> tuple[str, list[dict[s
         try:
             rows = _duckduckgo_html_search(query, timeout)
             if rows:
+                if cache_key:
+                    _save_search_cache(cache_key, "duckduckgo_html", rows)
                 return "duckduckgo_html", rows, errors
             errors.append("duckduckgo_html:no_results")
         except Exception as exc:
@@ -320,6 +359,34 @@ def _search(provider: str, query: str, timeout: float) -> tuple[str, list[dict[s
     if not searxng and not ddg and not errors:
         errors.append("search_backend_not_configured")
     return "none", [], errors
+
+
+def _search_cache_key(provider: str, query: str, cache_scope: str = "") -> str:
+    configured = "|".join((provider, os.getenv("SEARXNG_URL", "").strip(), os.getenv("DDG_MCP_URL", "").strip()))
+    return sha256(f"{cache_scope}|{configured}|{query.strip()}".encode("utf-8")).hexdigest()
+
+
+def _load_search_cache() -> dict[str, Any]:
+    try:
+        payload = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _save_search_cache(key: str, used: str, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    try:
+        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = _load_search_cache()
+        payload[key] = {"date": datetime.now().date().isoformat(), "used": used, "rows": rows[:8]}
+        tmp = CACHE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(CACHE_PATH)
+    except OSError:
+        # Cache is an optimization only; source availability must not change behavior.
+        return
 
 
 def _gap_relevant(row: dict[str, Any], key: str, code: str, name: str, context: str) -> bool:
@@ -336,28 +403,122 @@ def _gap_relevant(row: dict[str, Any], key: str, code: str, name: str, context: 
     return context_hit or rule_hit
 
 
+def _gap_target_key(target: dict[str, Any]) -> str:
+    return f"{target.get('factor_key')}.{target.get('subfactor_key')}"
+
+
+def _gap_priority(target: dict[str, Any]) -> float:
+    key = _gap_target_key(target)
+    maximum = float(target.get("maximum") or 0)
+    status = str(target.get("original_status") or "")
+    status_bonus = 4 if status == "需人工确认" else 2
+    return GAP_PRIORITY.get(key, 70) + maximum * 4 + status_bonus
+
+
+def _select_gap_targets(targets: list[dict[str, Any]], limit: int = MAX_GAP_TARGETS) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Select high-value gaps while reserving one search slot per factor."""
+    if limit <= 0:
+        return [], list(targets)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for target in targets:
+        grouped.setdefault(str(target.get("factor_key") or ""), []).append(target)
+    ranked_groups = {
+        factor: sorted(items, key=_gap_priority, reverse=True)
+        for factor, items in grouped.items()
+    }
+    selected_keys: set[str] = set()
+    selected: list[dict[str, Any]] = []
+    for factor in ("F1", "F2", "F3", "F4", "F5"):
+        candidate = ranked_groups.get(factor, [])
+        if candidate and len(selected) < limit:
+            selected.append(candidate[0])
+            selected_keys.add(_gap_target_key(candidate[0]))
+    ranked_all = sorted(targets, key=_gap_priority, reverse=True)
+    for target in ranked_all:
+        key = _gap_target_key(target)
+        if key in selected_keys or len(selected) >= limit:
+            continue
+        selected.append(target)
+        selected_keys.add(key)
+    selected.sort(key=_gap_priority, reverse=True)
+    skipped = [target for target in targets if _gap_target_key(target) not in selected_keys]
+    return selected, skipped
+
+
+def _allocate_gap_budgets(targets: list[dict[str, Any]], total_seconds: float = MAX_GAP_BUDGET_SECONDS) -> dict[str, float]:
+    if not targets:
+        return {}
+    total = max(0.0, float(total_seconds))
+    reserve = min(MIN_TARGET_BUDGET_SECONDS, total / len(targets))
+    weights = { _gap_target_key(target): max(1.0, _gap_priority(target)) for target in targets }
+    remaining = max(0.0, total - reserve * len(targets))
+    weight_total = sum(weights.values()) or 1.0
+    return {
+        key: round(reserve + remaining * weight / weight_total, 3)
+        for key, weight in weights.items()
+    }
+
+
 def _collect_gap_targets(code: str, name: str, context: str, targets: list[dict[str, Any]],
                          provider: str, timeout: float) -> dict[str, Any]:
+    started = time.monotonic()
+    deadline = started + MAX_GAP_BUDGET_SECONDS
     gap_results: list[dict[str, Any]] = []
     all_results: list[dict[str, Any]] = []
     errors: list[str] = []
     used_providers: list[str] = []
-    for target in targets:
+    selected_targets, skipped_targets = _select_gap_targets(targets)
+    target_budgets = _allocate_gap_budgets(selected_targets)
+    processed_targets: list[str] = []
+    for target in selected_targets:
         factor_key = str(target.get("factor_key") or "")
         subfactor_key = str(target.get("subfactor_key") or "")
         key = f"{factor_key}.{subfactor_key}"
         if key not in RULES or factor_key == "F6":
             continue
+        processed_targets.append(key)
+        target_budget = target_budgets.get(key, MIN_TARGET_BUDGET_SECONDS)
+        target_started = time.monotonic()
+        target_deadline = min(deadline, target_started + target_budget)
         target_rows: list[dict[str, Any]] = []
         target_queries = queries_for(key, name, code, context)
         target_queries.append(_china_finance_query(key, name, code, context))
+        target_queries = target_queries[:MAX_GAP_QUERIES_PER_TARGET]
         target_errors: list[str] = []
         seen: set[str] = set()
-        for query in target_queries:
-            used, rows, query_errors = _search(provider, query, timeout)
+        for query_index, query in enumerate(target_queries):
+            remaining = min(deadline, target_deadline) - time.monotonic()
+            if remaining <= 0:
+                target_errors.append(
+                    "global_budget_exhausted"
+                    if time.monotonic() >= deadline
+                    else "target_budget_exhausted"
+                )
+                break
+            # Auto search may try two fallback backends sequentially. Keep
+            # each request bounded by the target and global budgets.
+            queries_left = max(1, len(target_queries) - query_index)
+            if remaining < 0.2:
+                target_errors.append(
+                    "global_budget_exhausted"
+                    if time.monotonic() >= deadline
+                    else "target_budget_exhausted"
+                )
+                break
+            query_timeout = min(timeout, max(0.2, remaining / queries_left))
+            used, rows, query_errors = _search(provider, query, query_timeout, cache_scope=f"{code}|{key}")
             relevant = [row for row in rows if _gap_relevant(row, key, code, name, context)]
             if used == "searxng" and not relevant and provider == "auto" and os.getenv("DDG_MCP_URL", "").strip():
-                fallback_used, fallback_rows, fallback_errors = _search("duckduckgo", query, timeout)
+                fallback_remaining = min(deadline, target_deadline) - time.monotonic()
+                fallback_timeout = min(timeout, max(0.2, fallback_remaining / 2)) if fallback_remaining >= 0.2 else 0
+                fallback_used, fallback_rows, fallback_errors = (
+                    _search("duckduckgo", query, fallback_timeout, cache_scope=f"{code}|{key}")
+                    if fallback_timeout > 0 else (
+                        "none",
+                        [],
+                        ["global_budget_exhausted" if time.monotonic() >= deadline else "target_budget_exhausted"],
+                    )
+                )
                 query_errors.extend(fallback_errors)
                 if fallback_rows:
                     used, relevant = fallback_used, [row for row in fallback_rows if _gap_relevant(row, key, code, name, context)]
@@ -369,7 +530,14 @@ def _collect_gap_targets(code: str, name: str, context: str, targets: list[dict[
                 if not url or url in seen:
                     continue
                 seen.add(url)
-                fetch_status, content = _fetch_page(url, min(timeout, 5)) if rank == 1 else ("not_fetched", "")
+                remaining = min(deadline, target_deadline) - time.monotonic()
+                fetch_status, content = (
+                    _fetch_page(url, min(timeout, 5, max(0.2, remaining)))
+                    if rank == 1 and remaining > 0 else (
+                        "global_budget_exhausted" if time.monotonic() >= deadline else "target_budget_exhausted",
+                        "",
+                    )
+                )
                 enriched = {
                     **row,
                     "factor_key": factor_key,
@@ -404,9 +572,39 @@ def _collect_gap_targets(code: str, name: str, context: str, targets: list[dict[
             "provider": next((row.get("provider") for row in target_rows if row.get("provider")), "none"),
             "evidence": evidence_rows,
             "errors": target_errors,
+            "selection_status": "selected",
+            "selection_reason": "按因子覆盖、风险优先级、最大分值和缺口状态选入",
+            "target_budget_seconds": target_budget,
+            "budget_used_seconds": round(min(target_budget, max(0.0, time.monotonic() - target_started)), 3),
         }
         gap_results.append(gap_result)
         errors.extend(f"{key}:{error}" for error in target_errors)
+    for target in skipped_targets:
+        factor_key = str(target.get("factor_key") or "")
+        subfactor_key = str(target.get("subfactor_key") or "")
+        key = f"{factor_key}.{subfactor_key}"
+        gap_results.append({
+            **target,
+            "status": "搜索失败，需人工确认",
+            "score": 0.0,
+            "reason": f"超过缺口目标数量上限 {MAX_GAP_TARGETS}，本目标未分配搜索预算",
+            "signals": [],
+            "conflict": False,
+            "queries": [],
+            "provider": "none",
+            "evidence": [],
+            "errors": ["target_limit_exceeded"],
+            "selection_status": "skipped",
+            "selection_reason": "超过缺口目标数量上限，优先保障各因子和高价值风险缺口",
+            "skip_reason": "target_limit_exceeded",
+            "target_budget_seconds": 0.0,
+            "budget_used_seconds": 0.0,
+        })
+        errors.append(f"{key}:target_limit_exceeded")
+    used_seconds = round(min(MAX_GAP_BUDGET_SECONDS, max(0.0, time.monotonic() - started)), 3)
+    exhausted = used_seconds >= MAX_GAP_BUDGET_SECONDS or any(
+        "global_budget_exhausted" in error for error in errors
+    )
     return {
         "web_research_status": "completed" if gap_results else "unavailable",
         "web_research_provider": ",".join(used_providers) or "none",
@@ -415,6 +613,28 @@ def _collect_gap_targets(code: str, name: str, context: str, targets: list[dict[
         "web_subfactor_results": {f"{item['factor_key']}.{item['subfactor_key']}": item for item in gap_results},
         "results": all_results,
         "errors": errors,
+        "search_budget": {
+            "budget_total_seconds": MAX_GAP_BUDGET_SECONDS,
+            "budget_used_seconds": used_seconds,
+            "target_limit": MAX_GAP_TARGETS,
+            "targets_total": len(targets),
+            "targets_selected": len(processed_targets),
+            "targets_skipped": len(skipped_targets),
+            "selection_policy": "各 F1-F5 至少保留一个机会，其余按风险、最大分值、缺口状态和因子优先级排序",
+            "allocation_policy": f"每个入选目标至少 {MIN_TARGET_BUDGET_SECONDS:g} 秒，剩余时间按优先级加权分配",
+            "global_time_exhausted": exhausted,
+            "skip_reasons": {
+                "target_limit_exceeded": len(skipped_targets),
+                "global_time_exhausted": sum(
+                    "global_budget_exhausted" in item.get("errors", [])
+                    for item in gap_results
+                ),
+                "target_time_exhausted": sum(
+                    "target_budget_exhausted" in item.get("errors", [])
+                    for item in gap_results
+                ),
+            },
+        },
     }
 
 
@@ -484,6 +704,7 @@ def _classify(record: dict[str, Any], name: str, context: str = "") -> dict[str,
     }
     capex_up = any(term in text for term in CAPEX_UP_TERMS)
     capex_down = any(term in text for term in CAPEX_DOWN_TERMS)
+    capex_categories = [category for category, terms in CAPEX_CATEGORIES.items() if any(term in text for term in terms)]
     return {
         **record,
         "domain": domain,
@@ -501,6 +722,7 @@ def _classify(record: dict[str, Any], name: str, context: str = "") -> dict[str,
         "evidence_fresh": _is_fresh_date(evidence_date),
         "industry_context_match": any(token in text for token in context_tokens),
         "industry_capex_direction": "up" if capex_up and not capex_down else "down" if capex_down and not capex_up else "conflict" if capex_up and capex_down else "unknown",
+        "capex_categories": capex_categories,
     }
 
 
@@ -533,15 +755,24 @@ def _validate_supply(records: list[dict[str, Any]]) -> dict[str, Any]:
     categories = {category for row in usable for category in row["supply_categories"]}
     has_authority = any(row["source_tier"] == "A" for row in usable)
     directions = {row["supply_direction"] for row in usable}
+    # Require independent domains and independent evidence categories. A
+    # single article repeating the same signal cannot confirm a cycle.
     confirmed = len(domains) >= 2 and len(categories) >= 2 and has_authority and len(directions) == 1
+    category_directions: dict[str, set[str]] = {}
+    for row in usable:
+        for category in row.get("supply_categories", []):
+            category_directions.setdefault(category, set()).add(row["supply_direction"])
+    category_conflict = any(len(values) > 1 for values in category_directions.values())
+    if category_conflict:
+        confirmed = False
     return {
-        "status": "已验证" if confirmed else "证据冲突" if len(directions) > 1 else "需人工确认",
+        "status": "已验证" if confirmed else "证据冲突" if len(directions) > 1 or category_conflict else "需人工确认",
         "evidence_count": len(usable),
         "domain_count": len(domains),
         "categories": sorted(categories),
         "has_authority": has_authority,
         "tightening": next(iter(directions)) == "tightening" if confirmed else None,
-        "reason": "两个不同域名、两类证据且含权威来源同向" if confirmed else "未满足双域名、双类别、权威来源和同向要求",
+        "reason": "两个不同域名、两类证据且含权威来源同向" if confirmed else "未满足双域名、双类别、权威来源和同向要求，或同一类别方向冲突",
     }
 
 
@@ -620,14 +851,18 @@ def _validate_industry_capex(records: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     domains = {row.get("domain") for row in usable if row.get("domain")}
     directions = {row["industry_capex_direction"] for row in usable}
-    confirmed = len(domains) >= 2 and len(directions) == 1
+    # Industry capex is only confirmable when the sources are both fresh and
+    # independent. Require two distinct authority domains and two evidence
+    # categories (investment/expansion/equipment) where available.
+    capex_categories = {category for row in usable for category in row.get("capex_categories", [])}
+    confirmed = len(domains) >= 2 and len(directions) == 1 and (len(capex_categories) >= 2 or not capex_categories)
     direction = next(iter(directions)) if confirmed else None
     return {
         "status": "已验证" if confirmed else "证据冲突" if len(directions) > 1 else "需人工确认",
         "evidence_count": len(usable),
         "domain_count": len(domains),
         "signal": "上行" if direction == "up" else "下行" if direction == "down" else None,
-        "reason": "两家独立权威来源的一年内正文同向确认行业投资" if confirmed else "未满足行业匹配、有效日期、双权威域名和同向要求",
+        "reason": "两家独立权威来源的一年内正文同向确认行业投资" if confirmed else "未满足行业匹配、有效日期、双权威域名、双类别和同向要求",
     }
 
 
@@ -638,8 +873,37 @@ def collect(code: str, name: str, context: str, provider: str | None = None, tim
         selected = "off"
     if selected == "off":
         return {"web_research_status": "disabled", "web_research_provider": "off", "queries": [], "results": [], "errors": []}
+    classification_db = lookup(code, name)
+    database_specialized = has_category(classification_db, "specialized")
+    database_leadership = (
+        has_category(classification_db, "leadership")
+        or has_category(classification_db, "core_supplier")
+    )
     if targets is not None:
-        return _collect_gap_targets(code, name, context, targets, selected, timeout)
+        skipped_database_targets = [
+            target for target in targets
+            if (
+                database_specialized
+                and target.get("factor_key") == "F3"
+                and target.get("subfactor_key") == "specialized"
+            )
+            or (
+                database_leadership
+                and target.get("factor_key") == "F3"
+                and target.get("subfactor_key") == "leadership"
+            )
+        ]
+        filtered_targets = [
+            target for target in targets
+            if target not in skipped_database_targets
+        ]
+        result = _collect_gap_targets(code, name, context, filtered_targets, selected, timeout)
+        result["classification_db_found"] = bool(classification_db.get("found"))
+        result["classification_db_categories"] = list(classification_db.get("categories") or ())
+        result["classification_db_specialized"] = database_specialized
+        result["classification_db_leadership"] = database_leadership
+        result["database_skipped_targets"] = skipped_database_targets
+        return result
 
     short_context = " ".join(context.split()[:12])
     query_specs = [
@@ -655,6 +919,12 @@ def collect(code: str, name: str, context: str, provider: str | None = None, tim
         ("finance_disclosure", f"{name} {short_context} {CHINA_FINANCE_SITE_GROUPS['disclosure']} 年报 季报 公告 主营业务"),
         ("finance_market", f"{name} {short_context} {CHINA_FINANCE_SITE_GROUPS['market']} 订单 价格 产能 估值"),
     ]
+    if database_specialized or database_leadership:
+        query_specs = [
+            item for item in query_specs
+            if not (database_specialized and item[0] == "specialized")
+            and not (database_leadership and item[0] == "leadership")
+        ]
     queries = [query for _, query in query_specs]
     results: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -687,6 +957,10 @@ def collect(code: str, name: str, context: str, provider: str | None = None, tim
     return {
         "web_research_status": status,
         "web_research_provider": ",".join(used_providers) or "none",
+        "classification_db_found": bool(classification_db.get("found")),
+        "classification_db_categories": list(classification_db.get("categories") or ()),
+        "classification_db_specialized": database_specialized,
+        "classification_db_leadership": database_leadership,
         "queries": queries,
         "results": results,
         "errors": errors,
@@ -707,14 +981,16 @@ def build_report(code: str, name: str, data: dict[str, Any]) -> str:
             "",
             f"<!-- moda_web_research: {json.dumps(data, ensure_ascii=False)} -->",
             "",
-            "| 因子 | 子因子 | 原状态 | 搜索结果 | 未核验得分 | 后端 | 判断依据 |",
-            "|---|---|---|---|---:|---|---|",
+            "| 因子 | 子因子 | 原状态 | 选择状态 | 搜索结果 | 未核验得分 | 目标预算 | 实际用时 | 后端 | 判断依据 |",
+            "|---|---|---|---|---|---:|---:|---:|---|---|",
         ]
         for item in data.get("web_gap_results", []):
             reason = str(item.get("reason") or "").replace("|", "/")
             lines.append(
                 f"| {item.get('factor_key')} | {item.get('label')} | {item.get('original_status')} | "
-                f"{item.get('status')} | {item.get('score', 0):g}/{item.get('maximum', 0):g} | "
+                f"{item.get('selection_status', 'selected')} | {item.get('status')} | "
+                f"{item.get('score', 0):g}/{item.get('maximum', 0):g} | "
+                f"{item.get('target_budget_seconds', 0):g} | {item.get('budget_used_seconds', 0):g} | "
                 f"{item.get('provider', 'none')} | {reason} |"
             )
         lines += ["", "## 搜索明细", "", "| 子因子 | 标题 | URL | 查询词 | 后端 |", "|---|---|---|---|---|"]
@@ -723,7 +999,19 @@ def build_report(code: str, name: str, data: dict[str, Any]) -> str:
                 title = str(row.get("title") or "").replace("|", "/")
                 query = str(row.get("query") or "").replace("|", "/")
                 lines.append(f"| {item.get('factor_key')}.{item.get('subfactor_key')} | {title} | {row.get('url', '')} | {query} | {row.get('provider', '')} |")
-        lines += ["", "搜索结果只用于未核验补缺；结构化数据优先，F6 不使用网页补分。", ""]
+        budget = data.get("search_budget") or {}
+        lines += [
+            "",
+            "## 搜索预算",
+            "",
+            f"- 总预算：{budget.get('budget_total_seconds', MAX_GAP_BUDGET_SECONDS):g} 秒；实际使用：{budget.get('budget_used_seconds', 0):g} 秒。",
+            f"- 缺口目标：共 {budget.get('targets_total', 0)} 个；入选 {budget.get('targets_selected', 0)} 个；未入选 {budget.get('targets_skipped', 0)} 个；全局时间耗尽：{'是' if budget.get('global_time_exhausted') else '否'}。",
+            f"- 分配规则：{budget.get('selection_policy', '按优先级选择')}；{budget.get('allocation_policy', '按优先级分配剩余时间')}。",
+            f"- 预算原因：目标数量上限 {((budget.get('skip_reasons') or {}).get('target_limit_exceeded', 0))} 个；全局时间耗尽 {((budget.get('skip_reasons') or {}).get('global_time_exhausted', 0))} 个；单目标时间耗尽 {((budget.get('skip_reasons') or {}).get('target_time_exhausted', 0))} 个。",
+            "",
+            "搜索结果只用于未核验补缺；结构化数据优先，F6 不使用网页补分。",
+            "",
+        ]
         return "\n".join(lines)
     lines = [
         f"# 搜索交叉验证：{name or code}（{code}）",
@@ -759,7 +1047,10 @@ def main() -> None:
     parser.add_argument("--context", default="")
     parser.add_argument("--provider", default=None)
     parser.add_argument("--targets-json", default="")
+    parser.add_argument("--refresh", action="store_true", help="Bypass same-day successful search cache")
     args = parser.parse_args()
+    if args.refresh:
+        os.environ["MODA_SEARCH_CACHE"] = "off"
     code = args.stock.strip()
     targets = json.loads(args.targets_json) if args.targets_json else None
     data = collect(code, args.name or code, args.context, args.provider, targets=targets)

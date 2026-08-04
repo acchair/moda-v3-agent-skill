@@ -18,6 +18,10 @@ class SubfactorResult:
     status: str
     reason: str
     sources: tuple[str, ...] = ()
+    verified_points: float = 0.0
+    provisional_points: float = 0.0
+    unknown_maximum: float = 0.0
+    coverage: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -30,6 +34,10 @@ class FactorResult:
     score: float
     maximum: float
     subfactors: tuple[SubfactorResult, ...]
+    verified_points: float = 0.0
+    provisional_points: float = 0.0
+    unknown_maximum: float = 0.0
+    coverage: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -38,6 +46,10 @@ class FactorResult:
             "score": self.score,
             "maximum": self.maximum,
             "subfactors": [item.to_dict() for item in self.subfactors],
+            "verified_points": self.verified_points,
+            "provisional_points": self.provisional_points,
+            "unknown_maximum": self.unknown_maximum,
+            "coverage": self.coverage,
         }
 
 
@@ -51,6 +63,10 @@ class AdjustmentResult:
     status: str
     reason: str
     sources: tuple[str, ...] = ()
+    verified_points: float = 0.0
+    provisional_points: float = 0.0
+    unknown_maximum: float = 0.0
+    coverage: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -67,6 +83,14 @@ class Scorecard:
     rating_reason: str
     signal: str
     hard_caps: tuple[dict[str, str], ...]
+    verified_points: float = 0.0
+    provisional_points: float = 0.0
+    unknown_maximum: float = 0.0
+    coverage: float = 0.0
+    research_score: float = 0.0
+    action_rating: str = "待补证"
+    action_rating_reason: str = ""
+    legacy_rating: str = "不碰"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +103,14 @@ class Scorecard:
             "rating_reason": self.rating_reason,
             "signal": self.signal,
             "hard_caps": list(self.hard_caps),
+            "verified_points": self.verified_points,
+            "provisional_points": self.provisional_points,
+            "unknown_maximum": self.unknown_maximum,
+            "coverage": self.coverage,
+            "research_score": self.research_score,
+            "action_rating": self.action_rating,
+            "action_rating_reason": self.action_rating_reason,
+            "legacy_rating": self.legacy_rating,
         }
 
 
@@ -119,22 +151,78 @@ def _sources(evidence: dict[str, Any], keys: Iterable[str]) -> tuple[str, ...]:
 def _subfactor(
     evidence: dict[str, Any], key: str, label: str, score: float, maximum: float,
     reason: str, metric_keys: Iterable[str], *, partial: bool = False,
+    coverage_keys: Iterable[str | tuple[str, ...]] | None = None,
 ) -> SubfactorResult:
+    metric_keys = tuple(dict.fromkeys(metric_keys))
+    coverage_keys = tuple(coverage_keys or metric_keys)
     sources = _sources(evidence, metric_keys)
+    sourced_keys = sum(
+        any(
+            _sources(evidence, (candidate,))
+            for candidate in (coverage_key if isinstance(coverage_key, tuple) else (coverage_key,))
+        )
+        for coverage_key in coverage_keys
+    )
+    raw_score = _bounded(score, 0, maximum)
     if not sources:
         status = "需人工确认"
-        score = 0
+        verified_points = 0.0
+        provisional_points = 0.0
+        unknown_maximum = float(maximum)
+        coverage = 0.0
+    elif partial:
+        status = "部分覆盖"
+        verified_points = 0.0
+        provisional_points = raw_score
+        source_coverage = sourced_keys / len(coverage_keys) if coverage_keys else 0.0
+        coverage = _bounded(source_coverage, 0, 1)
+        unknown_maximum = round(maximum * (1 - coverage), 2)
     else:
-        status = "部分覆盖" if partial else "已验证"
-    return SubfactorResult(key, label, _bounded(score, 0, maximum), maximum, status, reason, sources)
+        status = "已验证"
+        verified_points = raw_score
+        provisional_points = 0.0
+        unknown_maximum = 0.0
+        coverage = 1.0
+    return SubfactorResult(
+        key, label, raw_score, maximum, status, reason, sources,
+        round(verified_points, 2), round(provisional_points, 2),
+        round(unknown_maximum, 2), round(coverage, 4),
+    )
 
 
 def _missing(key: str, label: str, maximum: float, reason: str) -> SubfactorResult:
-    return SubfactorResult(key, label, 0, maximum, "需人工确认", reason)
+    return SubfactorResult(key, label, 0, maximum, "需人工确认", reason, (), 0.0, 0.0, maximum, 0.0)
 
 
 def _factor(key: str, label: str, maximum: float, items: list[SubfactorResult]) -> FactorResult:
-    return FactorResult(key, label, round(sum(item.score for item in items), 2), maximum, tuple(items))
+    verified = round(sum(item.verified_points for item in items), 2)
+    provisional = round(sum(item.provisional_points for item in items), 2)
+    unknown = round(sum(item.unknown_maximum for item in items), 2)
+    coverage = _bounded((maximum - unknown) / maximum if maximum else 1.0, 0, 1)
+    return FactorResult(
+        key, label, round(sum(item.score for item in items), 2), maximum, tuple(items),
+        verified, provisional, unknown, coverage,
+    )
+
+
+def _adjustment(
+    key: str,
+    label: str,
+    score: float,
+    maximum: float,
+    status: str,
+    reason: str,
+    sources: tuple[str, ...] = (),
+    *,
+    known: bool = False,
+    partial: bool = False,
+) -> AdjustmentResult:
+    score = _bounded(score, 0, maximum)
+    if not known:
+        return AdjustmentResult(key, label, score, 0, maximum, "需人工确认", reason, sources, 0, 0, maximum, 0)
+    if partial:
+        return AdjustmentResult(key, label, score, 0, maximum, status or "部分覆盖", reason, sources, 0, score, maximum / 2, 0.5)
+    return AdjustmentResult(key, label, score, 0, maximum, status or "已验证", reason, sources, score, 0, 0, 1)
 
 
 def _apply_web_fallback(factor: FactorResult, evidence: dict[str, Any]) -> FactorResult:
@@ -157,10 +245,22 @@ def _apply_web_fallback(factor: FactorResult, evidence: dict[str, Any]) -> Facto
             source = "SearXNG（未核验）" if provider == "searxng" else "DuckDuckGo MCP（未核验）" if provider == "duckduckgo" else "网络搜索（未核验）"
             reason = f"{item.reason}；网络补缺：{result.get('reason', '命中搜索线索')}" if item.status == "部分覆盖" else str(result.get("reason") or item.reason)
             sources = tuple(dict.fromkeys((*item.sources, source)))
-            updated.append(SubfactorResult(item.key, item.label, score, item.maximum, web_status, reason, sources))
+            coverage = max(item.coverage, 0.5)
+            status = "部分覆盖" if item.status == "部分覆盖" else web_status
+            updated.append(SubfactorResult(
+                item.key, item.label, score, item.maximum, status, reason, sources,
+                item.verified_points, round(max(item.provisional_points, score), 2),
+                round(item.maximum * (1 - coverage), 2), coverage,
+            ))
         else:
             reason = f"{item.reason}；{result.get('reason', web_status)}"
-            updated.append(SubfactorResult(item.key, item.label, item.score, item.maximum, web_status, reason, item.sources))
+            # A failed or empty web search is a gap annotation. It must not
+            # turn already supported structured evidence into a negative fact.
+            status = item.status if item.status == "部分覆盖" else web_status
+            updated.append(SubfactorResult(
+                item.key, item.label, item.score, item.maximum, status, reason, item.sources,
+                item.verified_points, item.provisional_points, item.unknown_maximum, item.coverage,
+            ))
     return _factor(factor.key, factor.label, factor.maximum, updated)
 
 
@@ -180,7 +280,11 @@ def _score_f1(evidence: dict[str, Any]) -> FactorResult:
             keys.append("penetration_rate")
             score += 5 if 0.05 <= penetration <= 0.20 else 3 if penetration <= 0.50 else 1
             details.append(f"产业渗透率 {penetration:.1%}")
-        items.append(_subfactor(evidence, "era_track", "大时代赛道", score, 10, "；".join(details), keys, partial=len(keys) < 2))
+        items.append(_subfactor(
+            evidence, "era_track", "大时代赛道", score, 10, "；".join(details), keys,
+            partial=len(keys) < 2,
+            coverage_keys=("industry_cagr_3y", "penetration_rate"),
+        ))
     elif track is None:
         items.append(_missing("era_track", "大时代赛道", 10, "缺少未来三年 CAGR、产业渗透率或可核验产业趋势"))
     else:
@@ -191,6 +295,7 @@ def _score_f1(evidence: dict[str, Any]) -> FactorResult:
             evidence, "era_track", "大时代赛道", track * 10, 10,
             f"关键词兜底：{track_reason}",
             ("track_strength",), partial=True,
+            coverage_keys=("industry_cagr_3y", "penetration_rate", "track_strength"),
         ))
 
     stage = evidence.get("chain_position") or evidence.get("chain_stage")
@@ -211,6 +316,8 @@ def _score_f1(evidence: dict[str, Any]) -> FactorResult:
 
     supply_count = _number(evidence.get("supply_evidence_count"))
     supply_tightening = evidence.get("supply_tightening")
+    supply_categories = _number(evidence.get("supply_category_count"))
+    supply_status = evidence.get("supply_signal_status")
     cr3 = _number(evidence.get("supply_cr3"))
     expansion_years = _number(evidence.get("capacity_expansion_cycle_years"))
     if supply_count is None and cr3 is None and expansion_years is None:
@@ -219,8 +326,12 @@ def _score_f1(evidence: dict[str, Any]) -> FactorResult:
         score, details, keys = 0.0, [], []
         if supply_count is not None:
             keys.extend(("supply_evidence_count", "supply_tightening"))
-            score += 2 if supply_count >= 2 and supply_tightening is True else 0.75 if supply_count >= 1 and supply_tightening is not False else 0
-            details.append(f"价格/库存/订单证据 {supply_count:g} 类，趋紧={supply_tightening}")
+            # Full supply-gap credit requires at least two independent
+            # categories agreeing. Conflicting/insufficient evidence stays
+            # partial and cannot be converted into a positive signal.
+            category_count = supply_categories if supply_categories is not None else supply_count
+            score += 2 if category_count >= 2 and supply_tightening is True and supply_status != "conflict" else 0.75 if category_count >= 1 and supply_tightening is not False and supply_status != "conflict" else 0
+            details.append(f"价格/库存/订单证据 {supply_count:g} 类（独立类别 {category_count:g}），趋紧={supply_tightening}")
         if cr3 is not None:
             keys.append("supply_cr3")
             score += 1.5 if cr3 > 70 else 1 if cr3 >= 50 else 0.5 if cr3 >= 30 else 0
@@ -231,7 +342,14 @@ def _score_f1(evidence: dict[str, Any]) -> FactorResult:
             details.append(f"扩产周期 {expansion_years:g} 年")
         items.append(_subfactor(
             evidence, "supply_gap", "供需失衡", score, 5, "；".join(details), keys,
-            partial=not all(value is not None for value in (supply_count, cr3, expansion_years)),
+            partial=bool(supply_status in {"conflict", "insufficient"}) or not all(
+                value is not None for value in (supply_count, supply_tightening, cr3, expansion_years)
+            ),
+            coverage_keys=(
+                ("supply_evidence_count", "supply_tightening"),
+                "supply_cr3",
+                "capacity_expansion_cycle_years",
+            ),
         ))
 
     choke = _number(evidence.get("chokepoint_score"))
@@ -247,7 +365,15 @@ def _score_f1(evidence: dict[str, Any]) -> FactorResult:
 
     capex_yoy = _fraction(evidence.get("capex_yoy"))
     capex = _number(evidence.get("capex_strength"))
-    if capex_yoy is None and capex is None:
+    capex_conflict = evidence.get("capex_conflict") is True
+    if capex_conflict:
+        items.append(_subfactor(
+            evidence, "capex_wave", "资本开支浪潮", 0, 4,
+            evidence.get("capex_reason", "公司侧与行业侧资本开支方向冲突"),
+            tuple(key for key in ("capex_yoy", "capex_strength", "capex_conflict") if key in evidence),
+            partial=True,
+        ))
+    elif capex_yoy is None and capex is None:
         items.append(_missing("capex_wave", "资本开支浪潮", 4, "缺少资本开支同比、订单或扩产证据"))
     elif capex_yoy is not None:
         score = 4 if capex_yoy > 0.30 else 3 if capex_yoy >= 0.10 else 2 if capex_yoy > 0 else 0
@@ -324,7 +450,13 @@ def _score_f3(evidence: dict[str, Any]) -> FactorResult:
 
     leadership = _number(evidence.get("leadership_strength"))
     if leadership is None:
-        items.append(_missing("leadership", "龙头/核心供应商", 5, "缺少行业地位或核心供应商证据"))
+        items.append(_missing(
+            "leadership", "龙头/核心供应商", 5,
+            evidence.get(
+                "leadership_missing_reason",
+                "缺少名单数据库命中、行业地位、市场份额/规模、客户供应关系、技术或资质证据",
+            ),
+        ))
     else:
         items.append(_subfactor(evidence, "leadership", "龙头/核心供应商", leadership * 5, 5, evidence.get("leadership_reason", "按行业地位证据判断"), ("leadership_strength",), partial=evidence.get("leadership_partial", False)))
 
@@ -367,7 +499,16 @@ def _score_f3(evidence: dict[str, Any]) -> FactorResult:
         items.append(_missing("financial_safety", "财务安全", 5, "缺少净现金、短债覆盖、经营造血和资产质量数据"))
     else:
         coverage_groups = sum((net_cash_ratio is not None, short_cover is not None, cash_quality is not None or (operating_cashflow is not None and net_profit is not None), bool(balance_checks)))
-        items.append(_subfactor(evidence, "financial_safety", "财务安全", financial_score, 5, "；".join(details), used_keys, partial=coverage_groups < 4))
+        items.append(_subfactor(
+            evidence, "financial_safety", "财务安全", financial_score, 5, "；".join(details), used_keys,
+            partial=coverage_groups < 4,
+            coverage_keys=(
+                "net_cash_ratio",
+                "cash_to_short_debt",
+                ("operating_cashflow_to_net_profit", "operating_cashflow", "net_profit"),
+                ("debt_ratio", "receivables_to_assets"),
+            ),
+        ))
 
     risk_checks = (
         ("st_risk", "ST/退市风险"),
@@ -390,11 +531,18 @@ def _score_f3(evidence: dict[str, Any]) -> FactorResult:
         items.append(_subfactor(
             evidence, "survival_risk", "退市/审计/商誉风险", score, 3, "；".join(details),
             tuple(key for key, _, _ in known_risks), partial=len(known_risks) < len(risk_checks),
+            coverage_keys=tuple(key for key, _ in risk_checks),
         ))
 
     special = _number(evidence.get("specialized_strength"))
     if special is None:
-        items.append(_missing("specialized", "专精特新/单项冠军", 2, "未发现可核验的专精特新或单项冠军证据"))
+        items.append(_missing(
+            "specialized", "专精特新/单项冠军", 2,
+            evidence.get(
+                "specialized_missing_reason",
+                "完整版名单数据库未命中，且未发现可核验的专精特新或单项冠军证据",
+            ),
+        ))
     else:
         items.append(_subfactor(evidence, "specialized", "专精特新/单项冠军", special * 2, 2, evidence.get("specialized_reason", "按公开标签判断"), ("specialized_strength",), partial=evidence.get("specialized_partial", False)))
     return _factor("F3", "生存能力与龙头", 20, items)
@@ -453,6 +601,7 @@ def _score_f4(evidence: dict[str, Any]) -> FactorResult:
             evidence, "realization", "订单/产能兑现", realization_score, 4,
             "；".join(details), keys,
             partial=len(keys) < 3 or conflict or evidence.get("industry_prosperity_coverage") not in (None, "完整"),
+            coverage_keys=("revenue_yoy", "profit_yoy", "order_growth"),
         ))
     return _factor("F4", "利润兑现路径", 15, items)
 
@@ -473,7 +622,12 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
             keys.append("product_price_to_history_high")
             score += 1.25 if product_cycle < 0.30 else 0.875 if product_cycle <= 0.50 else 0.375 if product_cycle <= 0.70 else 0
             details.append(f"产品价格/历史高点 {product_cycle:.1%}")
-        items.append(_subfactor(evidence, "price_position", "价格分位（逆向）", score, 2.5, "逆向评分：价格位置越低越有利；" + "；".join(details), keys, partial=len(keys) < 2))
+        items.append(_subfactor(
+            evidence, "price_position", "价格分位（逆向）", score, 2.5,
+            "逆向评分：价格位置越低越有利；" + "；".join(details), keys,
+            partial=len(keys) < 2,
+            coverage_keys=("price_percentile_3y", "product_price_to_history_high"),
+        ))
 
     pe = _number(evidence.get("pe_ttm"))
     peer = _number(evidence.get("peer_pe_ttm_median"))
@@ -518,6 +672,11 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
         items.append(_subfactor(
             evidence, "valuation", "PE/PB 相对位置（逆向）", score, 2, "逆向评分：估值分位越低越有利；" + "；".join(details), keys,
             partial=len(comparison_scores) < 2 or (pe_percentile is None and pb_percentile is None),
+            coverage_keys=(
+                ("pe_ttm", "peer_pe_ttm_median", "pe_percentile_5y"),
+                ("pb", "pb_percentile_5y", "pb_to_5y_median"),
+                ("pe_percentile_5y", "pb_percentile_5y", "pb_to_5y_median"),
+            ),
         ))
 
     attention_heat = _number(evidence.get("attention_heat"))
@@ -530,17 +689,14 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
     if heat is None and industry_cold_value is None:
         items.append(_missing("coldness", "行业冰点/市场冷落", 2, "缺少个股关注度、人气排名或行业冷落证据"))
     else:
-        survival_ok = f3_score >= 8 and evidence.get("st_risk") is not True
         attention_score = 1 if heat is not None and heat <= 0.20 else 0.75 if heat is not None and heat <= 0.40 else 0.25 if heat is not None and heat <= 0.60 else 0
-        score = (attention_score + (1 if industry_cold else 0)) if survival_ok else 0
+        score = attention_score + (1 if industry_cold else 0)
         reason = f"逆向评分：关注热度越低越有利；当前 {heat:.2f}" if heat is not None else "逆向评分：个股热度缺失"
         reason += f"；行业周期 {'处于冰点' if industry_cold else prosperity or '未确认冰点'}"
-        if not survival_ok:
-            reason += "；F3 生存门槛未通过，冷门不加分"
         items.append(_subfactor(
             evidence, "coldness", "行业冰点/市场冷落", score, 2, reason,
             ("attention_heat", "social_heat", "industry_cycle_cold"),
-            partial=heat is None or industry_cold_value is None or evidence.get("attention_partial", False) or evidence.get("social_partial", False) or not survival_ok,
+            partial=heat is None or industry_cold_value is None or evidence.get("attention_partial", False) or evidence.get("social_partial", False),
         ))
 
     details, keys = [], []
@@ -586,6 +742,7 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
             evidence, "inflection", "业绩拐点", inflection_score, 2,
             "反转确认：低位本身不等于反转；" + "；".join(details), keys,
             partial=len(keys) < 4 or conflict or evidence.get("industry_prosperity_coverage") not in (None, "完整"),
+            coverage_keys=("revenue_yoy", "profit_yoy", "revenue_yoy_delta", "profit_yoy_delta"),
         ))
 
     gap_details, gap_keys = [], []
@@ -619,24 +776,32 @@ def _score_f5(evidence: dict[str, Any], f3_score: float) -> FactorResult:
     if not gap_keys:
         items.append(_missing("expectation_gap", "预期差", 1.5, "缺少关注度与产业、订单或财务拐点的交叉证据"))
     else:
-        gap_score = 1.5 if low_attention and strong_track and company_improvement and f3_score >= 8 else 0
+        gap_score = 1.5 if low_attention and strong_track and company_improvement else 0
         prosperity = evidence.get("industry_prosperity_status")
         if prosperity:
             gap_details.append(f"行业景气 {prosperity}（只影响确信度）")
         if gap_score == 0:
-            gap_details.append("低关注、强产业、公司改善和生存门槛未同时满足；低位只提供赔率，不替代反转证据")
+            gap_details.append("低关注、强产业和公司改善未同时满足；低位只提供赔率，不替代反转证据")
         industry_conflict = bool(evidence.get("industry_prosperity_conflicts")) or prosperity == "走弱"
         items.append(_subfactor(
             evidence, "expectation_gap", "预期差", gap_score, 1.5,
             "；".join(gap_details), gap_keys,
             partial=gap_score == 0 or industry_conflict or evidence.get("industry_prosperity_coverage") not in (None, "完整"),
+            coverage_keys=(
+                ("attention_heat", "social_heat"),
+                "track_strength",
+                ("order_growth", "supply_tightening", "revenue_yoy_delta", "profit_yoy_delta"),
+            ),
         ))
     return _factor("F5", "低位与困境反转", 10, items)
 
 
 def _score_f6(adjustments: tuple[AdjustmentResult, ...]) -> FactorResult:
     items = tuple(
-        SubfactorResult(item.key, item.label, item.score, item.maximum, item.status, item.reason, item.sources)
+        SubfactorResult(
+            item.key, item.label, item.score, item.maximum, item.status, item.reason, item.sources,
+            item.verified_points, item.provisional_points, item.unknown_maximum, item.coverage,
+        )
         for item in adjustments
     )
     return _factor("F6", "修正项", 10, items)
@@ -656,19 +821,21 @@ def _adjustments(evidence: dict[str, Any], f1_score: float) -> tuple[AdjustmentR
     source_map = evidence.setdefault("metric_sources", {})
     source_map["institutional_direction"] = ["机构方法/量化选股筛选", "机构方法/投资逻辑追踪"]
     method_text = "；".join(f"{item['method']}={item['label']}（{item['reason']}）" for item in methods)
-    institutional_result = AdjustmentResult(
-        "institutional_direction", "机构方向", institutional_score, 0, 2, institutional_status,
+    institutional_result = _adjustment(
+        "institutional_direction", "机构方向", institutional_score, 2, institutional_status,
         f"机构方向{institutional_label}；{method_text}", tuple(source_map["institutional_direction"]),
+        known=bool(available), partial=len(available) < 2,
     )
 
     technical_score = _number(evidence.get("technical_structure_score"))
     if technical_score is None:
-        technical_result = AdjustmentResult("technical_structure", "技术结构", 0, 0, 4, "需人工确认", "技术分析未生成结构化得分")
+        technical_result = _adjustment("technical_structure", "技术结构", 0, 4, "需人工确认", "技术分析未生成结构化得分")
     else:
-        technical_result = AdjustmentResult(
-            "technical_structure", "技术结构", _bounded(technical_score, 0, 4), 0, 4, "已验证",
+        technical_result = _adjustment(
+            "technical_structure", "技术结构", _bounded(technical_score, 0, 4), 4, "已验证",
             str(evidence.get("technical_structure_reason") or "按缠论结构与技术指标综合判断"),
             _sources(evidence, ("technical_structure_score",)),
+            known=bool(_sources(evidence, ("technical_structure_score",))),
         )
 
     price = _number(evidence.get("price_percentile_3y"))
@@ -693,7 +860,7 @@ def _adjustments(evidence: dict[str, Any], f1_score: float) -> tuple[AdjustmentR
     social_complete = social_checked is not None and social_total is not None and social_checked >= social_total
     trap_complete = evidence.get("trap_risk_level") in {"低", "注意", "高"}
     if not sentiment_keys:
-        sentiment_result = AdjustmentResult("sentiment", "情绪/拥挤度", 0, 0, 2, "需人工确认", "缺少价格位置、个股热度和市场拥挤度证据")
+        sentiment_result = _adjustment("sentiment", "情绪/拥挤度", 0, 2, "需人工确认", "缺少价格位置、个股热度和市场拥挤度证据")
     else:
         score, reason = 1, "情绪和拥挤度处于中性区间"
         if trap_risk == "高":
@@ -704,16 +871,26 @@ def _adjustments(evidence: dict[str, Any], f1_score: float) -> tuple[AdjustmentR
         elif price is not None and price <= 0.35 and heat is not None and heat <= 0.35 and f1_score >= 15:
             score, reason = 2, "低位冷门且产业逻辑未破"
         fully_covered = len(sentiment_keys) >= 3 and social_complete and trap_complete
-        sentiment_result = AdjustmentResult("sentiment", "情绪/拥挤度", score, 0, 2, "已验证" if fully_covered else "部分覆盖", reason, _sources(evidence, sentiment_keys))
+        sentiment_result = _adjustment(
+            "sentiment", "情绪/拥挤度", score, 2, "已验证" if fully_covered else "部分覆盖", reason,
+            _sources(evidence, sentiment_keys), known=True, partial=not fully_covered,
+        )
 
     catalysts = _number(evidence.get("verified_catalyst_count"))
     if catalysts is None:
-        catalyst_result = AdjustmentResult("catalyst", "风口催化", 0, 0, 2, "需人工确认", "缺少公告或研报中的可验证催化")
+        catalyst_result = _adjustment("catalyst", "风口催化", 0, 2, "需人工确认", "缺少公告或研报中的可验证催化")
     else:
         score = min(2, max(0, int(catalysts)))
-        status = "已验证" if score > 0 else "部分覆盖"
-        reason = f"发现 {int(catalysts)} 项可验证催化" if score > 0 else "公告标题未发现可验证催化"
-        catalyst_result = AdjustmentResult("catalyst", "风口催化", score, 0, 2, status, reason, _sources(evidence, ("verified_catalyst_count",)))
+        partial = evidence.get("catalyst_partial", False) or score == 0
+        status = "部分覆盖" if partial else "已验证"
+        reason = evidence.get("catalyst_reason") or (
+            f"发现 {int(catalysts)} 项可验证催化" if score > 0 else "公告标题未发现可验证催化"
+        )
+        catalyst_result = _adjustment(
+            "catalyst", "风口催化", score, 2, status, reason,
+            _sources(evidence, ("verified_catalyst_count", "catalyst_event_count", "catalyst_confirmed_event_count")),
+            known=True, partial=partial,
+        )
     return institutional_result, technical_result, sentiment_result, catalyst_result
 
 
@@ -731,6 +908,34 @@ def _cap_rating(rating: str, cap: str) -> str:
     return RATING_ORDER[min(RATING_ORDER.index(rating), RATING_ORDER.index(cap))]
 
 
+def _evidence_rating(score: float, coverage: float) -> str:
+    """Map a score to a research label only after enough evidence is covered."""
+    if coverage < 0.60:
+        return "待补证"
+    return _base_rating(score)
+
+
+def _action_rating(
+    research_score: float,
+    coverage: float,
+    caps: list[dict[str, str]],
+) -> tuple[str, str]:
+    hard_risk = next((item for item in caps if item["result"] == "已触发" and item["cap"] == "不碰"), None)
+    if hard_risk:
+        return "不碰", hard_risk["condition"]
+    triggered = [item for item in caps if item["result"] == "已触发"]
+    if coverage < 0.60 and triggered:
+        cap = min((item["cap"] for item in triggered), key=RATING_ORDER.index)
+        return cap, f"已确认 Hard Cap：{'；'.join(item['condition'] for item in triggered)}"
+    if coverage < 0.60:
+        return "待补证", f"证据覆盖率 {coverage:.1%} 低于 60%，暂不据此给出仓位结论"
+    rating = _base_rating(research_score)
+    if triggered:
+        rating = min((rating, *(item["cap"] for item in triggered)), key=RATING_ORDER.index)
+        return rating, "；".join(f"{item['condition']}，评级最高为{item['cap']}" for item in triggered)
+    return rating, "覆盖率达到 60%，按研究分映射行动状态"
+
+
 def score_evidence(evidence: dict[str, Any]) -> Scorecard:
     core_factors = tuple(_apply_web_fallback(factor, evidence) for factor in (
         _score_f1(evidence), _score_f2(evidence), _score_f3(evidence), _score_f4(evidence),
@@ -742,13 +947,14 @@ def score_evidence(evidence: dict[str, Any]) -> Scorecard:
     base_score = round(sum(factor.score for factor in (*core_factors, f5)), 2)
     adjustment_score = round(f6.score, 2)
     final_score = _bounded(base_score + adjustment_score, 0, 100)
-    rating = _base_rating(final_score)
-    factor_map = {factor.key: factor.score for factor in factors}
+    legacy_rating = _base_rating(final_score)
+    rating = legacy_rating
     caps: list[dict[str, str]] = []
 
     web_results = evidence.get("web_subfactor_results") if isinstance(evidence.get("web_subfactor_results"), dict) else {}
     web_hard_caps = {
-        key for result in web_results.values() if isinstance(result, dict)
+        key for result in web_results.values()
+        if isinstance(result, dict) and result.get("status") == "已验证"
         for key, value in (result.get("hard_cap_signals") or {}).items() if value is True
     }
     st_risk = evidence.get("st_risk") is True or (evidence.get("st_risk") is None and "st_risk" in web_hard_caps)
@@ -767,11 +973,6 @@ def score_evidence(evidence: dict[str, Any]) -> Scorecard:
     else:
         caps.append({"condition": "控股股东或实控人减持", "result": "未触发" if controller_action in ("increase", "stable") else "需人工确认", "cap": "无" if controller_action in ("increase", "stable") else "需人工确认"})
 
-    floor_triggered = factor_map["F1"] < 15 or factor_map["F3"] < 8
-    caps.append({"condition": "F1 < 15 或 F3 < 8", "result": "已触发" if floor_triggered else "未触发", "cap": "学习仓" if floor_triggered else "无"})
-    if floor_triggered:
-        rating = _cap_rating(rating, "学习仓")
-
     price = _number(evidence.get("price_percentile_3y"))
     congestion = _number(evidence.get("market_congestion"))
     congestion_fresh = evidence.get("market_congestion_fresh") is True
@@ -783,19 +984,45 @@ def score_evidence(evidence: dict[str, Any]) -> Scorecard:
 
     triggered = [item for item in caps if item["result"] == "已触发"]
     base_rating = _base_rating(final_score)
+    legacy_rating = rating
     if triggered:
         cap_text = "；".join(f"{item['condition']}，评级最高为{item['cap']}" for item in triggered)
         rating_reason = f"综合分 {_bounded(final_score, 0, 100):g} 对应{base_rating}；{cap_text}"
     else:
         rating_reason = f"综合分 {_bounded(final_score, 0, 100):g} 对应{rating}，且未触发评级上限"
+    all_items = [item for factor in factors for item in factor.subfactors]
+    total_maximum = sum(item.maximum for item in all_items)
+    verified_points = round(sum(item.verified_points for item in all_items), 2)
+    provisional_points = round(sum(item.provisional_points for item in all_items), 2)
+    unknown_maximum = round(sum(item.unknown_maximum for item in all_items), 2)
+    coverage = _bounded((total_maximum - unknown_maximum) / total_maximum if total_maximum else 1.0, 0, 1)
+    known_maximum = max(0.0, total_maximum - unknown_maximum)
+    research_score = _bounded(
+        (verified_points + provisional_points) / known_maximum * 100 if known_maximum else 0.0,
+        0,
+        100,
+    )
+    action_rating, action_reason = _action_rating(research_score, coverage, caps)
+    rating_reason = (
+        f"研究分 {research_score:g}，证据覆盖率 {coverage:.1%}；"
+        f"行动评级 {action_rating}：{action_reason}"
+    )
     return Scorecard(
         factors=factors,
         adjustments=adjustments,
         base_score=base_score,
         adjustment_score=adjustment_score,
         final_score=final_score,
-        rating=rating,
+        rating=legacy_rating,
         rating_reason=rating_reason,
         signal=str(evidence.get("technical_signal") or "需人工确认"),
         hard_caps=tuple(caps),
+        verified_points=verified_points,
+        provisional_points=provisional_points,
+        unknown_maximum=unknown_maximum,
+        coverage=coverage,
+        research_score=research_score,
+        action_rating=action_rating,
+        action_rating_reason=action_reason,
+        legacy_rating=legacy_rating,
     )

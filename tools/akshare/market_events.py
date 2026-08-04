@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 import json
 from pathlib import Path
@@ -25,6 +26,12 @@ OUTPUT_BASE = ROOT / "knowledge" / "research" / "market_events"
 STATE_TERMS = ("国有", "国资", "人民政府", "财政", "国务院", "中央汇金", "国有资本", "国资委")
 INSTITUTION_TERMS = STATE_TERMS + ("社保", "基金", "保险", "证券", "银行", "中央结算", "投资管理", "资产管理")
 INDUSTRIAL_TERMS = ("产业投资", "产业资本", "控股集团", "实业集团")
+NOMINEE_HOLDER_TERMS = (
+    "HKSCC NOMINEES LIMITED",
+    "香港中央结算（代理人）有限公司",
+    "香港中央结算代理人有限公司",
+    "香港中央结算(代理人)有限公司",
+)
 
 
 def _safe_fetch(function: Callable[[], pd.DataFrame]) -> pd.DataFrame:
@@ -116,23 +123,48 @@ def _holder_metrics(holders: list[dict]) -> dict:
     top1 = holders[0]
     names = [item["name"] for item in holders]
     first_name = top1["name"]
-    if any(term in first_name for term in STATE_TERMS):
+    nominee = any(term.upper() in first_name.upper() for term in NOMINEE_HOLDER_TERMS)
+    effective_holder = next(
+        (item for item in holders if not any(term.upper() in str(item["name"]).upper() for term in NOMINEE_HOLDER_TERMS)),
+        None,
+    )
+    effective_name = str(effective_holder["name"]) if effective_holder else ""
+    if nominee and effective_holder is None:
+        background = None
+        background_reason = f"第一大股东 {first_name} 为名义持有人，真实控制人待核验"
+    elif nominee:
+        # Nominee custody is not evidence of weak control. Use the first
+        # disclosed non-nominee holder when it carries a recognizable
+        # shareholder-quality signal; otherwise keep the factor unknown.
+        if any(term in effective_name for term in STATE_TERMS):
+            background, background_reason = 1.0, f"名义持有人 {first_name} 之外，披露的主要股东 {effective_name} 具有国资背景"
+        elif any(term in effective_name for term in INDUSTRIAL_TERMS):
+            background, background_reason = 0.6, f"名义持有人 {first_name} 之外，披露的主要股东 {effective_name} 具有产业资本特征"
+        else:
+            background = None
+            background_reason = f"第一大股东 {first_name} 为名义持有人，实际控制人与控股股东性质需结合公司公告核验（当前参考 {effective_name}）"
+    elif any(term in first_name for term in STATE_TERMS):
         background, background_reason = 1.0, f"第一大股东 {first_name} 具有明确国资背景"
     elif any(term in first_name for term in INDUSTRIAL_TERMS):
         background, background_reason = 0.6, f"第一大股东 {first_name} 具有产业资本特征"
     else:
-        background, background_reason = 0.0, f"第一大股东 {first_name} 未识别出国资或强产业资本背景"
+        background = None
+        background_reason = f"第一大股东 {first_name} 未识别出国资或强产业资本背景，背景质量需人工确认"
     quality_count = sum(any(term in name for term in INSTITUTION_TERMS) for name in names)
-    return {
+    result = {
         "top_holders": holders,
         "top1_holder_pct": top1["ratio"],
-        "background_quality": background,
         "background_reason": background_reason,
-        "background_partial": background not in (0.0, 1.0),
+        "background_nominee_holder": nominee,
+        "effective_holder_name": effective_name,
+        "background_partial": background is not None and background not in (0.0, 1.0),
         "top10_quality": quality_count / len(names),
         "top10_quality_reason": f"前十大股东中识别到 {quality_count}/{len(names)} 个国资或长期机构",
         "top10_partial": len(names) < 10,
     }
+    if background is not None:
+        result["background_quality"] = background
+    return result
 
 
 def _security_name(frames: dict[str, pd.DataFrame]) -> str:
@@ -158,16 +190,28 @@ def collect(code: str) -> tuple[dict, dict[str, pd.DataFrame]]:
         "research": lambda: provider.research_reports(code, max_pages=1),
         "pledge": lambda: fetch_pledge(code),
         "fund_holding": lambda: fetch_fund_holding(code),
+        "top_holders": lambda: fetch_top_holders(code),
     }
     frames: dict[str, pd.DataFrame] = {}
     fetch_status: dict[str, dict] = {}
-    for key, fetcher in fetchers.items():
-        frame, ok, error = _fetch_result(fetcher)
-        frames[key] = frame
-        fetch_status[key] = {"ok": ok, "error": error}
-    try:
-        holders = fetch_top_holders(code)
-    except Exception:
+    # These endpoints are independent and mostly network-bound. Running them
+    # together prevents one slow provider from consuming the whole collector
+    # timeout and preserves per-endpoint status for downstream scoring.
+    with ThreadPoolExecutor(max_workers=len(fetchers)) as executor:
+        futures = {key: executor.submit(_fetch_result, fetcher) for key, fetcher in fetchers.items()}
+        for key, future in futures.items():
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = (pd.DataFrame(), False, f"{type(exc).__name__}: {exc}")
+            if key == "top_holders":
+                holders, ok, error = result
+                fetch_status[key] = {"ok": ok, "error": error}
+            else:
+                frame, ok, error = result
+                frames[key] = frame
+                fetch_status[key] = {"ok": ok, "error": error}
+    if "top_holders" not in fetch_status:
         holders = []
     structured = _holder_metrics(holders)
     structured["market_event_fetch_status"] = fetch_status
@@ -243,9 +287,9 @@ def collect(code: str) -> tuple[dict, dict[str, pd.DataFrame]]:
         leadership_terms = ("龙头", "核心供应商", "行业领先", "国产替代", "全球领先")
         hits = [term for term in leadership_terms if term in research_text]
         if hits:
-            structured["leadership_strength"] = min(1.0, 0.5 + len(hits) * 0.2)
-            structured["leadership_reason"] = "研报标题出现：" + "、".join(hits)
-            structured["leadership_partial"] = True
+            # Research titles are discovery clues only. The scoring evidence
+            # layer must corroborate leadership with sector-appropriate facts.
+            structured["leadership_clues"] = hits
     return structured, frames
 
 

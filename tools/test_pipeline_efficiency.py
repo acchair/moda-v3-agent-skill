@@ -16,12 +16,15 @@ import requests
 
 from tools.akshare import announcements, business_data, finance_data, market_events
 from tools import run_pipeline
+from tools import stock_resolver
 from tools.scoring import grader
 from tools.scoring import evidence as evidence_module
 from tools.scoring.model import score_evidence
 from tools.scoring import web_research
 from tools.scoring import search_rules
 from tools.scoring import stock_discussion
+from tools.scoring import classification_db
+from tools.scoring import announcement_rules
 from tools.providers import axdata_provider
 from tools.tdx.analyzer import AlphaSorosAnalyzer
 
@@ -62,6 +65,59 @@ def full_evidence() -> dict:
 
 
 class PipelineEfficiencyTest(unittest.TestCase):
+    def test_stock_name_resolver_prefers_local_index(self) -> None:
+        original = stock_resolver._INDEX
+        try:
+            stock_resolver._INDEX = {
+                "300820": {"code": "300820", "name": "英杰电气", "source": "test"},
+            }
+            with patch("tools.efinance.provider.search_stock", side_effect=AssertionError("local hit must not call remote")):
+                self.assertEqual(stock_resolver.resolve_stock_input(" 英杰电气 "), ("300820", "英杰电气"))
+        finally:
+            stock_resolver._INDEX = original
+
+    def test_stock_name_resolver_realtime_fallback_is_cached(self) -> None:
+        original = stock_resolver._INDEX
+        try:
+            stock_resolver._INDEX = {}
+            rows = [{"code": "000001", "name": "平安银行", "source": "test"}]
+            with patch("tools.efinance.provider.search_stock", return_value=rows) as search, \
+                 patch.object(stock_resolver, "_write_index") as write:
+                self.assertEqual(stock_resolver.resolve_stock_input("平安银行"), ("000001", "平安银行"))
+            search.assert_called_once_with("平安银行", limit=20)
+            write.assert_called()
+            self.assertEqual(stock_resolver.resolve_stock_input("000001"), ("000001", "平安银行"))
+        finally:
+            stock_resolver._INDEX = original
+
+    def test_stock_name_resolver_rejects_ambiguous_fallback(self) -> None:
+        original = stock_resolver._INDEX
+        try:
+            stock_resolver._INDEX = {}
+            rows = [
+                {"code": "000001", "name": "平安银行", "source": "test"},
+                {"code": "000002", "name": "平安证券", "source": "test"},
+            ]
+            with patch("tools.efinance.provider.search_stock", return_value=rows):
+                with self.assertRaisesRegex(ValueError, "不唯一"):
+                    stock_resolver.resolve_stock_input("平安")
+        finally:
+            stock_resolver._INDEX = original
+
+    def test_latest_classification_database_confirms_categories_by_code(self) -> None:
+        result = classification_db.lookup("000002", "万科A")
+        self.assertTrue(result["found"])
+        self.assertEqual(result["source"], "专精特新_行业龙头_核心供应商_A股名单_完整版.csv")
+        self.assertTrue(classification_db.has_category(result, "leadership"))
+        self.assertFalse(classification_db.has_category(result, "specialized"))
+
+    def test_classification_database_hit_skips_matching_web_gap(self) -> None:
+        with patch("tools.scoring.evidence.read_reports", return_value={}):
+            targets = run_pipeline.unresolved_targets("000002", "万科A", (), 0)
+        self.assertNotIn(("F3", "leadership"), {
+            (item["factor_key"], item["subfactor_key"]) for item in targets
+        })
+
     def test_discussion_structured_data_precedes_search(self) -> None:
         structured = [{"source": "xueqiu", "title": "中石科技订单改善", "text": "订单改善，业绩增长", "status": "结构化接口"}]
         with patch.object(stock_discussion, "_xueqiu", return_value=structured), \
@@ -179,7 +235,8 @@ class PipelineEfficiencyTest(unittest.TestCase):
                                        "reason": "控股股东减持", "provider": "duckduckgo",
                                        "hard_cap_signals": {"controller_reduction": True}}
         }
-        self.assertEqual(score_evidence(missing).rating, "学习仓")
+        self.assertEqual(score_evidence(missing).rating, "根")
+        self.assertEqual(score_evidence(missing).action_rating, "根")
         safe = full_evidence()
         safe["web_subfactor_results"] = missing["web_subfactor_results"]
         self.assertEqual(score_evidence(safe).rating, "根")
@@ -188,6 +245,83 @@ class PipelineEfficiencyTest(unittest.TestCase):
         card = score_evidence({"metric_sources": {}})
         expected = {f"{factor.key}.{item.key}" for factor in card.factors if factor.key != "F6" for item in factor.subfactors}
         self.assertEqual(set(search_rules.RULES), expected)
+
+    def test_leadership_headline_is_only_a_clue_without_structured_evidence(self) -> None:
+        reports = {
+            "market_events": '<!-- moda_market_events: {"research_titles": ["测试公司是行业龙头、核心供应商"]} -->',
+        }
+        evidence = evidence_module.build_evidence("000001", "测试公司", reports)
+        self.assertNotIn("leadership_strength", evidence)
+        self.assertEqual(evidence.get("leadership_clues"), ["行业龙头", "核心供应商"])
+        self.assertIn("只有研报/行情标题线索", evidence.get("leadership_missing_reason", ""))
+
+    def test_leadership_uses_sector_appropriate_dimensions(self) -> None:
+        reports = {
+            "finance_data": '<!-- moda_metrics: {"industry": "乘用车"} --> 全国乘用车市场份额第一，销量领先',
+            "business_data": '<!-- moda_business: {"main_business": "汽车制造"} --> 核心技术领先，发明专利数量较多',
+            "announcements": "公司是核心供应商，已量产供货并进入头部客户供应链。",
+        }
+        evidence = evidence_module.build_evidence("000001", "测试公司", reports)
+        self.assertEqual(evidence["leadership_profile"], "制造/消费")
+        self.assertEqual(evidence["leadership_strength"], 1.0)
+        self.assertEqual(evidence["leadership_dimension_count"], 4)
+        self.assertIn("市场份额/排名", evidence["leadership_reason"])
+        self.assertIn("客户/核心供应关系", evidence["leadership_reason"])
+
+    def test_leadership_search_requires_dimensions_not_a_single_label(self) -> None:
+        row = {
+            "title": "某公司行业龙头",
+            "snippet": "市场地位稳固",
+            "url": "https://example.test",
+            "fetch_status": "ok",
+        }
+        result = search_rules.evaluate("F3.leadership", 5, [row])
+        self.assertEqual(result["status"], "已搜索未命中")
+        row["snippet"] = "市场份额第一，核心供应商，客户覆盖全国"
+        result = search_rules.evaluate("F3.leadership", 5, [row])
+        self.assertEqual(result["status"], "网络命中（未核验）")
+        self.assertEqual(result["score"], 3.75)
+
+    def test_gap_budget_selection_covers_each_factor_and_prioritizes_leadership(self) -> None:
+        targets = [
+            {"factor_key": factor, "subfactor_key": f"x{i}", "maximum": 5 if i == 0 else 2, "original_status": "需人工确认"}
+            for factor in ("F1", "F2", "F3", "F4", "F5")
+            for i in range(4)
+        ]
+        selected, skipped = web_research._select_gap_targets(targets)
+        self.assertEqual(len(selected), web_research.MAX_GAP_TARGETS)
+        self.assertEqual(len(skipped), len(targets) - web_research.MAX_GAP_TARGETS)
+        self.assertEqual({item["factor_key"] for item in selected}, {"F1", "F2", "F3", "F4", "F5"})
+        self.assertIn("F3.x0", {f"{item['factor_key']}.{item['subfactor_key']}" for item in selected})
+        budgets = web_research._allocate_gap_budgets(selected)
+        self.assertAlmostEqual(sum(budgets.values()), web_research.MAX_GAP_BUDGET_SECONDS, places=2)
+        self.assertGreaterEqual(min(budgets.values()), web_research.MIN_TARGET_BUDGET_SECONDS)
+
+    def test_gap_budget_report_distinguishes_target_limit_from_time_exhaustion(self) -> None:
+        report = web_research.build_report("000001", "测试", {
+            "web_gap_results": [{
+                "factor_key": "F3", "subfactor_key": "leadership", "label": "龙头/核心供应商",
+                "original_status": "需人工确认", "status": "搜索失败，需人工确认", "score": 0, "maximum": 5,
+                "provider": "none", "reason": "超过缺口目标数量上限 12，本目标未分配搜索预算",
+                "selection_status": "skipped", "target_budget_seconds": 0,
+                "budget_used_seconds": 0, "evidence": [],
+            }],
+            "web_research_provider": "none",
+            "search_budget": {
+                "budget_total_seconds": 75,
+                "budget_used_seconds": 75,
+                "targets_total": 20,
+                "targets_selected": 12,
+                "targets_skipped": 8,
+                "global_time_exhausted": True,
+                "selection_policy": "测试选择规则",
+                "allocation_policy": "测试分配规则",
+                "skip_reasons": {"target_limit_exceeded": 8, "global_time_exhausted": 1, "target_time_exhausted": 2},
+            },
+        })
+        self.assertIn("目标数量上限 8 个", report)
+        self.assertIn("全局时间耗尽：是", report)
+        self.assertIn("单目标时间耗尽 2 个", report)
 
     def test_pipeline_targets_manual_and_partial_f1_to_f5_but_not_f6(self) -> None:
         with patch("tools.scoring.evidence.read_reports", return_value={}), \
@@ -235,6 +369,47 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual((used, rows), ("duckduckgo", row))
         self.assertIn("searxng:TimeoutError", errors)
 
+    def test_gap_search_reuses_only_same_day_success(self) -> None:
+        row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(web_research, "CACHE_PATH", Path(directory) / "search.json"), \
+             patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off"}, clear=False), \
+             patch.object(web_research, "_searxng_search", return_value=row) as search:
+            first = web_research._search("auto", "测试查询", 0.1, cache_scope="000001|F1.era_track")
+            second = web_research._search("auto", "测试查询", 0.1, cache_scope="000001|F1.era_track")
+        self.assertEqual(first, second)
+        search.assert_called_once()
+
+    def test_gap_search_does_not_cache_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(web_research, "CACHE_PATH", Path(directory) / "search.json"), \
+             patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off"}, clear=False), \
+             patch.object(web_research, "_searxng_search", return_value=[]) as search:
+            web_research._search("auto", "失败查询", 0.1, cache_scope="000001|F1.era_track")
+            web_research._search("auto", "失败查询", 0.1, cache_scope="000001|F1.era_track")
+        self.assertEqual(search.call_count, 2)
+
+    def test_gap_search_cache_scope_separates_stocks_and_factors(self) -> None:
+        row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(web_research, "CACHE_PATH", Path(directory) / "search.json"), \
+             patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off"}, clear=False), \
+             patch.object(web_research, "_searxng_search", return_value=row) as search:
+            web_research._search("auto", "同一查询", 0.1, cache_scope="000001|F1.era_track")
+            web_research._search("auto", "同一查询", 0.1, cache_scope="000002|F1.era_track")
+            web_research._search("auto", "同一查询", 0.1, cache_scope="000001|F1.supply_gap")
+        self.assertEqual(search.call_count, 3)
+
+    def test_gap_search_cache_can_be_disabled_for_refresh(self) -> None:
+        row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(web_research, "CACHE_PATH", Path(directory) / "search.json"), \
+             patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off", "MODA_SEARCH_CACHE": "off"}, clear=False), \
+             patch.object(web_research, "_searxng_search", return_value=row) as search:
+            web_research._search("auto", "刷新查询", 0.1, cache_scope="000001|F1.era_track")
+            web_research._search("auto", "刷新查询", 0.1, cache_scope="000001|F1.era_track")
+        self.assertEqual(search.call_count, 2)
+
     def test_china_finance_sources_are_tiered_and_prioritized(self) -> None:
         self.assertEqual(web_research._source_role("static.cninfo.com.cn"), ("法定信息披露", "A"))
         self.assertEqual(web_research._source_role("news.cls.cn"), ("财经媒体", "B"))
@@ -260,11 +435,17 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual([factor.key for factor in card.factors], ["F1", "F2", "F3", "F4", "F5", "F6"])
         self.assertEqual(sum(len(factor.subfactors) for factor in card.factors), 28)
 
-    def test_missing_evidence_scores_zero(self) -> None:
+    def test_missing_evidence_is_unknown_not_negative(self) -> None:
         card = score_evidence({"metric_sources": {}})
         self.assertEqual(card.base_score, 0)
         self.assertTrue(all(item.score == 0 for factor in card.factors for item in factor.subfactors))
         self.assertTrue(all(item.status == "需人工确认" for factor in card.factors for item in factor.subfactors))
+        self.assertEqual(card.unknown_maximum, 100)
+        self.assertEqual(card.coverage, 0)
+        self.assertEqual(card.research_score, 0)
+        self.assertEqual(card.rating, "不碰")
+        self.assertEqual(card.action_rating, "待补证")
+        self.assertEqual(card.legacy_rating, "不碰")
 
     def test_f5_modifiers_are_bounded_to_ten_points(self) -> None:
         positive = score_evidence(full_evidence())
@@ -355,13 +536,15 @@ class PipelineEfficiencyTest(unittest.TestCase):
         data["controller_action"] = "reduction"
         self.assertEqual(score_evidence(data).rating, "学习仓")
 
-    def test_factor_floor_hard_cap(self) -> None:
+    def test_factor_floor_does_not_trigger_hard_cap(self) -> None:
         data = full_evidence()
         data.update({"track_strength": 0, "industry_cagr_3y": 0.05, "penetration_rate": 0.8,
                      "chain_stage": "downstream", "supply_tightening": False, "supply_cr3": 20,
                      "capacity_expansion_cycle_years": 0.5, "chokepoint_score": 0,
                      "capex_strength": 0, "capex_yoy": -0.1})
-        self.assertEqual(score_evidence(data).rating, "学习仓")
+        card = score_evidence(data)
+        self.assertNotIn("F1 < 15 或 F3 < 8", {item["condition"] for item in card.hard_caps})
+        self.assertNotEqual(card.rating_reason, "综合分 0 对应不碰；F1 < 15 或 F3 < 8，评级最高为学习仓")
 
     def test_stale_congestion_does_not_cap(self) -> None:
         data = full_evidence()
@@ -414,10 +597,12 @@ class PipelineEfficiencyTest(unittest.TestCase):
         evidence["completed_modules"] = []
         card = score_evidence(evidence)
         report = grader.render_report("300820", "英杰电气", evidence, card, ())
-        for heading in ("## 综合得分", "## 一句话结论与最终判断", "## 技术分析（easy-tdx 日 K）", "## 行业景气度交叉验证", "## 六层图形概览",
+        for heading in ("## 研究评分", "## 一句话结论与最终判断", "## 技术分析（easy-tdx 日 K）", "## 行业景气度交叉验证", "## 六层图形概览",
                         "## 六层评分卡", "## F5 低位与困境反转", "## F6 修正项", "## 舆情、社交热榜与异常推广风险",
                         "## Hard Cap 检查", "## 机构方法交叉验证", "## 睡得着检查"):
             self.assertIn(heading, report)
+        self.assertNotIn("原始综合分", report)
+        self.assertNotIn("原始评级", report)
         conclusion = report.split("## 一句话结论与最终判断", 1)[1].split("## 六层图形概览", 1)[0]
         for number in range(1, 7):
             self.assertIn(f"{number}. ", conclusion)
@@ -430,17 +615,17 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertNotIn("| 排名 | 指标", report)
         self.assertNotIn("A股适用性", report)
         self.assertIn("当前价格：30.0；支撑位：28.0；压力位：33.0", report)
-        self.assertIn("F6 是独立的第六层，已计入综合分", report)
+        self.assertIn("F6 是独立的第六层，已计入研究分", report)
         self.assertIn("**1. 一句话逻辑**\n\n", report)
         self.assertIn("**6. 最终判断**\n\n", report)
         self.assertIn("### 莫大视角总览", report)
         self.assertIn("| 核心问题 | 图示 | 大白话结论 | 数据与理由 |", report)
         self.assertIn("### 核心上下游对应表", report)
-        self.assertIn("产业链：半导体设备产业链；公司位置：上游", report)
+        self.assertIn("产业链：半导体设备产业链；公司位置：上游；匹配类型：待确认", report)
         self.assertIn("| 环节 | 核心内容 | 与公司的关系 | 判断 |", report)
         self.assertIn("公司主营映射到本环节：刻蚀设备、薄膜沉积设备；相关收入占比 60.0%", report)
 
-    def test_coldness_requires_f3_survival_gate(self) -> None:
+    def test_coldness_does_not_require_f3_survival_gate(self) -> None:
         data = full_evidence()
         for key in ("background_quality", "leadership_strength", "net_profit", "operating_cashflow",
                     "debt_ratio", "cash_to_debt", "st_risk", "audit_risk", "goodwill_risk", "specialized_strength"):
@@ -448,15 +633,91 @@ class PipelineEfficiencyTest(unittest.TestCase):
             data["metric_sources"].pop(key, None)
         f5 = next(factor for factor in score_evidence(data).factors if factor.key == "F5")
         coldness = next(item for item in f5.subfactors if item.key == "coldness")
-        self.assertEqual(coldness.score, 0)
-        self.assertIn("生存门槛未通过", coldness.reason)
+        self.assertEqual(coldness.score, 2)
+        self.assertNotIn("生存门槛未通过", coldness.reason)
 
-    def test_expectation_gap_requires_low_attention(self) -> None:
+    def test_expectation_gap_does_not_require_f3_gate(self) -> None:
         data = full_evidence()
         data["attention_heat"] = 0.8
         f5 = next(factor for factor in score_evidence(data).factors if factor.key == "F5")
         gap = next(item for item in f5.subfactors if item.key == "expectation_gap")
         self.assertEqual(gap.score, 0)
+
+    def test_expectation_gap_can_score_before_f3_is_complete(self) -> None:
+        data = full_evidence()
+        for key in ("background_quality", "leadership_strength", "net_profit", "operating_cashflow",
+                    "debt_ratio", "cash_to_debt", "st_risk", "audit_risk", "goodwill_risk", "specialized_strength"):
+            data.pop(key, None)
+            data["metric_sources"].pop(key, None)
+        data.update({"attention_heat": 0.2, "track_strength": 1.0, "order_growth": 10})
+        f5 = next(factor for factor in score_evidence(data).factors if factor.key == "F5")
+        gap = next(item for item in f5.subfactors if item.key == "expectation_gap")
+        self.assertEqual(gap.score, 1.5)
+
+    def test_missing_evidence_does_not_trigger_action_no_touch(self) -> None:
+        card = score_evidence({"metric_sources": {}})
+        self.assertEqual(card.action_rating, "待补证")
+        self.assertFalse(any(item["result"] == "已触发" for item in card.hard_caps))
+
+    def test_search_failure_preserves_structured_score_and_status(self) -> None:
+        data = full_evidence()
+        data["web_subfactor_results"] = {
+            "F1.era_track": {
+                "status": "搜索失败，需人工确认",
+                "score": 0,
+                "reason": "search_budget_exhausted",
+            },
+        }
+        card = score_evidence(data)
+        era = next(item for factor in card.factors for item in factor.subfactors if item.key == "era_track")
+        self.assertEqual(era.score, 10)
+        self.assertEqual(era.status, "已验证")
+
+    def test_unverified_web_hard_cap_does_not_trigger(self) -> None:
+        data = full_evidence()
+        data.pop("controller_action")
+        data["metric_sources"].pop("controller_action")
+        data["web_subfactor_results"] = {
+            "F2.controller_action": {
+                "status": "网络命中（未核验）",
+                "score": 0,
+                "reason": "控股股东减持",
+                "hard_cap_signals": {"controller_reduction": True},
+            },
+        }
+        card = score_evidence(data)
+        self.assertEqual(card.action_rating, "根")
+        self.assertEqual(next(item for item in card.hard_caps if item["condition"] == "控股股东或实控人减持")["result"], "需人工确认")
+
+    def test_nominee_holder_is_not_negative_background(self) -> None:
+        holders = [
+            {"rank": 1, "name": "HKSCC NOMINEES LIMITED", "ratio": 40.38},
+            {"rank": 2, "name": "王传福", "ratio": 16.90},
+        ]
+        metrics = market_events._holder_metrics(holders)
+        self.assertTrue(metrics["background_nominee_holder"])
+        self.assertNotIn("background_quality", metrics)
+        self.assertIn("名义持有人", metrics["background_reason"])
+
+    def test_precise_validation_chains_outrank_generic_industry_labels(self) -> None:
+        cases = [
+            ("002594", "比亚迪", "新能源汽车综合产业链"),
+            ("688114", "华大智造", "生命科学仪器产业链"),
+            ("688268", "华特气体", "半导体电子特气产业链"),
+            ("000762", "西藏矿业", "锂资源与盐湖产业链"),
+        ]
+        for code, name, expected in cases:
+            evidence = evidence_module.build_evidence(code, name, {
+                "finance_data": f'<!-- moda_metrics: {{"industry": "综合"}} -->',
+                "business_data": f'<!-- moda_business: {{"main_business": "{name}"}} -->',
+            })
+            self.assertEqual(evidence.get("chain_name"), expected)
+
+    def test_confirmed_high_risk_caps_survive_unknown_coverage(self) -> None:
+        data = {"metric_sources": {}, "st_risk": True}
+        card = score_evidence(data)
+        self.assertEqual(card.action_rating, "不碰")
+        self.assertEqual(card.rating, "不碰")
 
     def test_industry_prosperity_only_changes_confidence_not_score(self) -> None:
         baseline = score_evidence(full_evidence())
@@ -638,6 +899,15 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual(web_research._validate_specialized(valid)["strength"], 1.0)
         self.assertEqual(web_research._validate_specialized(invalid)["status"], "需人工确认")
 
+    def test_announcement_title_without_date_or_hard_detail_is_only_a_clue(self) -> None:
+        events = announcement_rules.extract_announcement_events([
+            {"date": "", "title": "公司扩产项目公告"},
+            {"date": "2026-08-03", "title": "公司新增产能10000吨，项目投产"},
+        ])
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["hard_detail"])
+        self.assertEqual(events[0]["category"], "capacity")
+
     def test_web_catalyst_requires_authority_company_event_and_fresh_date(self) -> None:
         valid = [{"fetch_status": "ok", "source_tier": "A", "company_named": True,
                   "catalyst_categories": ["orders"], "evidence_fresh": True}]
@@ -773,6 +1043,34 @@ class PipelineEfficiencyTest(unittest.TestCase):
         valuation = next(item for factor in score_evidence(data).factors for item in factor.subfactors if item.key == "valuation")
         self.assertEqual(valuation.score, 1)
         self.assertEqual(valuation.status, "部分覆盖")
+        self.assertGreater(valuation.unknown_maximum, 0)
+
+    def test_valuation_without_historical_percentiles_keeps_unknown_headroom(self) -> None:
+        data = full_evidence()
+        for key in ("pe_percentile_5y", "pb_percentile_5y", "pb_to_5y_median"):
+            data.pop(key, None)
+            data["metric_sources"].pop(key, None)
+        valuation = next(item for factor in score_evidence(data).factors for item in factor.subfactors if item.key == "valuation")
+        self.assertEqual(valuation.status, "部分覆盖")
+        self.assertGreater(valuation.unknown_maximum, 0)
+
+    def test_high_valuation_and_weak_technical_structure_still_deduct(self) -> None:
+        data = full_evidence()
+        data.update({
+            "pe_ttm": 120,
+            "peer_pe_ttm_median": 90,
+            "pb": 8,
+            "pe_percentile_5y": 0.95,
+            "pb_to_5y_median": 1.6,
+            "technical_structure_score": 0,
+            "technical_structure_reason": "趋势走弱，缠论向下",
+        })
+        card = score_evidence(data)
+        valuation = next(item for factor in card.factors for item in factor.subfactors if item.key == "valuation")
+        technical = next(item for item in card.adjustments if item.key == "technical_structure")
+        self.assertEqual(valuation.score, 0)
+        self.assertEqual(technical.score, 0)
+        self.assertLess(card.final_score, score_evidence(full_evidence()).final_score)
 
     def test_supply_details_do_not_crash_f3_scoring(self) -> None:
         data = full_evidence()
@@ -927,8 +1225,9 @@ class PipelineEfficiencyTest(unittest.TestCase):
         }
         evidence = evidence_module.build_evidence("000001", "测试", reports)
         self.assertEqual(evidence["industry_capex_signal"], "上行")
-        self.assertEqual(evidence["capex_strength"], 1.0)
-        self.assertIn("easy_tdx/CNINFO + AKShare/CNINFO", evidence["metric_sources"]["capex_strength"])
+        self.assertEqual(evidence["capex_strength"], 0.5)
+        self.assertTrue(evidence["capex_partial"])
+        self.assertNotIn("easy_tdx/CNINFO + AKShare/CNINFO", evidence["metric_sources"]["capex_strength"])
         self.assertIn("SearXNG + DuckDuckGo MCP", evidence["metric_sources"]["capex_strength"])
 
 if __name__ == "__main__":

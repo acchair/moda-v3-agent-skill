@@ -27,6 +27,7 @@ apply_patch()
 
 import akshare as ak
 import pandas as pd
+from tools.scoring.announcement_rules import catalyst_summary, capex_event_summary, extract_announcement_events
 OUTPUT_BASE = ROOT / "knowledge/research/announcements"
 ANNOUNCEMENT_PAGE_SIZE = 100
 ANNOUNCEMENT_MAX_PAGES = 5
@@ -183,7 +184,8 @@ def extract_keywords_from_qa(qa_list: list) -> dict:
 
 def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    titles = [str(item.get("title", "")) for item in ann_data.get("ann_list", [])]
+    ann_list = list(ann_data.get("ann_list", []))
+    titles = [str(item.get("title", "")) for item in ann_list]
     title_text = " ".join(titles)
     reduction = bool(re.search(r"(?:控股股东|实际控制人|实控人)[^。；\n]{0,35}减持|减持[^。；\n]{0,35}(?:控股股东|实际控制人|实控人)", title_text))
     increase = bool(re.search(r"(?:控股股东|实际控制人|实控人)[^。；\n]{0,35}增持|增持[^。；\n]{0,35}(?:控股股东|实际控制人|实控人)", title_text))
@@ -193,9 +195,12 @@ def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str
     controller_action = "reduction" if reduction else "increase" if increase else "stable" if controller_checked else None
     qa_text = " ".join(f"{item.get('question', '')} {item.get('answer', '')}" for item in irm_data.get("qa_list", []))
     growth_matches = re.findall(r"(?:订单|新增订单)[^\n。]{0,40}?(?:同比(?:增幅)?|增长)[^\d]{0,8}([0-9]+(?:\.[0-9]+)?)%", qa_text)
-    catalyst_terms = ("中标", "重大合同", "新增订单", "订单增长", "扩产", "投产", "涨价", "回购", "增持", "业绩预增", "扭亏")
+    announcement_events = extract_announcement_events(ann_list)
+    catalyst_data = catalyst_summary(announcement_events)
+    capex_data = capex_event_summary(announcement_events)
     structured = {
         "announcement_titles": titles,
+        "announcement_events": announcement_events,
         "announcement_lookback_days": ann_data.get("days"),
         "announcement_fetch_ok": fetch_ok,
         "announcement_coverage_complete": coverage_complete,
@@ -205,9 +210,9 @@ def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str
     audit_risk = any(term in title_text for term in ("非标准审计", "保留意见", "无法表示意见", "否定意见", "退市风险警示"))
     if audit_risk or coverage_complete:
         structured["audit_risk"] = audit_risk
-    catalyst_count = sum(term in title_text for term in catalyst_terms)
-    if catalyst_count or coverage_complete:
-        structured["verified_catalyst_count"] = catalyst_count
+    if catalyst_data["catalyst_event_count"] or coverage_complete:
+        structured.update(catalyst_data)
+    structured.update(capex_data)
     if growth_matches:
         structured["order_growth"] = max(float(value) for value in growth_matches)
 

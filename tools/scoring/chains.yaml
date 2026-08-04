@@ -93,7 +93,7 @@ chains:
       keywords: [智能手机, 汽车电子, 通信基站, 服务器, 工业控制, 物联网, AI芯片, 自动驾驶芯片, 军工电子]
 
   - name: 半导体电子特气产业链
-    aliases: [电子特气, 半导体特气, 光刻气, 特种气体, 高纯气体]
+    aliases: [电子特气, 半导体特气, 光刻气, 特种气体, 高纯气体, 华特气体]
     upstream:
       industries: [电子化学品, 化学制品, 半导体]
       keywords: [电子特气, 半导体特气, 光刻气, 特种气体, 高纯气体, 光刻及其他混合气体, 氢化物, 氮氧化合物, 混合气体]
@@ -358,6 +358,18 @@ chains:
       industries: [汽车服务, 汽车金融]
       keywords: [4S店, 经销商, 维修保养, 二手车, 汽车金融, 汽车保险, 充电, 加油]
 
+  - name: 新能源汽车综合产业链
+    aliases: [新能源汽车, 新能源汽车整车, 电动车, 电动汽车, 比亚迪]
+    upstream:
+      industries: [能源金属, 电池, 电源设备, 汽车零部件]
+      keywords: [锂资源, 动力电池, 电池材料, 电驱系统, 电控系统, 功率半导体, 热管理]
+    midstream:
+      industries: [汽车整车, 电池, 电源设备, 乘用车, 电动乘用车]
+      keywords: [新能源汽车, 纯电汽车, 插混汽车, 动力电池, 电池包, 整车制造, 智能汽车]
+    downstream:
+      industries: [汽车服务, 港口航运, 物流]
+      keywords: [汽车出海, 整车出口, 海外经销商, 充换电, 售后服务, 汽车金融]
+
   - name: 智能驾驶产业链
     aliases: [智能驾驶, 自动驾驶, 智驾, ADAS, 无人驾驶]
     upstream:
@@ -429,6 +441,30 @@ chains:
     downstream:
       industries: [医疗服务, 医药商业]
       keywords: [医院, 体检中心, 第三方检验, 经销商, 集采, DRG/DIP]
+
+  - name: 生命科学仪器产业链
+    aliases: [生命科学仪器, 基因测序, 测序仪, 实验室设备, 科研仪器, 华大智造]
+    upstream:
+      industries: [电子元件, 半导体, 精密仪器]
+      keywords: [光学器件, 芯片, 流体控制, 精密机械, 试剂耗材, 温控系统]
+    midstream:
+      industries: [科研仪器, 医疗器械]
+      keywords: [基因测序仪, 测序仪, 自动化样本处理, 实验室设备, 生命科学仪器, 生物信息设备]
+    downstream:
+      industries: [生物制品, 医疗服务, 科研服务]
+      keywords: [基因测序, 分子诊断, 生物医药研发, 科研实验室, 临床检测, 药物发现]
+
+  - name: 锂资源与盐湖产业链
+    aliases: [锂资源, 锂矿, 盐湖资源, 盐湖提锂, 西藏矿业]
+    upstream:
+      industries: [能源金属, 有色金属]
+      keywords: [锂矿勘探, 盐湖资源, 盐湖卤水, 锂资源储量, 战略矿产, 锂精矿, 铬铁矿, 采掘业, 矿产开采, 资源开发]
+    midstream:
+      industries: [能源金属, 化学原料]
+      keywords: [盐湖提锂, 碳酸锂, 氢氧化锂, 锂盐, 锂化工, 电池级锂盐]
+    downstream:
+      industries: [电池, 化学制品, 汽车整车]
+      keywords: [动力电池, 储能电池, 正极材料, 新能源汽车, 电池回收]
 
   - name: 中药产业链
     aliases: [中药, 中成药, 中药材, 配方颗粒]

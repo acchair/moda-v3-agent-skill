@@ -39,6 +39,11 @@ def _change(series: pd.Series) -> float | None:
     return float(clean.iloc[-1] / clean.iloc[0] - 1)
 
 
+def _latest_value(series: pd.Series) -> float | None:
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+    return float(clean.iloc[-1]) if not clean.empty else None
+
+
 def collect(context: str, lookback_days: int = 30) -> dict:
     mapping = match_mapping(context)
     if not mapping:
@@ -65,25 +70,37 @@ def collect(context: str, lookback_days: int = 30) -> dict:
     if not spot.empty and "spot_price" in spot:
         spot_change = _change(spot["spot_price"])
         if spot_change is not None:
-            evidence.append({"category": "spot_price", "value": round(spot_change, 4), "tightening": spot_change >= 0.03})
+            evidence.append({"category": "spot_price", "value": round(spot_change, 4), "tightening": spot_change >= 0.03,
+                             "threshold": 0.03, "window_days": lookback_days})
     if not spot.empty and "dom_basis_rate" in spot:
-        basis = pd.to_numeric(spot["dom_basis_rate"], errors="coerce").dropna()
-        if not basis.empty:
-            latest_basis = float(basis.iloc[-1])
-            evidence.append({"category": "basis", "value": round(latest_basis, 4), "tightening": latest_basis <= -0.01})
+        latest_basis = _latest_value(spot["dom_basis_rate"])
+        if latest_basis is not None:
+            # Positive basis/backwardation is the tightening signal; a negative
+            # basis is a loosening signal. Keep the threshold explicit.
+            evidence.append({"category": "basis", "value": round(latest_basis, 4), "tightening": latest_basis >= 0.01,
+                             "threshold": 0.01, "window_days": lookback_days})
     if not inventory.empty and "库存" in inventory:
         recent_inventory = inventory.tail(max(10, min(len(inventory), 30)))
         inventory_change = _change(recent_inventory["库存"])
         if inventory_change is not None:
-            evidence.append({"category": "inventory", "value": round(inventory_change, 4), "tightening": inventory_change <= -0.03})
+            evidence.append({"category": "inventory", "value": round(inventory_change, 4), "tightening": inventory_change <= -0.03,
+                             "threshold": -0.03, "window_days": min(lookback_days, 30)})
 
     positive = sum(item["tightening"] for item in evidence)
-    if len(evidence) >= 2 and positive >= 2:
+    categories = {item["category"] for item in evidence}
+    negative = len(evidence) - positive
+    if len(categories) >= 2 and positive >= 2 and negative == 0:
         tightening: bool | None = True
-    elif len(evidence) >= 2 and positive == 0:
+        signal_status = "tightening"
+    elif len(categories) >= 2 and negative >= 2 and positive == 0:
         tightening = False
+        signal_status = "loosening"
+    elif len(categories) >= 2 and positive and negative:
+        tightening = None
+        signal_status = "conflict"
     else:
         tightening = None
+        signal_status = "insufficient"
     return {
         "supply_mapping_found": True,
         "supply_commodity": mapping["commodity"],
@@ -91,6 +108,9 @@ def collect(context: str, lookback_days: int = 30) -> dict:
         "supply_matched_terms": mapping["matched_terms"],
         "supply_evidence_count": len(evidence),
         "supply_positive_count": positive,
+        "supply_negative_count": negative,
+        "supply_category_count": len(categories),
+        "supply_signal_status": signal_status,
         "supply_tightening": tightening,
         "supply_evidence": evidence,
         "supply_errors": errors,

@@ -8,6 +8,13 @@ from typing import Any
 
 import yaml
 
+from tools.scoring.announcement_rules import extract_announcement_events
+from tools.scoring.classification_db import (
+    SOURCE_LABEL as CLASSIFICATION_DB_SOURCE,
+    has_category,
+    lookup,
+)
+
 
 ROOT = Path(__file__).resolve().parents[2]
 REPORT_ROOT = ROOT / "knowledge" / "research"
@@ -37,7 +44,39 @@ TRACK_GROUPS = {
     "机器人与先进制造": ("机器人", "工业母机", "数控", "核心零部件", "自动化", "专用设备"),
 }
 CAPEX_TERMS = ("资本开支", "扩产", "投产", "产能利用率", "新增订单", "在手订单", "设备投资", "产线建设")
-LEADERSHIP_TERMS = ("全球龙头", "行业龙头", "国内龙头", "核心供应商", "市场第一", "市占率第一", "隐形冠军")
+LEADERSHIP_DIMENSION_PATTERNS = {
+    "market_share_rank": (
+        r"(?:市场份额|市场占有率|市占率)[^。；\n]{0,45}(?:第一|首位|排名|领先|[1-9]\d?(?:\.\d+)?%)",
+        r"(?:销量|出货量|装机量|用户数|保有量|产量)[^。；\n]{0,32}(?:第一|首位|排名|领先|份额|市占率)",
+    ),
+    "sales_scale": (
+        r"(?:销量|出货量|装机量|用户数|保有量|产量|资产规模|储量)[^。；\n]{0,45}(?:同比|达到|超过|领先|第一|排名|万|亿|%)",
+        r"(?:全球|全国|国内|区域)[^。；\n]{0,35}(?:销量|出货量|装机量|用户数|产量|资产规模|储量)",
+    ),
+    "customer_supply": (
+        r"(?:核心|关键|主要|指定)供应商[^。；\n]{0,45}(?:供货|配套|量产|定点|客户|供应链|订单)",
+        r"(?:定点|量产供货|进入|配套)[^。；\n]{0,45}(?:供应链|客户|主机厂|头部客户|核心客户)",
+    ),
+    "technical_barrier": (
+        r"(?:发明专利|核心专利|专利数量|核心技术|自主可控|不可替代|技术领先|技术优势)[^。；\n]{0,50}(?:领先|第一|核心|数量|标准|认证|产品)",
+        r"(?:首创|独家|唯一|关键技术|核心工艺)[^。；\n]{0,45}(?:产品|量产|应用|客户|认证)",
+    ),
+    "license_standard": (
+        r"(?:国家标准|行业标准|标准制定|牌照|批件|注册证|认证|资质)[^。；\n]{0,50}(?:牵头|参与|取得|获得|覆盖|核心|领先|第一)",
+        r"(?:行业准入|许可|注册|认证)[^。；\n]{0,40}(?:覆盖|领先|核心|全国|区域)",
+    ),
+    "coverage_scale": (
+        r"(?:全球|全国|国内|海外)[^。；\n]{0,40}(?:客户|渠道|网点|门店|用户|产能|基地|覆盖|布局|资产|储量)",
+        r"(?:客户覆盖|渠道覆盖|销售网络|服务网络|生产基地)[^。；\n]{0,45}(?:全球|全国|国内|区域|数量|覆盖)",
+    ),
+}
+LEADERSHIP_PROFILE_RULES = (
+    ("医药/医疗", ("医药", "医疗", "创新药", "仿制药", "器械", "医院", "诊断", "生物")),
+    ("金融", ("银行", "证券", "保险", "信托", "金融", "基金", "支付")),
+    ("资源/能源/公用事业", ("煤炭", "有色", "稀土", "锂", "矿", "石油", "天然气", "电力", "燃气", "水务", "公用事业")),
+    ("软件/平台/服务", ("软件", "计算机", "互联网", "平台", "云", "数据", "信息服务", "SaaS", "游戏", "传媒")),
+    ("制造/消费", ("汽车", "电池", "光伏", "风电", "家电", "机械", "设备", "电子", "制造", "消费", "食品", "建材", "化工")),
+)
 SPECIALIZED_TERMS = ("专精特新", "单项冠军", "制造业冠军", "小巨人")
 CATALYST_TERMS = ("中标", "重大合同", "新增订单", "订单增长", "扩产", "投产", "涨价", "回购", "增持", "业绩预增", "扭亏")
 PROMOTION_TEMPLATE_TERMS = ("必涨", "稳赚", "翻倍", "内部消息", "主力建仓", "最后上车")
@@ -138,12 +177,14 @@ def _chain_match(evidence: dict[str, Any]) -> None:
         industry_text,
         str(evidence.get("main_business", "")),
         " ".join(str(item) for item in evidence.get("business_items", [])[:30]),
+        str(evidence.get("security_name") or evidence.get("name") or ""),
     ]
     context = " ".join(primary_parts).lower()
     concept_context = " ".join(str(item) for item in evidence.get("concepts", [])[:30]).lower()
     if not context.strip():
         return
     candidates: list[dict[str, Any]] = []
+    exact_alias_chains: list[dict[str, Any]] = []
     specific_terms = (
         "电子特气", "半导体特气", "光刻气", "光刻及其他混合气体",
         "氢化物", "氮氧化合物", "半导体材料",
@@ -152,16 +193,24 @@ def _chain_match(evidence: dict[str, Any]) -> None:
         chain_name = str(chain.get("name", ""))
         aliases = [str(item).lower() for item in chain.get("aliases", [])]
         primary_aliases = [alias for alias in aliases if alias and alias in context]
+        exact_name_alias = any(
+            alias and alias == str(evidence.get("security_name") or evidence.get("name") or "").strip().lower()
+            for alias in aliases
+        )
         alias_score = min(2.0, 0.5 * max(map(len, primary_aliases))) if primary_aliases else 0.25 if any(alias and alias in concept_context for alias in aliases) else 0
+        if exact_name_alias:
+            exact_alias_chains.append({"chain_name": chain_name, "score": 5.0})
         for stage in ("upstream", "midstream", "downstream"):
             data = chain.get(stage, {}) or {}
             industries = [str(item).lower() for item in data.get("industries", [])]
             keywords = [str(item).lower() for item in data.get("keywords", [])]
-            primary_score = alias_score if primary_aliases else 0
-            primary_score += 2 * sum(item and item in industry_text for item in industries)
-            primary_score += sum(item and item in context for item in keywords)
-            if primary_score <= 0:
+            stage_score = 2 * sum(item and item in industry_text for item in industries)
+            stage_score += sum(item and item in context for item in keywords)
+            if stage_score <= 0:
                 continue
+            primary_score = alias_score + stage_score
+            if exact_name_alias:
+                primary_score += 5.0
             score = primary_score + 0.25 * sum(item and item in concept_context and item not in context for item in keywords)
             keyword_hits = [item for item in keywords if item and item in context]
             specific_hits = [term for term in specific_terms if term.lower() in context and term.lower() in keywords]
@@ -174,11 +223,29 @@ def _chain_match(evidence: dict[str, Any]) -> None:
                 "chain_name": chain_name,
                 "stage": stage,
                 "specificity": specificity,
+                "stage_score": stage_score,
                 "keyword_hits": keyword_hits,
                 "specific_hits": specific_hits,
             })
     candidates.sort(key=lambda item: (item["score"], item["specificity"], len(item["specific_hits"])), reverse=True)
     best = candidates[0] if candidates else None
+    exact_alias = max(exact_alias_chains, key=lambda item: item["score"], default=None)
+    if exact_alias and (best is None or best["chain_name"] != exact_alias["chain_name"]):
+        evidence["chain_name"] = exact_alias["chain_name"]
+        evidence["chain_matches"] = [{
+            "chain_name": exact_alias["chain_name"],
+            "stage": None,
+            "score": exact_alias["score"],
+            "specific_hits": [],
+            "keyword_hits": [],
+        }]
+        _set(evidence, "chain_name", exact_alias["chain_name"], "chains.yaml", overwrite=True)
+        evidence["chain_match_types"] = ["行业主题命中"]
+        evidence["chain_match_type"] = "行业主题命中"
+        evidence["chain_partial"] = True
+        evidence["business_match_partial"] = True
+        evidence["business_match_reason"] = f"命中 {exact_alias['chain_name']} 主题别名，主营环节和收入占比待确认"
+        return
     if best:
         source = "chains.yaml"
         _set(evidence, "chain_stage", best["stage"], source)
@@ -189,6 +256,7 @@ def _chain_match(evidence: dict[str, Any]) -> None:
                 "chain_name": item["chain_name"],
                 "stage": item["stage"],
                 "score": round(item["score"], 2),
+                "stage_score": round(item["stage_score"], 2),
                 "specific_hits": item["specific_hits"],
                 "keyword_hits": item["keyword_hits"][:8],
             }
@@ -210,6 +278,11 @@ def _chain_match(evidence: dict[str, Any]) -> None:
             _set(evidence, "business_chain_revenue_ratio", min(1.0, matched_ratio), "EastMoney/F10")
         revenue_confirmed = matched_ratio >= 0.30
         partial = best["score"] < 3 or not revenue_confirmed
+        match_types = ["主营嵌入支持" if revenue_confirmed else "主营嵌入线索"]
+        if best["stage"] == "upstream" and best["stage_score"] >= 3:
+            match_types.append("产业链关键位置")
+        evidence["chain_match_types"] = match_types
+        evidence["chain_match_type"] = "、".join(match_types)
         evidence["chain_partial"] = partial
         evidence["business_match_partial"] = partial
         ratio_text = f"，主营收入支持 {matched_ratio:.1%}" if matched_ratio > 0 else "，缺少收入占比确认"
@@ -246,6 +319,134 @@ def _chokepoint_match(evidence: dict[str, Any]) -> None:
         evidence["chokepoint_partial"] = best[2]
 
 
+def _leadership_profile(context: str) -> tuple[str, tuple[str, ...]]:
+    lowered = context.lower()
+    for profile, terms in LEADERSHIP_PROFILE_RULES:
+        if any(term.lower() in lowered for term in terms):
+            return profile, terms
+    return "综合行业", tuple()
+
+
+def _leadership_evidence(evidence: dict[str, Any], reports: dict[str, str]) -> None:
+    """Derive leadership from sector-appropriate evidence dimensions.
+
+    Research headlines remain clues only. A score requires evidence in the
+    structured company/industry reports, so a single promotional label cannot
+    turn into a leadership conclusion.
+    """
+    if (
+        evidence.get("classification_db_leadership") is True
+        or evidence.get("classification_db_core_supplier") is True
+    ):
+        return
+    context = " ".join([
+        str(evidence.get("industry", "")),
+        str(evidence.get("main_business", "")),
+        " ".join(str(item) for item in evidence.get("business_items", [])[:30]),
+    ])
+    profile, profile_terms = _leadership_profile(context)
+    expected_dimensions = {
+        "医药/医疗": ("market_share_rank", "sales_scale", "technical_barrier", "license_standard", "customer_supply"),
+        "金融": ("market_share_rank", "sales_scale", "license_standard", "coverage_scale", "customer_supply"),
+        "资源/能源/公用事业": ("market_share_rank", "sales_scale", "customer_supply", "license_standard", "coverage_scale"),
+        "软件/平台/服务": ("market_share_rank", "sales_scale", "customer_supply", "technical_barrier", "coverage_scale"),
+        "制造/消费": ("market_share_rank", "sales_scale", "customer_supply", "technical_barrier", "coverage_scale"),
+        "综合行业": tuple(LEADERSHIP_DIMENSION_PATTERNS),
+    }[profile]
+    # Industry/supply/macro reports describe the environment, not necessarily
+    # the company. They remain secondary context and cannot independently
+    # confirm company leadership.
+    primary_directories = {"finance_data", "business_data", "announcements"}
+    primary_sources = [
+        (directory, report)
+        for directory, report in reports.items()
+        if directory in primary_directories and report
+    ]
+    secondary_sources = [
+        (directory, report)
+        for directory, report in reports.items()
+        if directory not in primary_directories and directory != "web_research" and report
+    ]
+    dimensions: dict[str, dict[str, Any]] = {}
+    for dimension, patterns in LEADERSHIP_DIMENSION_PATTERNS.items():
+        primary_matches: list[dict[str, str]] = []
+        secondary_matches: list[dict[str, str]] = []
+        for directory, report in primary_sources + secondary_sources:
+            for pattern in patterns:
+                match = re.search(pattern, report, re.IGNORECASE)
+                if not match:
+                    continue
+                snippet = re.sub(r"\s+", " ", match.group(0)).strip()
+                record = {"source": directory, "signal": snippet[:120]}
+                (primary_matches if directory in primary_directories else secondary_matches).append(record)
+                break
+        if primary_matches or secondary_matches:
+            dimensions[dimension] = {
+                "matched": bool(primary_matches),
+                "primary_evidence": primary_matches[:3],
+                "secondary_clues": secondary_matches[:3],
+            }
+
+    matched_dimensions = [
+        dimension for dimension in expected_dimensions
+        if dimensions.get(dimension, {}).get("matched") is True
+    ]
+    quantitative_dimensions = {"market_share_rank", "sales_scale"}
+    relationship_dimensions = {"customer_supply", "coverage_scale"}
+    primary_directories_used = sorted({
+        item["source"]
+        for value in dimensions.values()
+        for item in value.get("primary_evidence", [])
+    })
+    clue_terms = [
+        term for term in ("全球龙头", "行业龙头", "国内龙头", "核心供应商", "市场第一", "市占率第一", "行业领先", "全球领先", "隐形冠军")
+        if term in " ".join(report for _, report in secondary_sources)
+    ]
+    if not matched_dimensions:
+        if clue_terms:
+            evidence["leadership_clues"] = clue_terms[:6]
+            evidence["leadership_profile"] = profile
+            evidence["leadership_missing_reason"] = (
+                f"行业画像为{profile}，当前只有研报/行情标题线索（{'、'.join(clue_terms[:4])}），"
+                "缺少市场份额、规模、客户供应关系、技术或资质的结构化证据"
+            )
+        return
+
+    has_quantitative = bool(set(matched_dimensions) & quantitative_dimensions)
+    has_relationship = bool(set(matched_dimensions) & relationship_dimensions)
+    source_count = len(primary_directories_used)
+    if len(matched_dimensions) >= 3 and (has_quantitative or has_relationship) and source_count >= 2:
+        strength = 1.0
+    elif len(matched_dimensions) >= 2 and (has_quantitative or has_relationship):
+        strength = 0.75
+    else:
+        strength = 0.5
+    missing_dimensions = [dimension for dimension in expected_dimensions if dimension not in matched_dimensions]
+    dimension_labels = {
+        "market_share_rank": "市场份额/排名",
+        "sales_scale": "销量/出货/规模",
+        "customer_supply": "客户/核心供应关系",
+        "technical_barrier": "技术/专利壁垒",
+        "license_standard": "牌照/批件/标准资质",
+        "coverage_scale": "渠道/区域/资源覆盖",
+    }
+    matched_text = "、".join(dimension_labels[item] for item in matched_dimensions)
+    missing_text = "、".join(dimension_labels[item] for item in missing_dimensions[:3]) or "无"
+    reason = (
+        f"行业画像={profile}；已确认维度：{matched_text}；"
+        f"结构化来源 {source_count} 个；仍缺：{missing_text}"
+    )
+    _set(evidence, "leadership_profile", profile, "行业/主营结构化匹配")
+    _set(evidence, "leadership_dimensions", dimensions, "公告/主营/行业结构化证据")
+    _set(evidence, "leadership_dimension_count", len(matched_dimensions), "公告/主营/行业结构化证据")
+    _set(evidence, "leadership_source_quality", "结构化披露", "公告/主营/行业结构化证据")
+    _set(evidence, "leadership_strength", strength, "公告/主营/行业结构化证据")
+    for directory in primary_directories_used:
+        _set(evidence, "leadership_strength", strength, SOURCE_LABELS.get(directory, directory))
+    evidence["leadership_reason"] = reason
+    evidence["leadership_partial"] = strength < 1.0 or len(missing_dimensions) > 0
+
+
 def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) -> None:
     industry_context = str(evidence.get("industry", ""))
     business_context = " ".join([
@@ -280,22 +481,67 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
         evidence["track_reason"] = "仅概念板块提示可能赛道，不参与大时代赛道得分"
 
     order_growth = _float(evidence.get("order_growth"))
-    announcement_text = " ".join(str(item) for item in evidence.get("announcement_titles", []))
-    capex_hits = [term for term in CAPEX_TERMS if term in announcement_text]
-    company_capex = bool(order_growth is not None and order_growth > 0) or bool(capex_hits)
+    announcement_items = [
+        {"date": "", "title": str(item)}
+        for item in evidence.get("announcement_titles", [])
+        if str(item).strip()
+    ]
+    announcement_events = evidence.get("announcement_events")
+    if not isinstance(announcement_events, list):
+        announcement_events = extract_announcement_events(announcement_items)
+    capex_events = [
+        item for item in announcement_events
+        if item.get("category") == "capacity" and item.get("hard_detail") is True
+    ]
+    # A dated event with hard details is stronger than a title word. Order
+    # growth is supporting evidence, not capital-expenditure evidence by itself.
+    company_capex_core_signals: list[str] = []
+    company_capex_support_signals: list[str] = []
+    if order_growth is not None and order_growth > 0:
+        company_capex_support_signals.append("订单增长（辅助）")
+    for key, label in (("capex_yoy", "资本开支同比"), ("construction_in_progress_yoy", "在建工程变化"),
+                       ("fixed_asset_investment_yoy", "固定资产投资")):
+        value = _float(evidence.get(key))
+        if value is not None and value > 0:
+            company_capex_core_signals.append(label)
+    if capex_events:
+        company_capex_core_signals.append(f"公告扩产/投产明确事件{len(capex_events)}项")
+    company_capex_core_signals = list(dict.fromkeys(company_capex_core_signals))
+    company_capex_support_signals = list(dict.fromkeys(company_capex_support_signals))
+    company_capex = bool(company_capex_core_signals)
+    evidence["company_capex_evidence_count"] = len(company_capex_core_signals)
+    evidence["company_capex_confirmed"] = len(company_capex_core_signals) >= 2
+    evidence["capex_event_count"] = len(capex_events)
     web_capex = evidence.get("web_industry_capex_validation") or {}
     if web_capex.get("status") == "已验证" and web_capex.get("signal") in {"上行", "下行"}:
         _set(evidence, "industry_capex_signal", web_capex["signal"], SOURCE_LABELS["web_research"], overwrite=True)
     industry_capex = evidence.get("industry_capex_signal") == "上行"
-    if company_capex and industry_capex:
+    industry_capex_down = evidence.get("industry_capex_signal") == "下行"
+    evidence["capex_conflict"] = bool(industry_capex_down and company_capex)
+    if company_capex and industry_capex and not evidence["capex_conflict"]:
         _set(evidence, "capex_strength", 1.0, SOURCE_LABELS["announcements"])
         _set(evidence, "capex_strength", 1.0, SOURCE_LABELS["web_research"])
-        evidence["capex_reason"] = "公司订单/扩产与行业资本开支双侧确认"
+        evidence["capex_reason"] = (
+            f"公司侧 {len(company_capex_core_signals)} 类（{'、'.join(company_capex_core_signals)}）"
+            "与行业资本开支双侧确认"
+        )
+        evidence["capex_partial"] = not evidence["company_capex_confirmed"]
     elif company_capex or industry_capex:
         source = SOURCE_LABELS["web_research"] if industry_capex else SOURCE_LABELS["announcements"]
         _set(evidence, "capex_strength", 0.5, source)
-        detail = f"订单增长 {order_growth:.2f}%" if order_growth is not None and order_growth > 0 else "、".join(capex_hits[:3]) if capex_hits else "行业资本开支上行"
+        detail = "、".join(company_capex_core_signals[:3]) if company_capex else "行业资本开支上行"
+        if company_capex_support_signals and not company_capex:
+            detail += f"；{'、'.join(company_capex_support_signals)}但未形成公司资本开支确认"
         evidence["capex_reason"] = f"仅单侧资本开支证据：{detail}"
+        evidence["capex_partial"] = True
+    elif company_capex_support_signals:
+        evidence["capex_reason"] = (
+            f"{'、'.join(company_capex_support_signals)}，但缺少资本开支、在建工程、固定资产投资或明确扩产事件"
+        )
+        evidence["capex_partial"] = True
+    elif industry_capex_down:
+        _set(evidence, "capex_strength", 0.0, SOURCE_LABELS["web_research"], overwrite=True)
+        evidence["capex_reason"] = "行业资本开支下行，未确认资本开支浪潮"
         evidence["capex_partial"] = True
 
     prosperity = evidence.get("industry_prosperity_status")
@@ -331,20 +577,40 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
     elif evidence.get("announcement_coverage_complete") is True:
         _set(evidence, "audit_risk", False, SOURCE_LABELS["announcements"])
 
-    leadership_hits = [term for term in LEADERSHIP_TERMS if term in full_context]
-    if leadership_hits:
-        _set(evidence, "leadership_strength", min(1.0, 0.5 + 0.25 * len(leadership_hits)), "公告/主营/研报")
-        evidence["leadership_reason"] = "发现行业地位证据：" + "、".join(leadership_hits[:3])
-        evidence["leadership_partial"] = True
+    _leadership_evidence(evidence, reports)
     specialized_hits = [term for term in SPECIALIZED_TERMS if term in full_context]
-    if specialized_hits:
-        _set(evidence, "specialized_strength", min(1.0, 0.5 + 0.25 * len(specialized_hits)), "公告/主营/概念")
-        evidence["specialized_reason"] = "发现标签：" + "、".join(specialized_hits[:3])
-        evidence["specialized_partial"] = True
+    if specialized_hits and not evidence.get("classification_db_specialized"):
+        evidence["specialized_clues"] = specialized_hits[:4]
+        evidence["specialized_missing_reason"] = (
+            "仅发现专精特新相关文字线索，名单数据库未命中，需通过权威网络来源核验"
+        )
 
-    catalyst_hits = {term for term in CATALYST_TERMS if term in title_text}
-    if title_text and (catalyst_hits or evidence.get("announcement_coverage_complete") is True):
-        _set(evidence, "verified_catalyst_count", len(catalyst_hits), SOURCE_LABELS["announcements"])
+    event_list = evidence.get("announcement_events")
+    if not isinstance(event_list, list):
+        event_list = []
+    if event_list or evidence.get("announcement_coverage_complete") is True:
+        event_categories = sorted({str(item.get("category")) for item in event_list if item.get("category")})
+        confirmed_events = [
+            item for item in event_list
+            if item.get("hard_detail") is True
+        ]
+        confirmed_categories = sorted({str(item.get("category")) for item in confirmed_events if item.get("category")})
+        _set(evidence, "catalyst_event_count", len(event_list), SOURCE_LABELS["announcements"])
+        _set(evidence, "catalyst_categories", event_categories, SOURCE_LABELS["announcements"])
+        _set(evidence, "catalyst_confirmed_event_count", len(confirmed_events), SOURCE_LABELS["announcements"])
+        _set(
+            evidence,
+            "verified_catalyst_count",
+            min(2, len(confirmed_categories)),
+            SOURCE_LABELS["announcements"],
+            overwrite=True,
+        )
+        evidence["catalyst_partial"] = len(confirmed_categories) < len(event_categories)
+        evidence["catalyst_reason"] = (
+            f"识别到 {len(event_list)} 项有日期公告事件，其中 {len(confirmed_events)} 项含金额、数量、产能或明确动作细节"
+            if event_list
+            else "公告覆盖完整但未识别到有日期的明确催化事件"
+        )
 
     _chain_match(evidence)
     _chokepoint_match(evidence)
@@ -399,6 +665,7 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
         evidence["business_match_partial"] = True
         evidence["business_match_reason"] = "网络搜索命中半导体电子特气关键供应链线索，主营收入占比仍需披露确认"
         evidence["web_chain_fallback"] = True
+
 
     promotion_hits = set(str(item) for item in evidence.get("promotional_keyword_hits", []))
     promotion_hits.update(str(item) for item in evidence.get("discussion_promotion_hits", []))
@@ -455,6 +722,42 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
         _set(evidence, "trap_risk_level", risk, SOURCE_LABELS["social_sentiment"])
 
 
+def _classification_database_evidence(evidence: dict[str, Any]) -> None:
+    result = lookup(
+        evidence.get("code"),
+        str(evidence.get("security_name") or evidence.get("name") or ""),
+    )
+    evidence["classification_db_source"] = CLASSIFICATION_DB_SOURCE
+    evidence["classification_db_found"] = bool(result.get("found"))
+    evidence["classification_db_match_by"] = result.get("match_by", "")
+    evidence["classification_db_categories"] = list(result.get("categories") or ())
+    if result.get("industry"):
+        evidence["classification_db_industry"] = result["industry"]
+    if not result.get("found"):
+        evidence["classification_db_reason"] = (
+            "完整版名单数据库未命中，专精特新、行业龙头、核心供应商转网络搜索核验"
+        )
+        return
+
+    categories = list(result.get("categories") or ())
+    category_text = "、".join(categories)
+    evidence["classification_db_reason"] = (
+        f"完整版名单数据库按{result.get('match_by') or '证券代码'}命中：{category_text}"
+    )
+    if has_category(result, "specialized"):
+        _set(evidence, "specialized_strength", 1.0, CLASSIFICATION_DB_SOURCE, overwrite=True)
+        evidence["classification_db_specialized"] = True
+        evidence["specialized_reason"] = evidence["classification_db_reason"]
+        evidence["specialized_partial"] = False
+    if has_category(result, "leadership") or has_category(result, "core_supplier"):
+        _set(evidence, "leadership_strength", 1.0, CLASSIFICATION_DB_SOURCE, overwrite=True)
+        evidence["classification_db_leadership"] = has_category(result, "leadership")
+        evidence["classification_db_core_supplier"] = has_category(result, "core_supplier")
+        evidence["leadership_reason"] = evidence["classification_db_reason"]
+        evidence["leadership_partial"] = False
+        evidence["leadership_source_quality"] = "名单数据库"
+
+
 def build_evidence(code: str, name: str, reports: dict[str, str]) -> dict[str, Any]:
     evidence: dict[str, Any] = {
         "code": code,
@@ -468,6 +771,7 @@ def build_evidence(code: str, name: str, reports: dict[str, str]) -> dict[str, A
             for key, value in payload.items():
                 _set(evidence, key, value, source, overwrite=True)
     _derive_legacy_fields(evidence, reports)
+    _classification_database_evidence(evidence)
     _derive_framework_fields(evidence, reports)
     if evidence.get("web_subfactor_results"):
         evidence["search_evidence_quality"] = "网络命中仅作未核验补缺，结构化数据优先"
