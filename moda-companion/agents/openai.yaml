@@ -1,0 +1,7 @@
+interface:
+  display_name: "莫大 Agent"
+  short_description: "莫大方法研究、A股分析与长期陪伴"
+  default_prompt: "Use $moda-companion. For a specific A-share, preserve the moda-v4 formal report and then add the Moda Agent interpretation."
+
+policy:
+  allow_implicit_invocation: true
