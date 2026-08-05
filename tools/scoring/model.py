@@ -899,7 +899,7 @@ def _base_rating(score: float) -> str:
         return "根"
     if score >= 70:
         return "矛"
-    if score >= 55:
+    if score >= 60:
         return "学习仓"
     return "不碰"
 

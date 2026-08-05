@@ -6,6 +6,7 @@ from html.parser import HTMLParser
 import ipaddress
 from io import BytesIO
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -31,6 +32,8 @@ USER_AGENT = "moda-v4-research/1.0"
 MAX_FETCH_BYTES = 600_000
 MAX_PDF_FETCH_BYTES = 10_000_000
 MAX_PAGES = 30
+MAX_PDF_PAGES = 30
+MAX_PDF_TEXT_CHARS = 120_000
 MAX_PAGES_PER_PURPOSE = 6
 MAX_GAP_TARGETS = 12
 MAX_GAP_QUERIES_PER_TARGET = 2
@@ -638,13 +641,68 @@ def _collect_gap_targets(code: str, name: str, context: str, targets: list[dict[
     }
 
 
+def _read_pdf_text(body: bytes) -> str:
+    parts: list[str] = []
+    text_length = 0
+    reader = PdfReader(BytesIO(body))
+    for page in reader.pages[:MAX_PDF_PAGES]:
+        page_text = page.extract_text() or ""
+        if not page_text:
+            continue
+        parts.append(page_text)
+        text_length += len(page_text) + 1
+        if text_length >= MAX_PDF_TEXT_CHARS:
+            break
+    return " ".join(parts)[:MAX_PDF_TEXT_CHARS]
+
+
+def _pdf_text_worker(body: bytes, connection: Any) -> None:
+    try:
+        connection.send(("ok", _read_pdf_text(body)))
+    except Exception as exc:
+        connection.send((f"pdf_{type(exc).__name__}", ""))
+    finally:
+        connection.close()
+
+
+def _extract_pdf_text(body: bytes, timeout: float) -> tuple[str, str]:
+    if timeout <= 0:
+        return "pdf_timeout", ""
+    context = multiprocessing.get_context("spawn")
+    receive_connection, send_connection = context.Pipe(duplex=False)
+    process = context.Process(target=_pdf_text_worker, args=(body, send_connection))
+    process.daemon = True
+    process.start()
+    send_connection.close()
+    try:
+        if receive_connection.poll(timeout):
+            status, text = receive_connection.recv()
+            process.join(0.2)
+            return status, text
+        process.terminate()
+        process.join(1)
+        if process.is_alive():
+            process.kill()
+            process.join(1)
+        return "pdf_timeout", ""
+    finally:
+        receive_connection.close()
+        if process.is_alive():
+            process.terminate()
+            process.join(1)
+
+
 def _fetch_page(url: str, timeout: float) -> tuple[str, str]:
+    deadline = time.monotonic() + max(0.0, timeout)
     current = url
     try:
         for _ in range(4):
             if not _safe_public_url(current):
                 return "unsafe_url", ""
-            response = requests.get(current, headers={"User-Agent": USER_AGENT}, timeout=timeout, allow_redirects=False, stream=True)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "timeout", ""
+            response = requests.get(current, headers={"User-Agent": USER_AGENT}, timeout=remaining, allow_redirects=False, stream=True)
             if response.is_redirect:
                 current = urljoin(current, response.headers.get("location", ""))
                 continue
@@ -655,6 +713,8 @@ def _fetch_page(url: str, timeout: float) -> tuple[str, str]:
             chunks: list[bytes] = []
             total = 0
             for chunk in response.iter_content(32_768):
+                if time.monotonic() >= deadline:
+                    return "timeout", ""
                 total += len(chunk)
                 if total > byte_limit:
                     break
@@ -663,10 +723,10 @@ def _fetch_page(url: str, timeout: float) -> tuple[str, str]:
             if total > byte_limit:
                 return "document_too_large", ""
             if is_pdf:
-                try:
-                    text = " ".join((page.extract_text() or "") for page in PdfReader(BytesIO(body)).pages)
-                except Exception as exc:
-                    return f"pdf_{type(exc).__name__}", ""
+                remaining = deadline - time.monotonic()
+                status, text = _extract_pdf_text(body, remaining)
+                if status != "ok":
+                    return status, ""
                 return ("ok", text[:120_000]) if text.strip() else ("pdf_no_text", "")
             encoding = response.encoding or "utf-8"
             html = body.decode(encoding, errors="replace")

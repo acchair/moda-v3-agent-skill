@@ -599,7 +599,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
         report = grader.render_report("300820", "英杰电气", evidence, card, ())
         for heading in ("## 研究评分", "## 一句话结论与最终判断", "## 技术分析（easy-tdx 日 K）", "## 行业景气度交叉验证", "## 六层图形概览",
                         "## 六层评分卡", "## F5 低位与困境反转", "## F6 修正项", "## 舆情、社交热榜与异常推广风险",
-                        "## Hard Cap 检查", "## 机构方法交叉验证", "## 睡得着检查"):
+                        "## Hard Cap 检查", "## 睡得着检查"):
             self.assertIn(heading, report)
         self.assertNotIn("原始综合分", report)
         self.assertNotIn("原始评级", report)
@@ -617,9 +617,13 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertIn("当前价格：30.0；支撑位：28.0；压力位：33.0", report)
         self.assertIn("F6 是独立的第六层，已计入研究分", report)
         self.assertIn("**1. 一句话逻辑**\n\n", report)
-        self.assertIn("**6. 最终判断**\n\n", report)
+        self.assertIn("**6. 评级与证伪条件**\n\n", report)
+        self.assertIn("### 技术信号：", report)
+        self.assertNotIn("## 机构方法交叉验证", report)
         self.assertIn("### 莫大视角总览", report)
         self.assertIn("| 核心问题 | 图示 | 大白话结论 | 数据与理由 |", report)
+        self.assertIn("产业与业务", report)
+        self.assertIn("主营包括", report)
         self.assertIn("### 核心上下游对应表", report)
         self.assertIn("产业链：半导体设备产业链；公司位置：上游；匹配类型：待确认", report)
         self.assertIn("| 环节 | 核心内容 | 与公司的关系 | 判断 |", report)
@@ -939,6 +943,59 @@ class PipelineEfficiencyTest(unittest.TestCase):
             used, rows, errors = web_research._search("auto", "test", 0.1)
         self.assertEqual((used, rows), ("none", []))
         self.assertIn("searxng:HTTPError", errors)
+
+    def test_pdf_text_reader_stops_at_page_limit(self) -> None:
+        pages = [SimpleNamespace(extract_text=lambda value=str(index): value) for index in range(web_research.MAX_PDF_PAGES + 3)]
+        with patch.object(web_research, "PdfReader", return_value=SimpleNamespace(pages=pages)):
+            text = web_research._read_pdf_text(b"pdf")
+        self.assertEqual(text.split(), [str(index) for index in range(web_research.MAX_PDF_PAGES)])
+
+    def test_pdf_extraction_timeout_terminates_worker(self) -> None:
+        class FakeConnection:
+            def __init__(self, ready: bool = False) -> None:
+                self.ready = ready
+                self.closed = False
+
+            def poll(self, timeout: float) -> bool:
+                return self.ready
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.daemon = False
+                self.started = False
+                self.terminated = False
+
+            def start(self) -> None:
+                self.started = True
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def join(self, timeout: float) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return self.started and not self.terminated
+
+            def kill(self) -> None:
+                self.terminated = True
+
+        receive_connection = FakeConnection()
+        send_connection = FakeConnection()
+        process = FakeProcess()
+        context = SimpleNamespace(
+            Pipe=lambda duplex: (receive_connection, send_connection),
+            Process=lambda target, args: process,
+        )
+        with patch.object(web_research.multiprocessing, "get_context", return_value=context):
+            result = web_research._extract_pdf_text(b"pdf", 0.01)
+        self.assertEqual(result, ("pdf_timeout", ""))
+        self.assertTrue(process.terminated)
+        self.assertTrue(receive_connection.closed)
+        self.assertTrue(send_connection.closed)
 
     def test_public_search_fallback_is_used_without_local_backend(self) -> None:
         row = [{"title": "公开搜索结果", "url": "https://example.com", "snippet": "测试"}]

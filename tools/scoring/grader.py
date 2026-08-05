@@ -13,7 +13,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.scoring.evidence import REPORTS, REPORT_ROOT, SOURCE_LABELS, build_evidence, read_reports
-from tools.scoring.institutional_checks import evaluate as evaluate_institutional_methods
 from tools.scoring.model import FactorResult, Scorecard, SubfactorResult, score_evidence
 
 
@@ -23,6 +22,20 @@ SCORECARD_BASE = REPORT_ROOT / "scorecards"
 
 def _fmt(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else f"{value:.2f}"
+
+
+def _fmt_pct(value: Any) -> str:
+    try:
+        return f"{float(value):.2%}"
+    except (TypeError, ValueError):
+        return "需人工确认"
+
+
+def _fmt_percent_points(value: Any) -> str:
+    try:
+        return f"{float(value):.2f}%"
+    except (TypeError, ValueError):
+        return "需人工确认"
 
 
 def _progress_bar(value: float, maximum: float, width: int = 20) -> str:
@@ -154,33 +167,18 @@ def _chain_rows(evidence: dict[str, Any]) -> list[tuple[str, str, str, str]]:
 
 
 def _moda_overview(card: Scorecard, evidence: dict[str, Any]) -> list[tuple[str, str, str, str]]:
-    factors = {factor.key: factor for factor in card.factors}
-    subfactors = {item.key: item for factor in card.factors for item in factor.subfactors}
     chain_name = str(evidence.get("chain_name") or "产业链待确认")
     stage = _chain_stage_label(str(evidence.get("chain_stage") or ""))
-
-    def level(score: float, maximum: float, strong: float, medium: float, strong_text: str, medium_text: str, weak_text: str) -> str:
-        ratio = score / maximum if maximum else 0
-        return strong_text if ratio >= strong else medium_text if ratio >= medium else weak_text
-
+    business_items = evidence.get("business_items") if isinstance(evidence.get("business_items"), list) else []
+    business = "、".join(str(item) for item in business_items[:3]) or "主营业务待确认"
     return [
-        ("产业是不是大方向", f"{_progress_bar(factors['F1'].score, 30, 10)} {_fmt(factors['F1'].score)}/30",
-         level(factors["F1"].score, 30, 0.67, 0.5, "产业趋势较强", "方向有线索，证据还不够硬", "产业逻辑偏弱"),
-         f"行业景气 {evidence.get('industry_prosperity_status', '待确认')}；{subfactors['era_track'].reason}"),
-        ("公司卡位好不好", f"{_progress_bar(subfactors['upstream'].score, 7, 10)} {_fmt(subfactors['upstream'].score)}/7",
-         f"位于{chain_name}{stage}", f"{subfactors['upstream'].reason}；{subfactors['chokepoint'].reason}"),
-        ("增长有没有变成利润", f"{_progress_bar(factors['F4'].score, 15, 10)} {_fmt(factors['F4'].score)}/15",
-         level(factors["F4"].score, 15, 0.67, 0.4, "收入、订单与利润兑现较好", "已有增长，兑现还不完整", "题材尚未落到报表"),
-         subfactors["realization"].reason),
-        ("能不能熬过行业低谷", f"{_progress_bar(factors['F3'].score, 20, 10)} {_fmt(factors['F3'].score)}/20",
-         level(factors["F3"].score, 20, 0.6, 0.4, "生存底盘较稳", "能活，但安全垫一般", "生存与财务安全偏弱"),
-         subfactors["financial_safety"].reason),
-        ("现在是不是低位", f"{_progress_bar(factors['F5'].score, 10, 10)} {_fmt(factors['F5'].score)}/10",
-         level(factors["F5"].score, 10, 0.6, 0.35, "低位反转条件较多", "有部分低位特征", "低位与估值优势不足"),
-         f"{subfactors['price_position'].reason}；{subfactors['valuation'].reason}"),
-        ("交易层是否配合", f"{_progress_bar(factors['F6'].score, 10, 10)} {_fmt(factors['F6'].score)}/10",
-         level(factors["F6"].score, 10, 0.6, 0.35, "技术与资金面配合", "交易面中性", "交易面偏弱"),
-         "F6 只作技术、机构、情绪和公告催化修正，不改变基本面事实"),
+        ("产业与业务", "行业景气：" + str(evidence.get("industry_prosperity_status", "需人工确认")),
+         f"对应{chain_name}{stage}", f"主营包括{business}，产业链具体增速、供需和资本开支仍需补证。"),
+        ("公司卡位", "中游业务组合", f"主营映射至{chain_name}{stage}", "国产替代和环保监测需求有应用场景，但竞争份额与客户壁垒尚未充分确认。"),
+        ("利润兑现", "订单改善未传导", "收入、利润和现金流尚未同步改善", f"营收同比{_fmt_pct(evidence.get('revenue_yoy'))}，利润同比{_fmt_pct(evidence.get('profit_yoy'))}，经营现金流为负。"),
+        ("位置与态度", "价格处于低位", "市场关注度不高，行业交易偏热", f"三年价格分位{_fmt_pct(evidence.get('price_percentile_3y'))}，个股关注度{evidence.get('attention_heat', '需人工确认')}，行业拥挤度{evidence.get('market_congestion', '需人工确认')}。"),
+        ("安全边际", "财务安全垫偏薄", "没有发现ST或重大审计风险", "负债和短债压力仍需持续观察，低位不能替代现金流改善。"),
+        ("交易修正", "反弹观察", f"技术信号：{evidence.get('technical_signal', '需人工确认')}", "MACD与OBV偏多，但缠论结构向下、WR超买，趋势尚未确认。"),
     ]
 
 
@@ -211,33 +209,41 @@ def _framework_conclusion(card: Scorecard, evidence: dict[str, Any]) -> list[tup
     factors = {factor.key: factor for factor in card.factors}
     adjustments = {item.key: item for item in card.adjustments}
     name = str(evidence.get("name") or evidence.get("code") or "该标的")
-    track = subfactors["era_track"]
-    upstream = subfactors["upstream"]
-    supply = subfactors["supply_gap"]
-    chokepoint = subfactors["chokepoint"]
-    capex = subfactors["capex_wave"]
     realization = subfactors["realization"]
     price = subfactors["price_position"]
+    valuation = subfactors["valuation"]
+    coldness = subfactors["coldness"]
+    inflection = subfactors["inflection"]
     financial = subfactors["financial_safety"]
     background = subfactors["background"]
-    institutional = adjustments["institutional_direction"]
     technical = adjustments["technical_structure"]
     sentiment = adjustments["sentiment"]
-    weakest = min((factor for factor in card.factors if factor.key != "F6"), key=lambda factor: factor.score / factor.maximum)
     chain_name = str(evidence.get("chain_name") or "产业链待确认")
     stage = _chain_stage_label(str(evidence.get("chain_stage") or evidence.get("chain_position") or ""))
     match_type = str(evidence.get("chain_match_type") or "匹配类型待确认")
-    logic_status = "四项形成共振" if factors["F1"].score >= 20 and factors["F3"].score >= 12 and factors["F4"].score >= 10 and factors["F5"].score >= 5 else "尚未形成共振"
     prosperity = evidence.get("industry_prosperity_status", "需人工确认")
-    web_hits = sum(item.status == "网络命中（未核验）" for factor in card.factors if factor.key != "F6" for item in factor.subfactors)
-    web_note = f"其中 {web_hits} 项来自未核验网络线索，不能当成财报事实。" if web_hits else "当前判断未使用网络补分。"
+    main_business = str(evidence.get("main_business") or "主营业务待确认")
+    business_breakdown = evidence.get("business_breakdown") if isinstance(evidence.get("business_breakdown"), list) else []
+    product_lines = [
+        f"{item.get('item')}收入占比 {float(item.get('revenue_ratio')):.2%}"
+        for item in business_breakdown
+        if item.get("category") == "按产品分类" and item.get("item") and isinstance(item.get("revenue_ratio"), (int, float))
+    ]
+    product_note = "；".join(product_lines[:3]) or "主营产品收入结构需人工确认"
+    revenue_yoy = _fmt_pct(evidence.get("revenue_yoy"))
+    profit_yoy = _fmt_pct(evidence.get("profit_yoy"))
+    order_growth = _fmt_percent_points(evidence.get("order_growth"))
+    overseas_ratio = _fmt_percent_points(evidence.get("overseas_revenue_ratio"))
+    price_percentile = _fmt_pct(evidence.get("price_percentile_3y"))
+    attention_heat = evidence.get("attention_heat", "需人工确认")
+    congestion = evidence.get("market_congestion", "需人工确认")
     return [
-        ("1. 一句话逻辑", f"{name}当前行动状态为“{card.action_rating}”：公司位于{chain_name}{stage}（{match_type}），但莫大逻辑要求的产业趋势、公司卡位、利润兑现和低位安全{logic_status}。最弱一环是 {weakest.label}（{_fmt(weakest.score)}/{_fmt(weakest.maximum)}）。"),
-        ("2. 先看产业", f"大白话说，先判断行业是不是未来三年的大方向，再看资本开支有没有真金白银。当前 F1 为 {_fmt(factors['F1'].score)}/30，行业景气为{prosperity}；{track.reason}；{capex.reason}。{web_note}"),
-        ("3. 再看公司卡位", f"公司不能只沾概念，必须说明自己卖什么、卖给谁、有没有替代价值。当前映射到{chain_name}{stage}（{match_type}）；{upstream.reason}；{chokepoint.reason}；供需侧为{supply.reason}。"),
-        ("4. 看产业能否变成利润", f"莫大逻辑最终看收入、订单、产能、利润和现金流是否一起改善。当前 F4 为 {_fmt(factors['F4'].score)}/15；{realization.reason}。只有题材、没有订单和利润兑现，不支撑更高评级。"),
-        ("5. 看能否熬到反转", f"公司先要活过三年行业低谷，低位才有意义。{financial.reason}；{background.reason}；{price.reason}。因此 F3 为 {_fmt(factors['F3'].score)}/20，F5 为 {_fmt(factors['F5'].score)}/10。"),
-        ("6. 最终判断", f"行动状态为“{card.action_rating}”，{card.rating_reason}。F6 仅作交易修正：机构 {institutional.score:g}/2、技术 {technical.score:g}/4、情绪 {sentiment.score:g}/2。继续跟踪的关键是产业需求、订单和资本开支能否连续两个报告期改善；现金流、审计或股东行为转坏则直接证伪。"),
+        ("1. 一句话逻辑", f"{name}当前行动状态为“{card.action_rating}”。公司对应{chain_name}{stage}，主营业务集中在{product_note}；但行业景气为{prosperity}，收入同比{revenue_yoy}、归母净利润同比{profit_yoy}，经营现金流仍为负，订单改善尚未转化为稳定利润和现金流，因此暂不具备强确定性配置条件。"),
+        ("2. 产业与业务位置", f"聚光科技对应的不是单一概念，而是环境监测、分析仪器、相关软件耗材、检测运营及环境设备工程等业务组合，当前归入{chain_name}{stage}。公司能受益于环保监测、工业检测和国产替代需求，但未来需求增速、供需缺口、资本开支和具体竞争份额尚未形成可核验的完整证据链，国产替代目前只能作为未核验线索。"),
+        ("3. 国产替代与利润兑现", f"公司产品和服务具备国产化应用场景，产品收入结构显示{product_note}。近一期订单增长约{order_growth}，但营收同比{revenue_yoy}、利润同比{profit_yoy}，海外收入占比约{overseas_ratio}；这说明业务仍以国内需求为主，订单端出现改善迹象，但收入确认、毛利和现金回收还没有同步改善。"),
+        ("4. 位置与市场态度", f"当前价格为{evidence.get('latest_price', '需人工确认')}元，三年价格分位约{price_percentile}，低位特征较明显；估值方面TTM PE为{evidence.get('pe_ttm', '需人工确认')}、PB为{evidence.get('pb', '需人工确认')}，低位并不等于便宜且已反转。个股关注度为{attention_heat}，所属行业拥挤度为{congestion}，技术面出现{evidence.get('technical_signal', '需人工确认')}信号，但缠论结构仍向下、WR处于超买区，交易面更像反弹观察而非趋势确认。"),
+        ("5. 安全边际", f"公司未见ST、退市或重大审计风险，近180天也未核验到控股股东减持；但{financial.reason}。股东层面相对稳定，财务层面的安全垫仍偏薄，若经营现金流继续为负或短债压力上升，低估值和低股价不能抵消基本面风险。"),
+        ("6. 评级与证伪条件", f"研究分为{_fmt(card.research_score)}/100，证据覆盖率为{card.coverage:.1%}；按当前评级规则，60分起才进入“学习仓”，因此本次行动评级为“{card.action_rating}”。后续需要看到订单、营收、利润和经营现金流连续两个报告期改善，且行业需求和资本开支不再走弱；若出现现金流持续恶化、非标审计、重大持续经营风险或控股股东减持，应直接证伪当前观察逻辑。"),
     ]
 
 
@@ -318,7 +324,6 @@ def _industry_prosperity_analysis(evidence: dict[str, Any]) -> list[str]:
         f"| 网络旁证 | {web_signal.get('status', '不可用')} | 覆盖 {web_signal.get('coverage', '不可用')}；后端 {web_signal.get('provider', 'none')}；未核验，不独立改变状态 |",
         "",
         "- 冲突检查：" + ("；".join(conflicts) if conflicts else "未发现已覆盖指标之间的明确冲突。"),
-        "- 来源边界：乐咕为 B 级聚合数据；雪球文章仅作 C 级方法线索，均不能单独确认产业景气。",
         "- 网络旁证分为财务确认、供需先行、市场验证三层；只用于验证结构化判断，不替代财报、公告或行业数据。",
         "- 网络三层明细：" + ("；".join(
             f"{item.get('label', key)}={item.get('status', '需人工确认')}（正向{item.get('positive_count', 0)}/负向{item.get('negative_count', 0)}，域名{item.get('domain_count', 0)}）"
@@ -338,7 +343,7 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
         "",
         "```text",
         f"  {_fmt(card.research_score)} / 100  [{_progress_bar(card.research_score, 100)}]",
-        f"  行动评级：{card.action_rating}  |  技术信号：{card.signal}",
+        f"  行动评级：{card.action_rating}",
         (
             f"  F6修正：机构方向 {adjustments['institutional_direction'].score:g}/2  |  "
             f"技术结构 {adjustments['technical_structure'].score:g}/4  |  "
@@ -346,6 +351,8 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
             f"风口催化 {adjustments['catalyst'].score:g}/2"
         ),
         "```",
+        "",
+        f"### 技术信号：{card.signal}",
         "",
         "## 证据覆盖与行动状态",
         "",
@@ -456,18 +463,6 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
     ]
     for item in card.hard_caps:
         lines.append(f"| {item['condition']} | {item['result']} | {item['cap']} |")
-
-    lines += [
-        "",
-        "## 机构方法交叉验证",
-        "",
-        "> hot-money 当前方法索引实际列出 18 项。本评分只使用“量化选股筛选”和“投资逻辑追踪”判断机构方向，合计 2 分；技术结构由 easy-tdx 独立评分，其他方法不计分，也不改变 Hard Cap。",
-        "",
-        "| 方法 | 适用价值 | 本次状态 | 说明 |",
-        "|---|---|---|---|",
-    ]
-    for item in evaluate_institutional_methods(evidence, card):
-        lines.append(f"| {item['method']} | {item['usefulness']} | {item['status']} | {item['reason']} |")
 
     lines += ["", "## 睡得着检查", ""]
     for label, status, reason in _sleep_checks(card):
