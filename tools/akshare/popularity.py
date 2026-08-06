@@ -10,6 +10,9 @@ import requests
 
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from tools.data_call import run_with_timeout
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "popularity"
 API = "https://emappdata.eastmoney.com/stockrank/getCurrentLatest"
 
@@ -18,7 +21,7 @@ def _market_code(code: str) -> str:
     return ("SH" if code.startswith(("5", "6", "9")) else "SZ") + code
 
 
-def collect(code: str, timeout: float = 12) -> dict:
+def _collect_primary(code: str, timeout: float = 12) -> dict:
     payload = {
         "appId": "appId01",
         "globalId": "786e4c21-70dc-435a-93bb-38",
@@ -43,7 +46,36 @@ def collect(code: str, timeout: float = 12) -> dict:
     }
 
 
+def collect(code: str, timeout: float = 12) -> dict:
+    result = run_with_timeout("个股人气", lambda: _collect_primary(code, timeout), seconds=int(timeout), source="东方财富人气榜")
+    if result.ok:
+        data = dict(result.value or {})
+        data.update({"fetch_state": "ok", "source_chain": result.source_chain or [], "error": None})
+        return data
+    return {
+        "fetch_state": "failed",
+        "source_chain": result.source_chain or [],
+        "error": result.error,
+        "attention_unavailable": True,
+        "attention_reason": "东方财富个股人气榜失败；没有语义等价备用接口，不以社交热度替代",
+    }
+
+
 def build_report(code: str, name: str, data: dict) -> str:
+    if data.get("fetch_state") == "failed":
+        return "\n".join([
+            f"# 个股人气：{name or code}（{code}）",
+            "",
+            f"> 采集时间：{time.strftime('%Y-%m-%d %H:%M:%S')}  |  数据源：东方财富个股人气榜",
+            "",
+            f"<!-- moda_popularity: {json.dumps(data, ensure_ascii=False)} -->",
+            "",
+            f"- 接口状态：失败，{data.get('attention_reason', '需人工确认')}。",
+            f"- 原始错误：{data.get('error') or '未返回错误信息'}",
+            "",
+            "人气数据不可用时，不将其他热度指标当作个股人气事实。",
+            "",
+        ])
     return "\n".join([
         f"# 个股人气：{name or code}（{code}）",
         "",

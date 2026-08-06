@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date, datetime
 from html.parser import HTMLParser
 import ipaddress
@@ -12,6 +14,7 @@ from pathlib import Path
 import re
 import socket
 import sys
+import threading
 import time
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -39,10 +42,12 @@ MAX_GAP_TARGETS = 12
 MAX_GAP_QUERIES_PER_TARGET = 2
 MAX_GAP_BUDGET_SECONDS = 75.0
 MIN_TARGET_BUDGET_SECONDS = 3.0
+MAX_GAP_WORKERS = 3
 GAP_PRIORITY = {
     "F2.controller_action": 120,
     "F3.survival_risk": 115,
     "F3.leadership": 108,
+    "F3.specialized": 107,
     "F1.capex_wave": 106,
     "F1.era_track": 102,
     "F1.chokepoint": 100,
@@ -55,6 +60,15 @@ GAP_PRIORITY = {
     "F3.background": 82,
 }
 CACHE_PATH = ROOT / "knowledge" / "research" / "pipeline" / "cache" / "web_search_daily.json"
+_RUNTIME_LOCAL = threading.local()
+_CACHE_LOCK = threading.RLock()
+_CACHE_PAYLOADS: dict[str, dict[str, Any]] = {}
+_CACHE_PATHS: dict[str, Path] = {}
+_CACHE_DIRTY: set[str] = set()
+_CACHE_BATCH_DEPTH = 0
+_PAGE_SNAPSHOT_LOCK = threading.RLock()
+_PAGE_SNAPSHOT: dict[str, tuple[str, str]] = {}
+_PAGE_INFLIGHT: dict[str, threading.Event] = {}
 AUTHORITY_DOMAINS = (
     "gov.cn", "cninfo.com.cn", "sse.com.cn", "szse.cn", "bse.cn",
     "stats.gov.cn", "miit.gov.cn", "ndrc.gov.cn", "customs.gov.cn",
@@ -232,8 +246,58 @@ def _response_payload(response: requests.Response) -> dict[str, Any]:
         return {}
 
 
+def _http_session() -> requests.Session:
+    session = getattr(_RUNTIME_LOCAL, "http_session", None)
+    if session is None:
+        session = requests.Session()
+        _RUNTIME_LOCAL.http_session = session
+    return session
+
+
+def _ddg_runtime(url: str, timeout: float) -> tuple[requests.Session, dict[str, str], int]:
+    runtime = getattr(_RUNTIME_LOCAL, "ddg_runtime", None)
+    if runtime and runtime[0] == url:
+        endpoint, session, headers, next_id = runtime
+        _RUNTIME_LOCAL.ddg_runtime = (endpoint, session, headers, next_id + 1)
+        return session, dict(headers), next_id
+
+    session = requests.Session()
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    initialize = {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "moda-v4", "version": "1.0"}},
+    }
+    response = session.post(url, json=initialize, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    session_id = response.headers.get("Mcp-Session-Id")
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    session.post(
+        url,
+        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        headers=headers,
+        timeout=timeout,
+    ).raise_for_status()
+    _RUNTIME_LOCAL.ddg_runtime = (url, session, headers, 3)
+    return session, dict(headers), 2
+
+
+def _reset_ddg_runtime() -> None:
+    runtime = getattr(_RUNTIME_LOCAL, "ddg_runtime", None)
+    if runtime:
+        try:
+            runtime[1].close()
+        except Exception:
+            pass
+        delattr(_RUNTIME_LOCAL, "ddg_runtime")
+
+
 def _searxng_search(base_url: str, query: str, timeout: float) -> list[dict[str, Any]]:
-    response = requests.get(
+    response = _http_session().get(
         base_url.rstrip("/") + "/search",
         params={"q": query, "format": "json", "language": "zh-CN", "safesearch": 1},
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
@@ -267,20 +331,9 @@ def _parse_ddg_text(text: str) -> list[dict[str, Any]]:
 
 
 def _ddg_mcp_search(url: str, query: str, timeout: float) -> list[dict[str, Any]]:
-    session = requests.Session()
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
-    initialize = {
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "moda-v4", "version": "1.0"}},
-    }
-    response = session.post(url, json=initialize, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    session_id = response.headers.get("Mcp-Session-Id")
-    if session_id:
-        headers["Mcp-Session-Id"] = session_id
-    session.post(url, json={"jsonrpc": "2.0", "method": "notifications/initialized"}, headers=headers, timeout=timeout).raise_for_status()
+    session, headers, request_id = _ddg_runtime(url, timeout)
     call = {
-        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
         "params": {"name": "search", "arguments": {"query": query, "max_results": 8, "region": "cn-zh"}},
     }
     response = session.post(url, json=call, headers=headers, timeout=timeout)
@@ -293,7 +346,7 @@ def _ddg_mcp_search(url: str, query: str, timeout: float) -> list[dict[str, Any]
 
 def _duckduckgo_html_search(query: str, timeout: float) -> list[dict[str, Any]]:
     """Use DuckDuckGo's public HTML endpoint when no local service exists."""
-    response = requests.get(
+    response = _http_session().get(
         "https://html.duckduckgo.com/html/",
         params={"q": query, "kl": "cn-zh"},
         headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
@@ -347,6 +400,7 @@ def _search(provider: str, query: str, timeout: float, cache_scope: str = "") ->
                 return "duckduckgo", rows, errors
             errors.append("duckduckgo:no_results")
         except Exception as exc:
+            _reset_ddg_runtime()
             errors.append(f"duckduckgo:{type(exc).__name__}")
     public_search = os.getenv("MODA_PUBLIC_SEARCH", "auto").strip().lower()
     if provider in {"auto", "duckduckgo"} and public_search not in {"0", "false", "off", "no"}:
@@ -370,26 +424,61 @@ def _search_cache_key(provider: str, query: str, cache_scope: str = "") -> str:
 
 
 def _load_search_cache() -> dict[str, Any]:
+    cache_path = CACHE_PATH.resolve()
+    cache_key = str(cache_path)
+    with _CACHE_LOCK:
+        if cache_key not in _CACHE_PAYLOADS:
+            try:
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                _CACHE_PAYLOADS[cache_key] = payload if isinstance(payload, dict) else {}
+            except (OSError, ValueError, TypeError):
+                _CACHE_PAYLOADS[cache_key] = {}
+            _CACHE_PATHS[cache_key] = cache_path
+        return _CACHE_PAYLOADS[cache_key]
+
+
+def _flush_search_cache() -> None:
+    with _CACHE_LOCK:
+        dirty_keys = list(_CACHE_DIRTY)
+        for cache_key in dirty_keys:
+            path = _CACHE_PATHS[cache_key]
+            payload = _CACHE_PAYLOADS[cache_key]
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+                temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                os.replace(temporary, path)
+                _CACHE_DIRTY.discard(cache_key)
+            except OSError:
+                continue
+
+
+@contextmanager
+def _search_cache_batch():
+    global _CACHE_BATCH_DEPTH
+    with _CACHE_LOCK:
+        _CACHE_BATCH_DEPTH += 1
     try:
-        payload = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else {}
-    except (OSError, ValueError, TypeError):
-        return {}
+        yield
+    finally:
+        with _CACHE_LOCK:
+            _CACHE_BATCH_DEPTH -= 1
+            should_flush = _CACHE_BATCH_DEPTH == 0
+        if should_flush:
+            _flush_search_cache()
 
 
 def _save_search_cache(key: str, used: str, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
-    try:
-        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _CACHE_LOCK:
         payload = _load_search_cache()
         payload[key] = {"date": datetime.now().date().isoformat(), "used": used, "rows": rows[:8]}
-        tmp = CACHE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(CACHE_PATH)
-    except OSError:
-        # Cache is an optimization only; source availability must not change behavior.
-        return
+        cache_key = str(CACHE_PATH.resolve())
+        _CACHE_DIRTY.add(cache_key)
+        should_flush = _CACHE_BATCH_DEPTH == 0
+    if should_flush:
+        _flush_search_cache()
 
 
 def _gap_relevant(row: dict[str, Any], key: str, code: str, name: str, context: str) -> bool:
@@ -462,6 +551,134 @@ def _allocate_gap_budgets(targets: list[dict[str, Any]], total_seconds: float = 
     }
 
 
+def _collect_gap_target(
+    code: str,
+    name: str,
+    context: str,
+    target: dict[str, Any],
+    provider: str,
+    timeout: float,
+    deadline: float,
+    target_budget: float,
+) -> dict[str, Any]:
+    factor_key = str(target.get("factor_key") or "")
+    subfactor_key = str(target.get("subfactor_key") or "")
+    key = f"{factor_key}.{subfactor_key}"
+    if key not in RULES or factor_key == "F6":
+        return {"key": key, "processed": False, "gap_result": None, "results": [], "providers": [], "errors": []}
+
+    target_started = time.monotonic()
+    target_deadline = min(deadline, target_started + target_budget)
+    target_rows: list[dict[str, Any]] = []
+    target_queries = queries_for(key, name, code, context)
+    target_queries.append(_china_finance_query(key, name, code, context))
+    target_queries = target_queries[:MAX_GAP_QUERIES_PER_TARGET]
+    target_errors: list[str] = []
+    used_providers: list[str] = []
+    all_results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for query_index, query in enumerate(target_queries):
+        remaining = min(deadline, target_deadline) - time.monotonic()
+        if remaining <= 0:
+            target_errors.append(
+                "global_budget_exhausted"
+                if time.monotonic() >= deadline
+                else "target_budget_exhausted"
+            )
+            break
+        queries_left = max(1, len(target_queries) - query_index)
+        if remaining < 0.2:
+            target_errors.append(
+                "global_budget_exhausted"
+                if time.monotonic() >= deadline
+                else "target_budget_exhausted"
+            )
+            break
+        query_timeout = min(timeout, max(0.2, remaining / queries_left))
+        used, rows, query_errors = _search(provider, query, query_timeout, cache_scope=f"{code}|{key}")
+        relevant = [row for row in rows if _gap_relevant(row, key, code, name, context)]
+        if used == "searxng" and not relevant and provider == "auto" and os.getenv("DDG_MCP_URL", "").strip():
+            fallback_remaining = min(deadline, target_deadline) - time.monotonic()
+            fallback_timeout = min(timeout, max(0.2, fallback_remaining / 2)) if fallback_remaining >= 0.2 else 0
+            fallback_used, fallback_rows, fallback_errors = (
+                _search("duckduckgo", query, fallback_timeout, cache_scope=f"{code}|{key}")
+                if fallback_timeout > 0 else (
+                    "none",
+                    [],
+                    ["global_budget_exhausted" if time.monotonic() >= deadline else "target_budget_exhausted"],
+                )
+            )
+            query_errors.extend(fallback_errors)
+            if fallback_rows:
+                used = fallback_used
+                relevant = [row for row in fallback_rows if _gap_relevant(row, key, code, name, context)]
+        target_errors.extend(query_errors)
+        if used != "none" and used not in used_providers:
+            used_providers.append(used)
+        for rank, row in enumerate(relevant[:5], 1):
+            url = str(row.get("url") or "")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            remaining = min(deadline, target_deadline) - time.monotonic()
+            fetch_status, content = (
+                _fetch_page(url, min(timeout, 5, max(0.2, remaining)))
+                if rank == 1 and remaining > 0 else (
+                    "global_budget_exhausted" if time.monotonic() >= deadline else "target_budget_exhausted",
+                    "",
+                )
+            )
+            enriched = {
+                **row,
+                "factor_key": factor_key,
+                "subfactor_key": subfactor_key,
+                "query": query,
+                "provider": used,
+                "rank": rank,
+                "fetch_status": fetch_status,
+                "content_excerpt": content[:6000] if content else "",
+            }
+            target_rows.append(enriched)
+            all_results.append({field: value for field, value in enriched.items() if field != "content_excerpt"})
+
+    if target_rows:
+        assessment = evaluate_gap(key, float(target.get("maximum") or 0), target_rows)
+    else:
+        hard_errors = [error for error in target_errors if not error.endswith(":no_results")]
+        assessment = {
+            "status": "搜索失败，需人工确认" if hard_errors else "已搜索未命中",
+            "score": 0.0,
+            "reason": "；".join(hard_errors[:4]) if hard_errors else "SearXNG 与 DuckDuckGo MCP 均未返回相关结果",
+            "signals": [],
+            "conflict": False,
+        }
+    evidence_rows = [
+        {field: row.get(field) for field in ("title", "url", "snippet", "provider", "rank", "fetch_status", "query")}
+        for row in target_rows[:5]
+    ]
+    gap_result = {
+        **target,
+        **assessment,
+        "queries": target_queries,
+        "provider": next((row.get("provider") for row in target_rows if row.get("provider")), "none"),
+        "evidence": evidence_rows,
+        "errors": target_errors,
+        "selection_status": "selected",
+        "selection_reason": "按因子覆盖、风险优先级、最大分值和缺口状态选入",
+        "target_budget_seconds": target_budget,
+        "budget_used_seconds": round(min(target_budget, max(0.0, time.monotonic() - target_started)), 3),
+    }
+    return {
+        "key": key,
+        "processed": True,
+        "gap_result": gap_result,
+        "results": all_results,
+        "providers": used_providers,
+        "errors": target_errors,
+    }
+
+
 def _collect_gap_targets(code: str, name: str, context: str, targets: list[dict[str, Any]],
                          provider: str, timeout: float) -> dict[str, Any]:
     started = time.monotonic()
@@ -472,116 +689,31 @@ def _collect_gap_targets(code: str, name: str, context: str, targets: list[dict[
     used_providers: list[str] = []
     selected_targets, skipped_targets = _select_gap_targets(targets)
     target_budgets = _allocate_gap_budgets(selected_targets)
-    processed_targets: list[str] = []
-    for target in selected_targets:
-        factor_key = str(target.get("factor_key") or "")
-        subfactor_key = str(target.get("subfactor_key") or "")
-        key = f"{factor_key}.{subfactor_key}"
-        if key not in RULES or factor_key == "F6":
-            continue
-        processed_targets.append(key)
-        target_budget = target_budgets.get(key, MIN_TARGET_BUDGET_SECONDS)
-        target_started = time.monotonic()
-        target_deadline = min(deadline, target_started + target_budget)
-        target_rows: list[dict[str, Any]] = []
-        target_queries = queries_for(key, name, code, context)
-        target_queries.append(_china_finance_query(key, name, code, context))
-        target_queries = target_queries[:MAX_GAP_QUERIES_PER_TARGET]
-        target_errors: list[str] = []
-        seen: set[str] = set()
-        for query_index, query in enumerate(target_queries):
-            remaining = min(deadline, target_deadline) - time.monotonic()
-            if remaining <= 0:
-                target_errors.append(
-                    "global_budget_exhausted"
-                    if time.monotonic() >= deadline
-                    else "target_budget_exhausted"
-                )
-                break
-            # Auto search may try two fallback backends sequentially. Keep
-            # each request bounded by the target and global budgets.
-            queries_left = max(1, len(target_queries) - query_index)
-            if remaining < 0.2:
-                target_errors.append(
-                    "global_budget_exhausted"
-                    if time.monotonic() >= deadline
-                    else "target_budget_exhausted"
-                )
-                break
-            query_timeout = min(timeout, max(0.2, remaining / queries_left))
-            used, rows, query_errors = _search(provider, query, query_timeout, cache_scope=f"{code}|{key}")
-            relevant = [row for row in rows if _gap_relevant(row, key, code, name, context)]
-            if used == "searxng" and not relevant and provider == "auto" and os.getenv("DDG_MCP_URL", "").strip():
-                fallback_remaining = min(deadline, target_deadline) - time.monotonic()
-                fallback_timeout = min(timeout, max(0.2, fallback_remaining / 2)) if fallback_remaining >= 0.2 else 0
-                fallback_used, fallback_rows, fallback_errors = (
-                    _search("duckduckgo", query, fallback_timeout, cache_scope=f"{code}|{key}")
-                    if fallback_timeout > 0 else (
-                        "none",
-                        [],
-                        ["global_budget_exhausted" if time.monotonic() >= deadline else "target_budget_exhausted"],
-                    )
-                )
-                query_errors.extend(fallback_errors)
-                if fallback_rows:
-                    used, relevant = fallback_used, [row for row in fallback_rows if _gap_relevant(row, key, code, name, context)]
-            target_errors.extend(query_errors)
-            if used != "none" and used not in used_providers:
+    jobs = [
+        (
+            code,
+            name,
+            context,
+            target,
+            provider,
+            timeout,
+            deadline,
+            target_budgets.get(_gap_target_key(target), MIN_TARGET_BUDGET_SECONDS),
+        )
+        for target in selected_targets
+    ]
+    with _search_cache_batch():
+        with ThreadPoolExecutor(max_workers=min(MAX_GAP_WORKERS, len(jobs) or 1)) as executor:
+            target_outputs = list(executor.map(lambda values: _collect_gap_target(*values), jobs))
+    processed_targets = [item["key"] for item in target_outputs if item["processed"]]
+    for item in target_outputs:
+        if item["gap_result"] is not None:
+            gap_results.append(item["gap_result"])
+        all_results.extend(item["results"])
+        for used in item["providers"]:
+            if used not in used_providers:
                 used_providers.append(used)
-            for rank, row in enumerate(relevant[:5], 1):
-                url = str(row.get("url") or "")
-                if not url or url in seen:
-                    continue
-                seen.add(url)
-                remaining = min(deadline, target_deadline) - time.monotonic()
-                fetch_status, content = (
-                    _fetch_page(url, min(timeout, 5, max(0.2, remaining)))
-                    if rank == 1 and remaining > 0 else (
-                        "global_budget_exhausted" if time.monotonic() >= deadline else "target_budget_exhausted",
-                        "",
-                    )
-                )
-                enriched = {
-                    **row,
-                    "factor_key": factor_key,
-                    "subfactor_key": subfactor_key,
-                    "query": query,
-                    "provider": used,
-                    "rank": rank,
-                    "fetch_status": fetch_status,
-                    "content_excerpt": content[:6000] if content else "",
-                }
-                target_rows.append(enriched)
-                all_results.append({key: value for key, value in enriched.items() if key != "content_excerpt"})
-        if target_rows:
-            assessment = evaluate_gap(key, float(target.get("maximum") or 0), target_rows)
-        else:
-            hard_errors = [error for error in target_errors if not error.endswith(":no_results")]
-            assessment = {
-                "status": "搜索失败，需人工确认" if hard_errors else "已搜索未命中",
-                "score": 0.0,
-                "reason": "；".join(hard_errors[:4]) if hard_errors else "SearXNG 与 DuckDuckGo MCP 均未返回相关结果",
-                "signals": [],
-                "conflict": False,
-            }
-        evidence_rows = [
-            {field: row.get(field) for field in ("title", "url", "snippet", "provider", "rank", "fetch_status", "query")}
-            for row in target_rows[:5]
-        ]
-        gap_result = {
-            **target,
-            **assessment,
-            "queries": target_queries,
-            "provider": next((row.get("provider") for row in target_rows if row.get("provider")), "none"),
-            "evidence": evidence_rows,
-            "errors": target_errors,
-            "selection_status": "selected",
-            "selection_reason": "按因子覆盖、风险优先级、最大分值和缺口状态选入",
-            "target_budget_seconds": target_budget,
-            "budget_used_seconds": round(min(target_budget, max(0.0, time.monotonic() - target_started)), 3),
-        }
-        gap_results.append(gap_result)
-        errors.extend(f"{key}:{error}" for error in target_errors)
+        errors.extend(f"{item['key']}:{error}" for error in item["errors"])
     for target in skipped_targets:
         factor_key = str(target.get("factor_key") or "")
         subfactor_key = str(target.get("subfactor_key") or "")
@@ -692,7 +824,7 @@ def _extract_pdf_text(body: bytes, timeout: float) -> tuple[str, str]:
             process.join(1)
 
 
-def _fetch_page(url: str, timeout: float) -> tuple[str, str]:
+def _fetch_page_uncached(url: str, timeout: float) -> tuple[str, str]:
     deadline = time.monotonic() + max(0.0, timeout)
     current = url
     try:
@@ -702,7 +834,13 @@ def _fetch_page(url: str, timeout: float) -> tuple[str, str]:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return "timeout", ""
-            response = requests.get(current, headers={"User-Agent": USER_AGENT}, timeout=remaining, allow_redirects=False, stream=True)
+            response = _http_session().get(
+                current,
+                headers={"User-Agent": USER_AGENT},
+                timeout=remaining,
+                allow_redirects=False,
+                stream=True,
+            )
             if response.is_redirect:
                 current = urljoin(current, response.headers.get("location", ""))
                 continue
@@ -736,6 +874,47 @@ def _fetch_page(url: str, timeout: float) -> tuple[str, str]:
         return "too_many_redirects", ""
     except Exception as exc:
         return type(exc).__name__, ""
+
+
+def _fetch_page(url: str, timeout: float) -> tuple[str, str]:
+    started = time.monotonic()
+    with _PAGE_SNAPSHOT_LOCK:
+        cached = _PAGE_SNAPSHOT.get(url)
+        if cached is not None:
+            return cached
+        event = _PAGE_INFLIGHT.get(url)
+        if event is None:
+            event = threading.Event()
+            _PAGE_INFLIGHT[url] = event
+            owner = True
+        else:
+            owner = False
+    if not owner:
+        if event.wait(max(0.0, timeout)):
+            with _PAGE_SNAPSHOT_LOCK:
+                cached = _PAGE_SNAPSHOT.get(url)
+            if cached is not None:
+                return cached
+            remaining = timeout - (time.monotonic() - started)
+            if remaining > 0:
+                return _fetch_page(url, remaining)
+        return "timeout", ""
+
+    result = _fetch_page_uncached(url, timeout)
+    with _PAGE_SNAPSHOT_LOCK:
+        if result[0] == "ok" and result[1]:
+            _PAGE_SNAPSHOT[url] = result
+        _PAGE_INFLIGHT.pop(url, None)
+        event.set()
+    return result
+
+
+def _reset_run_snapshot() -> None:
+    with _PAGE_SNAPSHOT_LOCK:
+        _PAGE_SNAPSHOT.clear()
+        for event in _PAGE_INFLIGHT.values():
+            event.set()
+        _PAGE_INFLIGHT.clear()
 
 
 def _classify(record: dict[str, Any], name: str, context: str = "") -> dict[str, Any]:
@@ -928,6 +1107,7 @@ def _validate_industry_capex(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 def collect(code: str, name: str, context: str, provider: str | None = None, timeout: float = 12,
             targets: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    _reset_run_snapshot()
     selected = (provider or os.getenv("MODA_SEARCH_PROVIDER", "auto")).strip().lower()
     if selected not in {"auto", "searxng", "duckduckgo", "off"}:
         selected = "off"
@@ -1113,7 +1293,8 @@ def main() -> None:
         os.environ["MODA_SEARCH_CACHE"] = "off"
     code = args.stock.strip()
     targets = json.loads(args.targets_json) if args.targets_json else None
-    data = collect(code, args.name or code, args.context, args.provider, targets=targets)
+    with _search_cache_batch():
+        data = collect(code, args.name or code, args.context, args.provider, targets=targets)
     OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_BASE / f"{code}.md"
     path.write_text(build_report(code, args.name or code, data), encoding="utf-8")

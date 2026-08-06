@@ -500,6 +500,12 @@ def collect(
     periods = [item.get("period") for item in financial.get("values", {}).values() if item.get("period")]
     web_signal = collect_web_signal(name or code, industry)
     all_conflicts = [*conflicts, *web_signal.get("conflicts", [])]
+    fetch_state = "stale" if not usable and raw else "failed" if not raw else "empty" if mapping.get("status") != "已验证" else "ok"
+    prosperity_chain = [{
+        "source": raw.get("source") or "乐咕乐股/申万行业中位数",
+        "status": "ok" if usable else "stale" if raw else "failed",
+        "error": record.get("error") or "",
+    }]
     return {
         "industry_mapping": mapping,
         "industry_prosperity_status": overall,
@@ -517,6 +523,8 @@ def collect(
         "industry_prosperity_cache_hit": record.get("cache_hit", False),
         "industry_prosperity_cache_status": record.get("status"),
         "industry_prosperity_error": record.get("error"),
+        "fetch_state": fetch_state,
+        "source_chain": prosperity_chain,
         "industry_required_factors": {
             "industry_growth": financial.get("status", "不可用"),
             "penetration_rate": "需人工确认",

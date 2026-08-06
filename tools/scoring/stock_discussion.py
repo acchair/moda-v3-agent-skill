@@ -167,6 +167,13 @@ def collect(code: str, name: str, timeout: float = 8) -> dict[str, Any]:
     summary = _score(records)
     only_no_results = bool(search_errors) and all(item.endswith(":no_results") for item in search_errors)
     source_status = "结构化接口" if structured else "网络命中（未核验）" if records else "已搜索未命中" if only_no_results else "搜索失败，需人工确认"
+    fetch_state = "ok" if structured else "fallback_ok" if records else "empty" if only_no_results else "failed"
+    source_chain = [
+        {"source": "雪球", "status": "ok" if xueqiu else "empty", "error": "" if xueqiu else "empty response"},
+        {"source": "东方财富股吧", "status": "ok" if eastmoney else "empty", "error": "" if eastmoney else "empty response"},
+    ]
+    if not structured:
+        source_chain.append({"source": "SearXNG/DuckDuckGo", "status": "ok" if records else "failed" if search_errors and not only_no_results else "empty", "error": "; ".join(search_errors)})
     return {
         "discussion_posts_total": len(records),
         "discussion_structured_count": len(structured),
@@ -177,6 +184,8 @@ def collect(code: str, name: str, timeout: float = 8) -> dict[str, Any]:
         "discussion_partial": not structured or bool(search_errors),
         "discussion_records": records[:25],
         "discussion_search_errors": search_errors,
+        "fetch_state": fetch_state,
+        "source_chain": source_chain,
         **summary,
     }
 
@@ -211,7 +220,7 @@ def build_report(code: str, name: str, data: dict[str, Any]) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Collect stock discussion without CloakBrowser")
+    parser = argparse.ArgumentParser(description="Collect stock discussion from public interfaces and search fallback")
     parser.add_argument("--stock", required=True)
     parser.add_argument("--name", default="")
     args = parser.parse_args()

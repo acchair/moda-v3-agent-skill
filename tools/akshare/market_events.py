@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from tools.providers import a_stock_data_provider as provider
+from tools.data_call import run_with_timeout
 
 
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "market_events"
@@ -44,6 +45,119 @@ def _fetch_result(function: Callable[[], pd.DataFrame]) -> tuple[pd.DataFrame, b
         return (frame if frame is not None else pd.DataFrame()), True, ""
     except Exception as exc:
         return pd.DataFrame(), False, f"{type(exc).__name__}: {exc}"
+
+
+def _quarter_dates(count: int = 8) -> list[str]:
+    today = date.today()
+    quarter = (today.month - 1) // 3
+    year = today.year
+    if quarter == 0:
+        year -= 1
+        quarter = 4
+    result = []
+    for _ in range(count):
+        month = quarter * 3
+        result.append(f"{year}{month:02d}{30 if month in (6, 9) else 31}")
+        quarter -= 1
+        if quarter == 0:
+            year -= 1
+            quarter = 4
+    return result
+
+
+def _filter_code(frame: pd.DataFrame, code: str) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    candidates = ("SECURITY_CODE", "股票代码", "证券代码", "代码", "stock_code", "股票代码")
+    column = next((name for name in candidates if name in frame.columns), None)
+    if column is None:
+        return pd.DataFrame()
+    values = frame[column].astype(str).str.extract(r"(\d{6})", expand=False)
+    return frame[values.eq(code)].copy()
+
+
+def _ak_holder_num(code: str) -> pd.DataFrame:
+    import akshare as ak
+    for report_date in _quarter_dates():
+        frame = _filter_code(ak.stock_hold_num_cninfo(date=report_date), code)
+        if not frame.empty:
+            return frame
+    return pd.DataFrame()
+
+
+def _ak_lockup(code: str) -> pd.DataFrame:
+    import akshare as ak
+    return ak.stock_restricted_release_queue_sina(symbol=code)
+
+
+def _ak_pledge(code: str) -> pd.DataFrame:
+    import akshare as ak
+    for report_date in _quarter_dates():
+        frame = _filter_code(ak.stock_cg_equity_mortgage_cninfo(date=report_date), code)
+        if not frame.empty:
+            return frame
+    return pd.DataFrame()
+
+
+def _ak_top_holders(code: str) -> list[dict]:
+    import akshare as ak
+    frame = ak.stock_main_stock_holder(stock=code)
+    if frame is None or frame.empty:
+        return []
+    name_col = next((item for item in ("股东名称", "股东", "HOLDER_NAME") if item in frame.columns), None)
+    ratio_col = next((item for item in ("持股比例", "持股比例(%)", "HOLD_NUM_RATIO") if item in frame.columns), None)
+    if not name_col or not ratio_col:
+        return []
+    result = []
+    for rank, (_, row) in enumerate(frame.head(10).iterrows(), 1):
+        ratio = pd.to_numeric(pd.Series([row.get(ratio_col)]), errors="coerce").iloc[0]
+        if pd.notna(ratio):
+            result.append({"rank": rank, "name": str(row.get(name_col) or ""), "ratio": float(ratio)})
+    return result
+
+
+def _fetch_frame_status(key: str, primary: Callable[[], pd.DataFrame], fallback: Callable[[], pd.DataFrame] | None = None) -> tuple[pd.DataFrame, dict]:
+    primary_result = run_with_timeout(key, primary, seconds=15, source="东方财富直连")
+    chain = list(primary_result.source_chain or [])
+    if primary_result.ok:
+        frame = primary_result.value if isinstance(primary_result.value, pd.DataFrame) else pd.DataFrame()
+        return frame, {
+            "ok": True,
+            "fetch_state": "empty" if frame.empty else "ok",
+            "source": "东方财富直连",
+            "source_chain": chain,
+            "error": None,
+        }
+    if fallback is None:
+        return pd.DataFrame(), {"ok": False, "fetch_state": "failed", "source": "东方财富直连", "source_chain": chain, "error": primary_result.error}
+    fallback_result = run_with_timeout(key, fallback, seconds=20, source="AKShare/Sina等价接口")
+    chain.extend(fallback_result.source_chain or [])
+    if fallback_result.ok:
+        frame = fallback_result.value if isinstance(fallback_result.value, pd.DataFrame) else pd.DataFrame()
+        return frame, {
+            "ok": True,
+            "fetch_state": "fallback_ok" if not frame.empty else "empty",
+            "source": "AKShare/Sina等价接口",
+            "source_chain": chain,
+            "error": None,
+        }
+    return pd.DataFrame(), {"ok": False, "fetch_state": "failed", "source": "AKShare/Sina等价接口", "source_chain": chain, "error": f"{primary_result.error}; fallback: {fallback_result.error}"}
+
+
+def _fetch_list_status(key: str, primary: Callable[[], list[dict]], fallback: Callable[[], list[dict]] | None = None) -> tuple[list[dict], dict]:
+    primary_result = run_with_timeout(key, primary, seconds=15, source="Sina/公开 HTTP")
+    chain = list(primary_result.source_chain or [])
+    if primary_result.ok:
+        value = primary_result.value if isinstance(primary_result.value, list) else []
+        return value, {"ok": True, "fetch_state": "empty" if not value else "ok", "source": "Sina/公开 HTTP", "source_chain": chain, "error": None}
+    if fallback is None:
+        return [], {"ok": False, "fetch_state": "failed", "source": "Sina/公开 HTTP", "source_chain": chain, "error": primary_result.error}
+    fallback_result = run_with_timeout(key, fallback, seconds=20, source="AKShare/stock_main_stock_holder")
+    chain.extend(fallback_result.source_chain or [])
+    if fallback_result.ok:
+        value = fallback_result.value if isinstance(fallback_result.value, list) else []
+        return value, {"ok": True, "fetch_state": "fallback_ok" if value else "empty", "source": "AKShare/stock_main_stock_holder", "source_chain": chain, "error": None}
+    return [], {"ok": False, "fetch_state": "failed", "source": "AKShare/stock_main_stock_holder", "source_chain": chain, "error": f"{primary_result.error}; fallback: {fallback_result.error}"}
 
 
 def fetch_top_holders(code: str, timeout: float = 15) -> list[dict]:
@@ -183,40 +297,43 @@ def _security_name(frames: dict[str, pd.DataFrame]) -> str:
 
 
 def collect(code: str) -> tuple[dict, dict[str, pd.DataFrame]]:
-    fetchers = {
-        "holder_num": lambda: provider.holder_num_change(code),
-        "lockup": lambda: provider.lockup_expiry(code),
-        "concepts": lambda: provider.concept_blocks(code),
-        "research": lambda: provider.research_reports(code, max_pages=1),
-        "pledge": lambda: fetch_pledge(code),
-        "fund_holding": lambda: fetch_fund_holding(code),
-        "top_holders": lambda: fetch_top_holders(code),
+    frame_fetchers = {
+        "holder_num": (lambda: provider.holder_num_change(code), _ak_holder_num),
+        "lockup": (lambda: provider.lockup_expiry(code), lambda: _ak_lockup(code)),
+        "concepts": (lambda: provider.concept_blocks(code), None),
+        "research": (lambda: provider.research_reports(code, max_pages=1), None),
+        "pledge": (lambda: fetch_pledge(code), lambda: _ak_pledge(code)),
+        "fund_holding": (lambda: fetch_fund_holding(code), None),
     }
     frames: dict[str, pd.DataFrame] = {}
     fetch_status: dict[str, dict] = {}
-    # These endpoints are independent and mostly network-bound. Running them
-    # together prevents one slow provider from consuming the whole collector
-    # timeout and preserves per-endpoint status for downstream scoring.
-    with ThreadPoolExecutor(max_workers=len(fetchers)) as executor:
-        futures = {key: executor.submit(_fetch_result, fetcher) for key, fetcher in fetchers.items()}
+    with ThreadPoolExecutor(max_workers=len(frame_fetchers) + 1) as executor:
+        futures = {
+            key: executor.submit(_fetch_frame_status, key, primary, fallback)
+            for key, (primary, fallback) in frame_fetchers.items()
+        }
+        holders_future = executor.submit(_fetch_list_status, "前十大股东", lambda: fetch_top_holders(code), lambda: _ak_top_holders(code))
         for key, future in futures.items():
             try:
-                result = future.result()
+                frame, status = future.result()
             except Exception as exc:
-                result = (pd.DataFrame(), False, f"{type(exc).__name__}: {exc}")
-            if key == "top_holders":
-                holders, ok, error = result
-                fetch_status[key] = {"ok": ok, "error": error}
-            else:
-                frame, ok, error = result
-                frames[key] = frame
-                fetch_status[key] = {"ok": ok, "error": error}
-    if "top_holders" not in fetch_status:
-        holders = []
+                frame, status = pd.DataFrame(), {"ok": False, "fetch_state": "failed", "source": "", "source_chain": [], "error": f"{type(exc).__name__}: {exc}"}
+            frames[key] = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+            fetch_status[key] = status
+        try:
+            holders, holder_status = holders_future.result()
+        except Exception as exc:
+            holders, holder_status = [], {"ok": False, "fetch_state": "failed", "source": "", "source_chain": [], "error": f"{type(exc).__name__}: {exc}"}
+        fetch_status["top_holders"] = holder_status
+
     structured = _holder_metrics(holders)
     structured["market_event_fetch_status"] = fetch_status
+    structured["fetch_state"] = "failed" if any(item.get("fetch_state") == "failed" for item in fetch_status.values()) else "fallback_ok" if any(item.get("fetch_state") == "fallback_ok" for item in fetch_status.values()) else "empty" if all(item.get("fetch_state") == "empty" for item in fetch_status.values()) else "ok"
+    structured["source_chain"] = {key: item.get("source_chain", []) for key, item in fetch_status.items()}
     structured["pledge_fetch_ok"] = fetch_status["pledge"]["ok"]
+    structured["pledge_fetch_state"] = fetch_status["pledge"]["fetch_state"]
     structured["unlock_fetch_ok"] = fetch_status["lockup"]["ok"]
+    structured["unlock_fetch_state"] = fetch_status["lockup"]["fetch_state"]
     security_name = _security_name(frames)
     if security_name:
         structured["security_name"] = security_name

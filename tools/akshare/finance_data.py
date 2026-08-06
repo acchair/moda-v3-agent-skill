@@ -28,6 +28,7 @@ apply_patch()
 import akshare as ak
 import pandas as pd
 import numpy as np
+from tools.data_call import dataframe_empty, run_fallback_chain
 OUTPUT_BASE = ROOT / "knowledge/research/finance_data"
 
 # 东方财富列名 → 统一列名映射
@@ -41,6 +42,46 @@ SINA_COL_MAP = {"date": "date", "open": "open", "high": "high", "low": "low",
 OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
 
+def _with_frame_meta(frame: pd.DataFrame, *, fetch_state: str, source_chain: list[dict] | None = None, error: str = "") -> pd.DataFrame:
+    frame = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    frame.attrs["fetch_state"] = fetch_state
+    frame.attrs["source_chain"] = source_chain or []
+    frame.attrs["fetch_error"] = error or None
+    return frame
+
+
+def _normalize_daily(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    frame = frame.rename(columns=EM_COL_MAP_DAILY | SINA_COL_MAP).copy()
+    required = ["date", "open", "high", "low", "close", "volume", "amount", "pct_chg", "turnover"]
+    for column in required:
+        if column not in frame.columns:
+            frame[column] = pd.NA
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    for column in required[1:]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+
+
+def _financial_aliases(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    aliases = {
+        "报告日期": "报告期", "报告期": "报告期", "日期": "报告期",
+        "营业收入": "营业收入", "营业收入同比": "营业收入_同比", "营业收入_同比": "营业收入_同比",
+        "归属于母公司所有者的净利润": "归属于母公司所有者的净利润",
+        "归属于母公司所有者的净利润同比": "归属于母公司所有者的净利润_同比",
+        "归属于母公司的净利润": "归属于母公司的净利润",
+        "归属于母公司的净利润同比": "归属于母公司的净利润_同比",
+        "经营活动产生的现金流量净额": "经营活动产生的现金流量净额",
+    }
+    renamed = frame.rename(columns={key: value for key, value in aliases.items() if key in frame.columns}).copy()
+    if "报告期" in renamed.columns:
+        renamed["报告期"] = renamed["报告期"].astype(str)
+    return renamed
+
+
 # ══════════════════════════════════════════════════════
 #  Data Fetchers (each with fallback)
 # ══════════════════════════════════════════════════════
@@ -50,45 +91,32 @@ def fetch_kline_daily(code: str, kline_file: Path | None = None) -> pd.DataFrame
     if kline_file and kline_file.stem == code and kline_file.exists():
         df = pd.read_csv(kline_file, parse_dates=["date"])
         print(f"  [日K] 共享缓存 → {len(df)} 条")
-        return df
+        return _with_frame_meta(df, fetch_state="ok", source_chain=[{"source": "shared-cache", "status": "ok", "error": ""}])
 
-    try:
+    def easy_tdx() -> pd.DataFrame:
         from tools.providers.easy_tdx_provider import fetch_kline_daily as fetch_easy_tdx_kline
+        return _normalize_daily(fetch_easy_tdx_kline(code))
 
-        df = fetch_easy_tdx_kline(code)
-        if not df.empty:
-            print(f"  [日K] easy_tdx → {len(df)} 条")
-            return df
-    except Exception as e:
-        print(f"  [日K] easy_tdx失败: {e}")
+    def eastmoney() -> pd.DataFrame:
+        return _normalize_daily(ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq"))
 
-    # 方案1: 东财 (最近一年)
-    try:
-        df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
-        if not df.empty:
-            df = df.rename(columns=EM_COL_MAP_DAILY)
-            df["date"] = pd.to_datetime(df["date"])
-            print(f"  [日K] 东财 → {len(df)} 条")
-            return df
-    except Exception as e:
-        print(f"  [日K] 东财失败: {e}")
-
-    # 方案2: 新浪
-    try:
+    def sina() -> pd.DataFrame:
         pfx = "sh" if code[0] == "6" else "sz"
-        df = ak.stock_zh_a_daily(symbol=f"{pfx}{code}", adjust="qfq")
-        if not df.empty:
-            df = df.rename(columns=SINA_COL_MAP)
-            df["date"] = pd.to_datetime(df["date"])
-            # 新浪没有涨跌幅，手动算
-            if "pct_chg" not in df.columns:
-                df["pct_chg"] = df["close"].pct_change() * 100
-            print(f"  [日K] 新浪 → {len(df)} 条")
-            return df
-    except Exception as e:
-        print(f"  [日K] 新浪失败: {e}")
+        frame = _normalize_daily(ak.stock_zh_a_daily(symbol=f"{pfx}{code}", adjust="qfq"))
+        if "pct_chg" in frame.columns and frame["pct_chg"].isna().all() and "close" in frame.columns:
+            frame["pct_chg"] = frame["close"].pct_change() * 100
+        return frame
 
-    return pd.DataFrame()
+    result = run_fallback_chain(
+        "日K线",
+        [("easy_tdx", easy_tdx), ("AKShare/东方财富", eastmoney), ("AKShare/Sina", sina)],
+        seconds=12,
+        empty=dataframe_empty,
+    )
+    frame = result.value if isinstance(result.value, pd.DataFrame) else pd.DataFrame()
+    if result.ok:
+        print(f"  [日K] {result.source} → {len(frame)} 条")
+    return _with_frame_meta(frame, fetch_state=result.fetch_state, source_chain=result.source_chain, error=result.error)
 
 
 def fetch_kline_quarterly(code: str, daily: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -116,27 +144,20 @@ def fetch_kline_quarterly(code: str, daily: pd.DataFrame | None = None) -> pd.Da
 
 def fetch_spot(code: str) -> dict:
     """实时行情: easy_tdx 单股查询，回退 efinance 单股查询。"""
-    try:
+    def easy_tdx() -> dict:
         from tools.providers.easy_tdx_provider import fetch_realtime_quote
+        return fetch_realtime_quote(code)
 
-        result = fetch_realtime_quote(code)
-        if result:
-            print(f"  [行情] easy_tdx → {result.get('最新价', 'N/A')}")
-            return result
-    except Exception as e:
-        print(f"  [行情] easy_tdx失败: {e}")
-
-    try:
+    def efinance() -> dict:
         from tools.efinance.provider import fetch_realtime_quotes
+        return fetch_realtime_quotes(code)
 
-        result = fetch_realtime_quotes(code)
-        if result:
-            print(f"  [行情] efinance → {result.get('最新价', 'N/A')}")
-            return result
-    except Exception as e:
-        print(f"  [行情] efinance失败: {e}")
-
-    return {}
+    result = run_fallback_chain("实时行情", [("easy_tdx", easy_tdx), ("efinance", efinance)], seconds=8, empty=lambda value: not bool(value))
+    payload = dict(result.value or {})
+    if result.ok:
+        print(f"  [行情] {result.source} → {payload.get('最新价', 'N/A')}")
+    payload.update({"_fetch_state": result.fetch_state, "_source_chain": result.source_chain or [], "_fetch_error": result.error or None})
+    return payload
 
 
 def fetch_company_and_peers(code: str) -> tuple[dict, pd.DataFrame]:
@@ -185,17 +206,22 @@ def fetch_company_and_peers(code: str) -> tuple[dict, pd.DataFrame]:
 
 
 def fetch_financial_report(code: str, report_type: str) -> pd.DataFrame:
-    """财报: easy_tdx 封装的 Sina JSON 接口。"""
-    try:
-        from tools.providers.easy_tdx_provider import fetch_financial_report as fetch_sina_report
+    """财报: easy_tdx/Sina → AKShare/Sina，字段归一化后保持旧字段名。"""
+    indicator = {"lrb": "利润表", "fzb": "资产负债表", "llb": "现金流量表"}.get(report_type, report_type)
 
-        df = fetch_sina_report(code, report_type, num=8)
-        if not df.empty:
-            print(f"  [财报/{report_type}] easy_tdx/Sina → {len(df)} 期")
-            return df
-    except Exception as e:
-        print(f"  [财报/{report_type}] easy_tdx/Sina失败: {e}")
-    return pd.DataFrame()
+    def easy_sina() -> pd.DataFrame:
+        from tools.providers.easy_tdx_provider import fetch_financial_report as fetch_sina_report
+        return _financial_aliases(fetch_sina_report(code, report_type, num=8))
+
+    def ak_sina() -> pd.DataFrame:
+        prefix = "sh" if code.startswith(("6", "9")) else "bj" if code.startswith(("4", "8")) else "sz"
+        return _financial_aliases(ak.stock_financial_report_sina(stock=f"{prefix}{code}", symbol=indicator))
+
+    result = run_fallback_chain(f"财报/{report_type}", [("easy_tdx/Sina", easy_sina), ("AKShare/Sina", ak_sina)], seconds=15, empty=dataframe_empty)
+    frame = result.value if isinstance(result.value, pd.DataFrame) else pd.DataFrame()
+    if result.ok:
+        print(f"  [财报/{report_type}] {result.source} → {len(frame)} 期")
+    return _with_frame_meta(frame, fetch_state=result.fetch_state, source_chain=result.source_chain, error=result.error)
 
 
 def fetch_historical_valuation(code: str) -> dict[str, pd.DataFrame]:
@@ -270,6 +296,16 @@ def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame
         "profit_yoy": latest("lrb", "归属于母公司的净利润_同比", "归属于母公司所有者的净利润_同比"),
         "operating_cashflow": latest("llb", "经营活动产生的现金流量净额"),
         "net_profit": latest("lrb", "归属于母公司的净利润", "归属于母公司所有者的净利润"),
+        "quote_fetch_state": spot.get("_fetch_state") if spot else "failed",
+        "quote_source_chain": spot.get("_source_chain", []) if spot else [],
+        "kline_fetch_state": kline_daily.attrs.get("fetch_state", "failed"),
+        "kline_source_chain": kline_daily.attrs.get("source_chain", []),
+        "financial_fetch_state": {
+            key: frame.attrs.get("fetch_state", "failed") for key, frame in financials.items()
+        },
+        "financial_source_chain": {
+            key: frame.attrs.get("source_chain", []) for key, frame in financials.items()
+        },
     }
     income = financials.get("lrb", pd.DataFrame())
     if len(income) >= 2:
@@ -360,6 +396,13 @@ def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame
             if high > low:
                 metrics["price_percentile_3y"] = (latest_close - low) / (high - low)
                 metrics["drawdown_from_3y_high"] = latest_close / high - 1
+    states = [metrics.get("quote_fetch_state"), metrics.get("kline_fetch_state"), *metrics.get("financial_fetch_state", {}).values()]
+    metrics["fetch_state"] = "failed" if any(state == "failed" for state in states) else "fallback_ok" if any(state == "fallback_ok" for state in states) else "empty" if all(state in {"empty", "failed"} for state in states) else "ok"
+    metrics["source_chain"] = {
+        "quote": metrics.get("quote_source_chain", []),
+        "kline": metrics.get("kline_source_chain", []),
+        "financial": metrics.get("financial_source_chain", {}),
+    }
     clean: dict = {}
     for key, value in metrics.items():
         if value is None:

@@ -5,6 +5,7 @@ import csv
 from datetime import date, timedelta
 import json
 from pathlib import Path
+import sys
 import time
 
 import akshare as ak
@@ -12,6 +13,9 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from tools.data_call import dataframe_empty, run_fallback_chain
 MAP_PATH = Path(__file__).with_name("commodity_futures_map.csv")
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "supply_demand"
 
@@ -44,27 +48,82 @@ def _latest_value(series: pd.Series) -> float | None:
     return float(clean.iloc[-1]) if not clean.empty else None
 
 
+def _normalize_spot(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    aliases = {"日期": "date", "交易日期": "date", "spot_price": "spot_price", "现货价": "spot_price", "价格": "spot_price", "基差": "dom_basis_rate", "基差率": "dom_basis_rate"}
+    frame = frame.rename(columns={key: value for key, value in aliases.items() if key in frame.columns}).copy()
+    if "date" in frame.columns:
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    for column in ("spot_price", "dom_basis_rate"):
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+def _normalize_inventory(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    frame = frame.rename(columns={"日期": "date", "统计日期": "date", "库存量": "库存", "库存": "库存"}).copy()
+    if "date" in frame.columns:
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    if "库存" in frame.columns:
+        frame["库存"] = pd.to_numeric(frame["库存"], errors="coerce")
+    return frame
+
+
+def _future_spot_fallback(mapping: dict) -> pd.DataFrame:
+    """Return only a directly mapped futures snapshot; never invent a history."""
+    frame = ak.futures_zh_spot(symbol=mapping["futures_symbol"], market=mapping["exchange"])
+    frame = _normalize_spot(frame)
+    if "spot_price" not in frame.columns:
+        price_column = next((item for item in ("最新价", "最新", "收盘价") if item in frame.columns), None)
+        if price_column:
+            frame["spot_price"] = pd.to_numeric(frame[price_column], errors="coerce")
+    return frame
+
+
+def _future_inventory_fallback(mapping: dict) -> pd.DataFrame:
+    return _normalize_inventory(ak.futures_inventory_99(symbol=mapping["inventory_symbol"]))
+
+
 def collect(context: str, lookback_days: int = 30) -> dict:
     mapping = match_mapping(context)
     if not mapping:
         return {
             "supply_mapping_found": False,
+            "fetch_state": "empty",
+            "source_chain": [],
             "supply_reason": "主营、行业和概念未匹配商品期货映射，不强行评分",
         }
 
     start = (date.today() - timedelta(days=lookback_days)).strftime("%Y%m%d")
     end = date.today().strftime("%Y%m%d")
-    spot = pd.DataFrame()
-    inventory = pd.DataFrame()
-    errors: list[str] = []
-    try:
-        spot = ak.futures_spot_price_daily(start_day=start, end_day=end, vars_list=[mapping["spot_var"]])
-    except Exception as exc:
-        errors.append(f"spot:{type(exc).__name__}")
-    try:
-        inventory = ak.futures_inventory_em(symbol=mapping["inventory_symbol"])
-    except Exception as exc:
-        errors.append(f"inventory:{type(exc).__name__}")
+    spot_result = run_fallback_chain(
+        "商品现货/基差",
+        [
+            ("AKShare/现货库存主接口", lambda: _normalize_spot(ak.futures_spot_price_daily(start_day=start, end_day=end, vars_list=[mapping["spot_var"]]))),
+            ("AKShare/对应期货快照", lambda: _future_spot_fallback(mapping)),
+        ],
+        seconds=20,
+        empty=dataframe_empty,
+    )
+    inventory_result = run_fallback_chain(
+        "商品库存",
+        [
+            ("AKShare/库存主接口", lambda: _normalize_inventory(ak.futures_inventory_em(symbol=mapping["inventory_symbol"]))),
+            ("AKShare/库存等价接口", lambda: _future_inventory_fallback(mapping)),
+        ],
+        seconds=20,
+        empty=dataframe_empty,
+    )
+    spot = spot_result.value if isinstance(spot_result.value, pd.DataFrame) else pd.DataFrame()
+    inventory = inventory_result.value if isinstance(inventory_result.value, pd.DataFrame) else pd.DataFrame()
+    errors = [item for item in (spot_result.error, inventory_result.error) if item]
+    fetch_status = {
+        "spot": {"fetch_state": spot_result.fetch_state, "source": spot_result.source, "source_chain": spot_result.source_chain or [], "error": spot_result.error or None},
+        "inventory": {"fetch_state": inventory_result.fetch_state, "source": inventory_result.source, "source_chain": inventory_result.source_chain or [], "error": inventory_result.error or None},
+    }
 
     evidence: list[dict] = []
     if not spot.empty and "spot_price" in spot:
@@ -114,6 +173,10 @@ def collect(context: str, lookback_days: int = 30) -> dict:
         "supply_tightening": tightening,
         "supply_evidence": evidence,
         "supply_errors": errors,
+        "fetch_state": "failed" if all(item["fetch_state"] == "failed" for item in fetch_status.values()) else "fallback_ok" if any(item["fetch_state"] == "fallback_ok" for item in fetch_status.values()) else "ok" if evidence else "empty",
+        "source_chain": {key: value["source_chain"] for key, value in fetch_status.items()},
+        "supply_fetch_status": fetch_status,
+        "supply_reason": "现货、基差和库存接口返回字段不足或不可用，供需证据类别不可用" if not evidence else None,
     }
 
 

@@ -35,13 +35,58 @@ SOURCE_LABELS = {
 REPORTS = tuple(SOURCE_LABELS)
 COMMENT_PATTERN = re.compile(r"<!--\s*(moda_[a-z_]+):\s*(\{.*?\})\s*-->", re.S)
 
-TRACK_GROUPS = {
-    "AI 算力与数据中心": ("算力", "数据中心", "服务器", "液冷", "光模块", "高速互联", "AI电源", "人工智能"),
-    "半导体国产替代": ("半导体", "芯片", "光刻", "电子特气", "硅片", "封装", "国产替代", "功率器件"),
-    "商业航天与军工": ("商业航天", "卫星", "火箭", "高温合金", "军工", "航空发动机"),
-    "新能源与储能": ("储能", "电网", "新能源", "锂电", "光伏", "风电", "充电桩"),
-    "资源与周期": ("锂矿", "铜矿", "金矿", "稀土", "有色", "煤炭", "航运", "涨价"),
-    "机器人与先进制造": ("机器人", "工业母机", "数控", "核心零部件", "自动化", "专用设备"),
+TRACK_GROUPS: dict[str, dict[str, Any]] = {
+    "AI 算力与数据中心": {
+        "sw_first": ("计算机", "通信", "电子"),
+        "sw_second": ("计算机设备", "IT服务Ⅱ", "软件开发", "通信设备", "通信服务", "半导体", "元件", "光学光电子"),
+        "terms": ("算力", "数据中心", "服务器", "液冷", "光模块", "高速互联", "AI电源", "人工智能", "大模型"),
+        "require_terms": True,
+    },
+    "半导体国产替代": {
+        "sw_first": ("电子",),
+        "sw_second": ("半导体", "电子化学品Ⅱ", "元件", "光学光电子"),
+        "terms": ("半导体", "芯片", "光刻", "电子特气", "硅片", "封装", "国产替代", "功率器件"),
+    },
+    "商业航天与军工": {
+        "sw_first": ("国防军工",),
+        "sw_second": ("航天装备Ⅱ", "航空装备Ⅱ", "地面兵装Ⅱ", "航海装备Ⅱ", "军工电子Ⅱ"),
+        "terms": ("商业航天", "卫星", "火箭", "高温合金", "军工", "航空发动机", "低空经济"),
+    },
+    "新能源与储能": {
+        "sw_first": ("电力设备",),
+        "sw_second": ("光伏设备", "风电设备", "电池", "电网设备", "其他电源设备Ⅱ"),
+        "terms": ("储能", "电网", "新能源", "锂电", "光伏", "风电", "充电桩", "逆变器"),
+    },
+    "汽车电动化与出海": {
+        "sw_first": ("汽车",),
+        "sw_second": ("汽车零部件", "乘用车", "商用车", "摩托车及其他"),
+        "terms": ("汽车出海", "整车出口", "汽车出口", "海外市场", "新能源车", "新能源汽车", "电动车", "智能汽车"),
+        "require_terms": True,
+        "require_export_or_electrification": True,
+    },
+    "资源与周期": {
+        "sw_first": ("有色金属", "煤炭", "石油石化", "钢铁"),
+        "sw_second": ("工业金属", "贵金属", "小金属", "能源金属", "煤炭开采", "焦炭Ⅱ", "油气开采Ⅱ", "油服工程", "冶钢原料", "特钢Ⅱ", "航运港口"),
+        "terms": ("锂矿", "铜矿", "金矿", "稀土", "有色", "煤炭", "石油", "天然气", "航运", "资源品", "涨价"),
+    },
+    "机器人与先进制造": {
+        "sw_first": ("机械设备",),
+        "sw_second": ("自动化设备", "通用设备", "专用设备", "电机Ⅱ", "工程机械"),
+        "terms": ("机器人", "工业母机", "数控", "核心零部件", "自动化", "减速器", "伺服", "丝杠"),
+        "require_terms": True,
+    },
+    "创新药与生命科学": {
+        "sw_first": ("医药生物",),
+        "sw_second": ("化学制药", "生物制品", "医疗器械", "医疗服务"),
+        "terms": ("创新药", "生物制药", "生物医药", "ADC", "抗体", "临床", "药物", "基因测序", "多组学"),
+        "require_terms": True,
+    },
+    "大健康与功能性消费": {
+        "sw_first": ("食品饮料", "美容护理", "医药生物"),
+        "sw_second": ("食品加工", "饮料乳品", "休闲食品", "个护用品", "医疗美容"),
+        "terms": ("保健品", "功能性原料", "保健食品", "营养健康", "维生素", "健康食品", "功能饮料"),
+        "require_terms": True,
+    },
 }
 CAPEX_TERMS = ("资本开支", "扩产", "投产", "产能利用率", "新增订单", "在手订单", "设备投资", "产线建设")
 LEADERSHIP_DIMENSION_PATTERNS = {
@@ -457,28 +502,74 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
     structured_context = " ".join([industry_context, business_context])
     searchable_reports = [report for directory, report in reports.items() if directory != "web_research"]
     full_context = structured_context + " " + " ".join(searchable_reports)
-    track_candidates: list[tuple[int, int, int, str, list[str], list[str]]] = []
+    mapping = evidence.get("industry_mapping") if isinstance(evidence.get("industry_mapping"), dict) else {}
+    mapping_status = str(mapping.get("status") or "不可用")
+    sw_first = str(mapping.get("sw_first_name") or "")
+    sw_second = str(mapping.get("sw_second_name") or "")
+
+    def sw_matches(value: str, candidates: tuple[str, ...]) -> bool:
+        normalized = value.replace("Ⅱ", "").strip()
+        return bool(normalized and any(normalized == item.replace("Ⅱ", "").strip() for item in candidates))
+
+    overseas_ratio = _float(evidence.get("overseas_revenue_ratio"))
+    if overseas_ratio is not None and overseas_ratio > 1:
+        overseas_ratio /= 100
+
+    track_candidates: list[tuple[int, int, int, int, str, list[str], list[str], list[str]]] = []
     concept_clues: list[str] = []
-    for label, terms in TRACK_GROUPS.items():
+    for label, rule in TRACK_GROUPS.items():
+        terms = tuple(rule.get("terms") or ())
         industry_hits = [term for term in terms if term.lower() in industry_context.lower()]
         business_hits = [term for term in terms if term.lower() in business_context.lower()]
         concept_hits = [term for term in terms if term.lower() in concept_context.lower()]
-        primary_score = len(industry_hits) * 2 + len(business_hits)
+        sw_first_hit = sw_matches(sw_first, tuple(rule.get("sw_first") or ()))
+        sw_second_hit = sw_matches(sw_second, tuple(rule.get("sw_second") or ()))
+        structured_hits = len(industry_hits) + len(business_hits)
+        if rule.get("require_export_or_electrification"):
+            export_or_electrification = bool(structured_hits) or (overseas_ratio is not None and overseas_ratio >= 0.20)
+            if not export_or_electrification:
+                if sw_first_hit or sw_second_hit or concept_hits:
+                    concept_clues.append(label)
+                continue
+        if rule.get("require_terms") and structured_hits == 0:
+            if sw_first_hit or sw_second_hit or concept_hits:
+                concept_clues.append(label)
+            continue
+        primary_score = int(sw_second_hit) * 6 + int(sw_first_hit) * 3 + len(industry_hits) * 2 + len(business_hits)
         if primary_score:
-            track_candidates.append((primary_score, len(business_hits), len(industry_hits), label, industry_hits, business_hits))
+            sw_hits = [item for item in (f"申万一级：{sw_first}" if sw_first_hit else "", f"申万二级：{sw_second}" if sw_second_hit else "") if item]
+            track_candidates.append((
+                primary_score, int(sw_second_hit), int(sw_first_hit), len(business_hits),
+                label, industry_hits, business_hits, sw_hits,
+            ))
         elif concept_hits:
             concept_clues.append(label)
     if track_candidates:
-        _, business_count, industry_count, dominant_track, industry_hits, business_hits = max(track_candidates, key=lambda item: item[:3])
-        strength = 1.0 if industry_count and business_count else 0.8 if business_count >= 2 else 0.6
-        _set(evidence, "track_strength", strength, "行业/主营结构化匹配")
+        _, second_hit, first_hit, business_count, dominant_track, industry_hits, business_hits, sw_hits = max(
+            track_candidates, key=lambda item: item[:4]
+        )
+        industry_count = len(industry_hits)
+        structured_count = industry_count + business_count
+        if second_hit and structured_count:
+            strength = 1.0
+        elif first_hit and business_count >= 2:
+            strength = 1.0
+        elif second_hit or (first_hit and structured_count) or business_count >= 2:
+            strength = 0.8
+        else:
+            strength = 0.6
+        source = "申万行业映射 + 主营结构化匹配" if sw_hits and mapping_status in {"已验证", "部分覆盖"} else "行业/主营结构化匹配"
+        _set(evidence, "track_strength", strength, source)
         evidence["dominant_track"] = dominant_track
-        hits = list(dict.fromkeys([*industry_hits, *business_hits]))
-        evidence["track_reason"] = f"主导赛道：{dominant_track}（主营/行业命中：{'、'.join(hits)}）"
-        evidence["track_partial"] = strength < 1.0
+        structured_labels = list(dict.fromkeys([*industry_hits, *business_hits]))
+        reason_parts = [*sw_hits]
+        if structured_labels:
+            reason_parts.append(f"主营/行业：{'、'.join(structured_labels)}")
+        evidence["track_reason"] = f"主导赛道：{dominant_track}（{'；'.join(reason_parts)}）"
+        evidence["track_partial"] = strength < 1.0 or not sw_hits or mapping_status != "已验证"
     elif concept_clues:
         evidence["track_clues"] = list(dict.fromkeys(concept_clues))
-        evidence["track_reason"] = "仅概念板块提示可能赛道，不参与大时代赛道得分"
+        evidence["track_reason"] = "仅申万宽口径或概念板块提示可能赛道，缺少主营共同验证，不参与大时代赛道得分"
 
     order_growth = _float(evidence.get("order_growth"))
     announcement_items = [

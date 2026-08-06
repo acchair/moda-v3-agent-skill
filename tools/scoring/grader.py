@@ -38,6 +38,25 @@ def _fmt_percent_points(value: Any) -> str:
         return "需人工确认"
 
 
+def _fmt_decimal(value: Any, digits: int = 2) -> str:
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "需人工确认"
+
+
+def _cashflow_summary(evidence: dict[str, Any]) -> str:
+    try:
+        cashflow = float(evidence.get("operating_cashflow"))
+    except (TypeError, ValueError):
+        return "经营现金流需人工确认"
+    if cashflow > 0:
+        return "经营现金流为正"
+    if cashflow < 0:
+        return "经营现金流为负"
+    return "经营现金流接近零"
+
+
 def _progress_bar(value: float, maximum: float, width: int = 20) -> str:
     if width <= 0:
         return ""
@@ -78,13 +97,21 @@ def _source_text(item: SubfactorResult) -> str:
     return "、".join(f"[{source}]" for source in item.sources) if item.sources else "需人工确认"
 
 
+def _visible_action_cap(cap: str) -> str:
+    if cap == "不碰":
+        return "卖出"
+    if cap in {"学习仓", "矛"}:
+        return "持有"
+    return cap
+
+
 def _table_text(value: Any, limit: int = 110) -> str:
     text = " ".join(str(value or "需人工确认").replace("|", "/").split())
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 PENDING_CONFIRMATION_GUIDANCE = {
-    "era_track": "补充行业未来三年 CAGR、渗透率或权威产业趋势数据。",
+    "era_track": "补充莫大选股产业趋势判断、主营/行业结构化匹配，以及未来三年 CAGR、渗透率或权威产业趋势数据。",
     "supply_gap": "补充至少两类同向的价格、库存、订单、CR3 或扩产周期证据。",
     "capex_wave": "补充公司资本开支同比、在建工程/固定资产、订单或扩产计划，并与行业投资方向交叉核对。",
     "background": "补充控股股东、实际控制人身份及国资/产业资本背景的年报或公告证据。",
@@ -166,19 +193,32 @@ def _chain_rows(evidence: dict[str, Any]) -> list[tuple[str, str, str, str]]:
     return rows
 
 
+def _technical_snapshot(evidence: dict[str, Any]) -> str:
+    indicators = evidence.get("technical_indicators") if isinstance(evidence.get("technical_indicators"), dict) else {}
+    chan = evidence.get("chan_structure") if isinstance(evidence.get("chan_structure"), dict) else {}
+
+    def state(key: str) -> str:
+        item = indicators.get(key)
+        return str(item.get("state") or "需人工确认") if isinstance(item, dict) else "需人工确认"
+
+    direction = str(chan.get("latest_direction") or "需人工确认") if chan.get("status") == "可分析" else "需人工确认"
+    return f"缠论结构{direction}、MACD{state('macd')}、OBV{state('obv')}、WR{state('wr')}"
+
+
 def _moda_overview(card: Scorecard, evidence: dict[str, Any]) -> list[tuple[str, str, str, str]]:
     chain_name = str(evidence.get("chain_name") or "产业链待确认")
     stage = _chain_stage_label(str(evidence.get("chain_stage") or ""))
     business_items = evidence.get("business_items") if isinstance(evidence.get("business_items"), list) else []
-    business = "、".join(str(item) for item in business_items[:3]) or "主营业务待确认"
+    business = "、".join(str(item) for item in business_items[:3]) or str(evidence.get("main_business") or "主营业务待确认")
+    technical = _technical_snapshot(evidence)
     return [
         ("产业与业务", "行业景气：" + str(evidence.get("industry_prosperity_status", "需人工确认")),
          f"对应{chain_name}{stage}", f"主营包括{business}，产业链具体增速、供需和资本开支仍需补证。"),
-        ("公司卡位", "中游业务组合", f"主营映射至{chain_name}{stage}", "国产替代和环保监测需求有应用场景，但竞争份额与客户壁垒尚未充分确认。"),
-        ("利润兑现", "订单改善未传导", "收入、利润和现金流尚未同步改善", f"营收同比{_fmt_pct(evidence.get('revenue_yoy'))}，利润同比{_fmt_pct(evidence.get('profit_yoy'))}，经营现金流为负。"),
-        ("位置与态度", "价格处于低位", "市场关注度不高，行业交易偏热", f"三年价格分位{_fmt_pct(evidence.get('price_percentile_3y'))}，个股关注度{evidence.get('attention_heat', '需人工确认')}，行业拥挤度{evidence.get('market_congestion', '需人工确认')}。"),
+        ("公司卡位", f"{stage}业务映射", f"主营映射至{chain_name}{stage}", "主营与产业链已有映射，竞争份额、客户壁垒和国产替代程度仍以可核验证据为准。"),
+        ("利润兑现", "财务兑现进度", f"营收同比{_fmt_pct(evidence.get('revenue_yoy'))}，利润同比{_fmt_pct(evidence.get('profit_yoy'))}", f"{_cashflow_summary(evidence)}，订单、利润和现金回收能否同步改善仍需跟踪。"),
+        ("位置与态度", f"三年价格分位{_fmt_pct(evidence.get('price_percentile_3y'))}", f"个股关注度{_fmt_pct(evidence.get('attention_heat'))}，行业拥挤度{_fmt_pct(evidence.get('market_congestion'))}", technical),
         ("安全边际", "财务安全垫偏薄", "没有发现ST或重大审计风险", "负债和短债压力仍需持续观察，低位不能替代现金流改善。"),
-        ("交易修正", "反弹观察", f"技术信号：{evidence.get('technical_signal', '需人工确认')}", "MACD与OBV偏多，但缠论结构向下、WR超买，趋势尚未确认。"),
+        ("交易修正", str(evidence.get("technical_signal") or "需人工确认"), f"技术信号：{evidence.get('technical_signal', '需人工确认')}", f"{technical}，交易判断以当前技术证据为准。"),
     ]
 
 
@@ -229,21 +269,26 @@ def _framework_conclusion(card: Scorecard, evidence: dict[str, Any]) -> list[tup
         for item in business_breakdown
         if item.get("category") == "按产品分类" and item.get("item") and isinstance(item.get("revenue_ratio"), (int, float))
     ]
-    product_note = "；".join(product_lines[:3]) or "主营产品收入结构需人工确认"
+    product_note = "；".join(product_lines[:3]) or main_business
     revenue_yoy = _fmt_pct(evidence.get("revenue_yoy"))
     profit_yoy = _fmt_pct(evidence.get("profit_yoy"))
     order_growth = _fmt_percent_points(evidence.get("order_growth"))
     overseas_ratio = _fmt_percent_points(evidence.get("overseas_revenue_ratio"))
     price_percentile = _fmt_pct(evidence.get("price_percentile_3y"))
-    attention_heat = evidence.get("attention_heat", "需人工确认")
-    congestion = evidence.get("market_congestion", "需人工确认")
+    latest_price = _fmt_decimal(evidence.get("latest_price"))
+    pe_ttm = _fmt_decimal(evidence.get("pe_ttm"))
+    pb = _fmt_decimal(evidence.get("pb"))
+    attention_heat = _fmt_pct(evidence.get("attention_heat"))
+    congestion = _fmt_pct(evidence.get("market_congestion"))
+    cashflow = _cashflow_summary(evidence)
+    technical_snapshot = _technical_snapshot(evidence)
     return [
-        ("1. 一句话逻辑", f"{name}当前行动状态为“{card.action_rating}”。公司对应{chain_name}{stage}，主营业务集中在{product_note}；但行业景气为{prosperity}，收入同比{revenue_yoy}、归母净利润同比{profit_yoy}，经营现金流仍为负，订单改善尚未转化为稳定利润和现金流，因此暂不具备强确定性配置条件。"),
-        ("2. 产业与业务位置", f"聚光科技对应的不是单一概念，而是环境监测、分析仪器、相关软件耗材、检测运营及环境设备工程等业务组合，当前归入{chain_name}{stage}。公司能受益于环保监测、工业检测和国产替代需求，但未来需求增速、供需缺口、资本开支和具体竞争份额尚未形成可核验的完整证据链，国产替代目前只能作为未核验线索。"),
-        ("3. 国产替代与利润兑现", f"公司产品和服务具备国产化应用场景，产品收入结构显示{product_note}。近一期订单增长约{order_growth}，但营收同比{revenue_yoy}、利润同比{profit_yoy}，海外收入占比约{overseas_ratio}；这说明业务仍以国内需求为主，订单端出现改善迹象，但收入确认、毛利和现金回收还没有同步改善。"),
-        ("4. 位置与市场态度", f"当前价格为{evidence.get('latest_price', '需人工确认')}元，三年价格分位约{price_percentile}，低位特征较明显；估值方面TTM PE为{evidence.get('pe_ttm', '需人工确认')}、PB为{evidence.get('pb', '需人工确认')}，低位并不等于便宜且已反转。个股关注度为{attention_heat}，所属行业拥挤度为{congestion}，技术面出现{evidence.get('technical_signal', '需人工确认')}信号，但缠论结构仍向下、WR处于超买区，交易面更像反弹观察而非趋势确认。"),
+        ("1. 一句话逻辑", f"{name}当前行动状态为“{card.action_rating}”。公司对应{chain_name}{stage}，主营业务集中在{product_note}；行业景气为{prosperity}，收入同比{revenue_yoy}、归母净利润同比{profit_yoy}，{cashflow}。订单、利润和现金回收是否形成稳定改善，仍需结合后续报告期验证。"),
+        ("2. 产业与业务位置", f"{name}主营业务为{main_business}，当前归入{chain_name}{stage}，产业链匹配方式为{match_type}。现有证据仅确认以上业务和链位映射；未来需求增速、供需缺口、资本开支与竞争份额仍需补证，国产替代仅在有对应证据时成立。"),
+        ("3. 国产替代与利润兑现", f"现有主营和收入结构显示{product_note}。近一期订单增长指标为{order_growth}，营收同比{revenue_yoy}、利润同比{profit_yoy}，海外收入占比约{overseas_ratio}，{cashflow}；订单、收入、毛利和现金回收能否同步改善仍需持续验证。"),
+        ("4. 位置与市场态度", f"当前价格为{latest_price}元，三年价格分位约{price_percentile}；估值方面TTM PE为{pe_ttm}、PB为{pb}，低位不等于便宜或已经反转。个股关注度为{attention_heat}，所属行业拥挤度为{congestion}，技术面出现{evidence.get('technical_signal', '需人工确认')}信号；{technical_snapshot}。"),
         ("5. 安全边际", f"公司未见ST、退市或重大审计风险，近180天也未核验到控股股东减持；但{financial.reason}。股东层面相对稳定，财务层面的安全垫仍偏薄，若经营现金流继续为负或短债压力上升，低估值和低股价不能抵消基本面风险。"),
-        ("6. 评级与证伪条件", f"研究分为{_fmt(card.research_score)}/100，证据覆盖率为{card.coverage:.1%}；按当前评级规则，60分起才进入“学习仓”，因此本次行动评级为“{card.action_rating}”。后续需要看到订单、营收、利润和经营现金流连续两个报告期改善，且行业需求和资本开支不再走弱；若出现现金流持续恶化、非标审计、重大持续经营风险或控股股东减持，应直接证伪当前观察逻辑。"),
+        ("6. 评级与证伪条件", f"研究分为{_fmt(card.research_score)}/100，证据覆盖率为{card.coverage:.1%}；按研究分映射为买入/持有/卖出，本次行动评级为“{card.action_rating}”。覆盖率仅提示证据质量，不新增第四种评级。后续需要看到订单、营收、利润和经营现金流连续两个报告期改善，且行业需求和资本开支不再走弱；若出现现金流持续恶化、非标审计、重大持续经营风险或控股股东减持，应直接证伪当前观察逻辑。"),
     ]
 
 
@@ -254,7 +299,10 @@ def _technical_analysis(evidence: dict[str, Any]) -> list[str]:
     def value(key: str, field: str = "value", suffix: str = "") -> str:
         item = indicators.get(key, {})
         raw = item.get(field) if isinstance(item, dict) else None
-        return f"{raw}{suffix}" if raw is not None else "需人工确认"
+        if raw is None:
+            return "需人工确认"
+        rendered = _fmt_decimal(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else str(raw)
+        return f"{rendered}{suffix}"
 
     chan_reading = "需人工确认"
     if chan.get("status") == "可分析":
@@ -270,9 +318,9 @@ def _technical_analysis(evidence: dict[str, Any]) -> list[str]:
         ("RSI", value("rsi"), indicators.get("rsi", {}).get("state", "需人工确认")),
         ("WR", value("wr"), indicators.get("wr", {}).get("state", "需人工确认")),
     ]
-    current_price = chan.get("current_price", "需人工确认")
-    support = chan.get("support", "需人工确认")
-    resistance = chan.get("resistance", "需人工确认")
+    current_price = _fmt_decimal(chan.get("current_price"))
+    support = _fmt_decimal(chan.get("support"))
+    resistance = _fmt_decimal(chan.get("resistance"))
     structure_score = evidence.get("technical_structure_score", "需人工确认")
     structure_reason = evidence.get("technical_structure_reason", "技术证据不足，需人工确认")
     lines = [
@@ -281,7 +329,7 @@ def _technical_analysis(evidence: dict[str, Any]) -> list[str]:
         (
             f"- 当前价格：{current_price}；支撑位：{support}；压力位：{resistance}。"
         ),
-        f"- 综合判断：技术结构 {structure_score}/4；{structure_reason}；交易信号 {evidence.get('technical_signal', '需人工确认')}。",
+        f"- 综合判断：技术结构 {_fmt_decimal(structure_score, 1)}/4；{structure_reason}；交易信号 {evidence.get('technical_signal', '需人工确认')}。",
         "- 缠论说明：识别日线分型、笔和最近三笔重叠区间，不替代完整多级别缠论递归。",
         "",
         "| 指标 | 当前读数 | 当前评价 |",
@@ -363,7 +411,7 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
         f"| 已确认得分 | {_fmt(card.verified_points)} | 结构化或明确来源证据支持 |",
         f"| 未核验得分 | {_fmt(card.provisional_points)} | 网络线索或部分覆盖证据支持 |",
         f"| 未知可得分上限 | {_fmt(card.unknown_maximum)} | 尚未核验，不加分也不扣分 |",
-        f"| 最终行动状态 | {card.action_rating} | {card.action_rating_reason} |",
+        f"| 行动评级 | {card.action_rating} | {card.action_rating_reason} |",
         "",
         "## 一句话结论与最终判断",
         "",
@@ -462,7 +510,7 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
         "|---|---|---|",
     ]
     for item in card.hard_caps:
-        lines.append(f"| {item['condition']} | {item['result']} | {item['cap']} |")
+        lines.append(f"| {item['condition']} | {item['result']} | {_visible_action_cap(item['cap'])} |")
 
     lines += ["", "## 睡得着检查", ""]
     for label, status, reason in _sleep_checks(card):

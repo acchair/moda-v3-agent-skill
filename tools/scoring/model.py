@@ -88,7 +88,7 @@ class Scorecard:
     unknown_maximum: float = 0.0
     coverage: float = 0.0
     research_score: float = 0.0
-    action_rating: str = "待补证"
+    action_rating: str = "卖出"
     action_rating_reason: str = ""
     legacy_rating: str = "不碰"
 
@@ -280,9 +280,13 @@ def _score_f1(evidence: dict[str, Any]) -> FactorResult:
             keys.append("penetration_rate")
             score += 5 if 0.05 <= penetration <= 0.20 else 3 if penetration <= 0.50 else 1
             details.append(f"产业渗透率 {penetration:.1%}")
+        if track is not None:
+            keys.append("track_strength")
+            track_reason = evidence.get("track_reason", "莫大选股产业趋势判断")
+            details.append(f"莫大选股判断：{track_reason}")
         items.append(_subfactor(
             evidence, "era_track", "大时代赛道", score, 10, "；".join(details), keys,
-            partial=len(keys) < 2,
+            partial=cagr is None or penetration is None,
             coverage_keys=("industry_cagr_3y", "penetration_rate"),
         ))
     elif track is None:
@@ -293,7 +297,7 @@ def _score_f1(evidence: dict[str, Any]) -> FactorResult:
             track_reason = f"{track_reason}；{evidence['industry_prosperity_reason']}"
         items.append(_subfactor(
             evidence, "era_track", "大时代赛道", track * 10, 10,
-            f"关键词兜底：{track_reason}",
+            f"莫大选股判断：{track_reason}",
             ("track_strength",), partial=True,
             coverage_keys=("industry_cagr_3y", "penetration_rate", "track_strength"),
         ))
@@ -908,32 +912,39 @@ def _cap_rating(rating: str, cap: str) -> str:
     return RATING_ORDER[min(RATING_ORDER.index(rating), RATING_ORDER.index(cap))]
 
 
-def _evidence_rating(score: float, coverage: float) -> str:
-    """Map a score to a research label only after enough evidence is covered."""
-    if coverage < 0.60:
-        return "待补证"
-    return _base_rating(score)
-
-
 def _action_rating(
     research_score: float,
     coverage: float,
     caps: list[dict[str, str]],
 ) -> tuple[str, str]:
+    def action_from_research(score: float) -> str:
+        if score >= 70:
+            return "买入"
+        if score >= 60:
+            return "持有"
+        return "卖出"
+
+    def action_cap(cap: str) -> str:
+        return "卖出" if cap == "不碰" else "持有"
+
     hard_risk = next((item for item in caps if item["result"] == "已触发" and item["cap"] == "不碰"), None)
     if hard_risk:
-        return "不碰", hard_risk["condition"]
+        return "卖出", hard_risk["condition"]
     triggered = [item for item in caps if item["result"] == "已触发"]
-    if coverage < 0.60 and triggered:
-        cap = min((item["cap"] for item in triggered), key=RATING_ORDER.index)
-        return cap, f"已确认 Hard Cap：{'；'.join(item['condition'] for item in triggered)}"
-    if coverage < 0.60:
-        return "待补证", f"证据覆盖率 {coverage:.1%} 低于 60%，暂不据此给出仓位结论"
-    rating = _base_rating(research_score)
+    rating = action_from_research(research_score)
     if triggered:
-        rating = min((rating, *(item["cap"] for item in triggered)), key=RATING_ORDER.index)
-        return rating, "；".join(f"{item['condition']}，评级最高为{item['cap']}" for item in triggered)
-    return rating, "覆盖率达到 60%，按研究分映射行动状态"
+        capped = [action_cap(item["cap"]) for item in triggered]
+        if "卖出" in capped:
+            rating = "卖出"
+        elif "持有" in capped and rating == "买入":
+            rating = "持有"
+        cap_text = "；".join(f"{item['condition']}，行动评级最高为{action_cap(item['cap'])}" for item in triggered)
+        reason = cap_text
+    else:
+        reason = "按研究分映射为买入/持有/卖出"
+    if coverage < 0.60:
+        reason += f"；证据覆盖率 {coverage:.1%} 低于 60%，评级仅作当前证据下的研究判断"
+    return rating, reason
 
 
 def score_evidence(evidence: dict[str, Any]) -> Scorecard:

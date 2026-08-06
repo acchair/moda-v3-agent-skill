@@ -7,7 +7,7 @@
 | Windows | `python tools/run_pipeline.py` | PowerShell 仅作为可选启动方式 |
 | macOS | `python3 tools/run_pipeline.py` | 使用 POSIX 路径和 Python 标准库 |
 | Linux | `python3 tools/run_pipeline.py` | 推荐的无桌面运行环境 |
-| OpenMinis / Apple 移动端 | Agent 工作区中的 `python3` | 使用 OpenMinis Linux 沙箱；不依赖 PowerShell、CloakBrowser 或 Windows 用户目录 |
+| OpenMinis / Apple 移动端 | Agent 工作区中的 `python3` | 使用 OpenMinis Linux 沙箱；不依赖 PowerShell、浏览器状态或 Windows 用户目录 |
 
 ## 搜索回退
 
@@ -22,7 +22,7 @@
 ## 移动端限制
 
 - 不要求 PowerShell、`Get-NetTCPConnection` 或 `Start-Process`。
-- 不要求本机浏览器登录状态、Cookie 或 CloakBrowser。
+- 不要求本机浏览器登录状态或 Cookie。
 - 数据请求失败时保留 `需人工确认`，不把失败转换为安全或利好。
 - 适合在 OpenMinis 中输出 Markdown 报告；完整流水线可能受移动网络、后台执行时间和第三方接口限流影响。
 

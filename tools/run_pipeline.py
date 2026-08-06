@@ -49,8 +49,17 @@ def run_module(label: str, script: str, args: list[str], timeout: int = 180) -> 
                 "coverage": _report_coverage(label, report) if fresh else 0,
                 "elapsed_seconds": round((datetime.now() - started).total_seconds(), 1)}
     except subprocess.TimeoutExpired:
-        return {"label": label, "ok": False, "error": f"timeout after {timeout}s",
-                "elapsed_seconds": round((datetime.now() - started).total_seconds(), 1)}
+        code = args[args.index("--stock") + 1]
+        report = ROOT / "knowledge/research" / REPORT_DIRS[label] / f"{code}.md"
+        fresh = report.exists() and report.stat().st_mtime >= started_ts - 1
+        return {
+            "label": label,
+            "ok": False,
+            "error": f"timeout after {timeout}s",
+            "report_fresh": fresh,
+            "coverage": _report_coverage(label, report) if fresh else 0,
+            "elapsed_seconds": round((datetime.now() - started).total_seconds(), 1),
+        }
 
 
 def _report_coverage(label: str, path: Path) -> int:
@@ -92,10 +101,31 @@ def run_collectors(collectors: list[tuple]) -> list[dict]:
         return list(executor.map(lambda module: run_module(*module), collectors))
 
 
-def current_context(code: str, directories: tuple[str, ...], since: float) -> tuple[str, str, str]:
+def update_report_snapshot(
+    code: str,
+    directories: tuple[str, ...],
+    since: float,
+    snapshot: dict[str, str] | None = None,
+) -> dict[str, str]:
+    from tools.scoring.evidence import read_reports
+
+    reports = snapshot if snapshot is not None else {}
+    missing = tuple(directory for directory in directories if directory not in reports)
+    if missing:
+        reports.update(read_reports(code, missing, since))
+    return reports
+
+
+def current_context(
+    code: str,
+    directories: tuple[str, ...],
+    since: float,
+    reports: dict[str, str] | None = None,
+) -> tuple[str, str, str]:
     from tools.scoring.evidence import build_evidence, read_reports
 
-    evidence = build_evidence(code, code, read_reports(code, directories, since))
+    source_reports = reports if reports is not None else read_reports(code, directories, since)
+    evidence = build_evidence(code, code, source_reports)
     industry = str(evidence.get("industry") or "综合")
     values = [
         industry,
@@ -107,11 +137,18 @@ def current_context(code: str, directories: tuple[str, ...], since: float) -> tu
     return industry, " ".join(value for value in values if value).strip(), security_name
 
 
-def unresolved_targets(code: str, name: str, directories: tuple[str, ...], since: float) -> list[dict]:
+def unresolved_targets(
+    code: str,
+    name: str,
+    directories: tuple[str, ...],
+    since: float,
+    reports: dict[str, str] | None = None,
+) -> list[dict]:
     from tools.scoring.evidence import build_evidence, read_reports
     from tools.scoring.model import score_evidence
 
-    evidence = build_evidence(code, name, read_reports(code, directories, since))
+    source_reports = reports if reports is not None else read_reports(code, directories, since)
+    evidence = build_evidence(code, name, source_reports)
     card = score_evidence(evidence)
     targets = [
         {
@@ -136,6 +173,34 @@ def unresolved_targets(code: str, name: str, directories: tuple[str, ...], since
             if not (item["factor_key"] == "F3" and item["subfactor_key"] == "leadership")
         ]
     return targets
+
+
+def run_contextual_collectors(
+    collectors: list[tuple],
+    context_labels: set[str],
+    followup_factory,
+) -> tuple[list[dict], list[dict]]:
+    context_collectors = [module for module in collectors if module[0] in context_labels]
+    sidecar_collectors = [module for module in collectors if module[0] not in context_labels]
+    context_workers = min(3, max(1, len(context_collectors)))
+    sidecar_workers = min(4, max(1, len(sidecar_collectors)))
+    with ThreadPoolExecutor(max_workers=context_workers) as context_executor, \
+         ThreadPoolExecutor(max_workers=sidecar_workers) as sidecar_executor:
+        futures = {
+            id(module): (
+                context_executor if module[0] in context_labels else sidecar_executor
+            ).submit(run_module, *module)
+            for module in collectors
+        }
+        context_results = [
+            futures[id(module)].result()
+            for module in context_collectors
+        ]
+        followup_collectors = list(followup_factory(context_results))
+        followup_futures = [context_executor.submit(run_module, *module) for module in followup_collectors]
+        first_results = [futures[id(module)].result() for module in collectors]
+        followup_results = [future.result() for future in followup_futures]
+    return first_results, followup_results
 
 
 def main() -> None:
@@ -167,32 +232,74 @@ def main() -> None:
         ("social_sentiment", "tools/akshare/social_sentiment.py", common, 90),
     ]
 
-    results = run_collectors(first_wave)
-    first_sources = tuple(result["label"] for result in results if result.get("ok"))
-    industry, context, discovered_name = current_context(code, first_sources, started_ts)
-    resolved_name = args.name.strip() or discovered_name or resolved_input_name or code
-    common = ["--stock", code, "--name", resolved_name]
-    congestion = ("congestion", "tools/akshare/congestion.py", [*common, "--industry", industry, *refresh_args], 90)
-    second_wave = [
-        ("supply_demand", "tools/scoring/supply_demand.py", [*common, "--context", context], 150),
-        ("macro_policy", "tools/akshare/macro_policy.py", [*common, "--industry", industry], 150),
-    ]
-    prosperity = (
-        "industry_prosperity",
-        "tools/akshare/industry_prosperity.py",
-        [*common, "--industry", industry, *refresh_args],
-        180,
+    report_snapshot: dict[str, str] = {}
+    context_state: dict[str, object] = {}
+
+    def followup_factory(context_results: list[dict]) -> list[tuple]:
+        context_sources = tuple(
+            result["label"] for result in context_results
+            if result.get("ok") or result.get("report_fresh")
+        )
+        update_report_snapshot(code, context_sources, started_ts, report_snapshot)
+        industry, context, discovered_name = current_context(
+            code,
+            context_sources,
+            started_ts,
+            reports=report_snapshot,
+        )
+        resolved_name = args.name.strip() or discovered_name or resolved_input_name or code
+        resolved_common = ["--stock", code, "--name", resolved_name]
+        congestion = (
+            "congestion",
+            "tools/akshare/congestion.py",
+            [*resolved_common, "--industry", industry, *refresh_args],
+            90,
+        )
+        second_wave = [
+            ("supply_demand", "tools/scoring/supply_demand.py", [*resolved_common, "--context", context], 150),
+            ("macro_policy", "tools/akshare/macro_policy.py", [*resolved_common, "--industry", industry], 150),
+        ]
+        prosperity = (
+            "industry_prosperity",
+            "tools/akshare/industry_prosperity.py",
+            [*resolved_common, "--industry", industry, *refresh_args],
+            180,
+        )
+        followups = [congestion, *second_wave, prosperity]
+        context_state.update({
+            "context": context,
+            "resolved_name": resolved_name,
+            "common": resolved_common,
+            "followups": followups,
+        })
+        return followups
+
+    results, followup_results = run_contextual_collectors(
+        first_wave,
+        {"finance_data", "business_data", "market_events"},
+        followup_factory,
     )
-    # These modules share the resolved industry/context and have no dependency
-    # on one another; overlap their network waits while preserving ordering of
-    # the resulting report list.
-    results.extend(run_collectors([congestion, *second_wave, prosperity]))
-    structured_sources = tuple(result["label"] for result in results if result.get("ok"))
-    targets = unresolved_targets(code, resolved_name, structured_sources, started_ts)
+    results.extend(followup_results)
+    resolved_name = str(context_state["resolved_name"])
+    common = list(context_state["common"])
+    context = str(context_state["context"])
+    followups = list(context_state["followups"])
+    # A fresh report is usable evidence even when the subprocess exit status
+    # was affected by an outer timeout. Its embedded fetch_state still
+    # preserves whether the module itself succeeded, fell back, or failed.
+    structured_sources = tuple(
+        result["label"] for result in results
+        if result.get("ok") or result.get("report_fresh")
+    )
+    update_report_snapshot(code, structured_sources, started_ts, report_snapshot)
+    targets = unresolved_targets(code, resolved_name, structured_sources, started_ts, reports=report_snapshot)
     web_args = [*common, "--context", context, "--targets-json", json.dumps(targets, ensure_ascii=False), *refresh_args]
     results.append(run_module("web_research", "tools/scoring/web_research.py", web_args, 120))
-    successful_sources = ",".join(result["label"] for result in results if result.get("ok"))
-    requested_labels = [module[0] for module in first_wave + [congestion] + second_wave + [prosperity]] + ["web_research"]
+    successful_sources = ",".join(
+        result["label"] for result in results
+        if result.get("ok") or result.get("report_fresh")
+    )
+    requested_labels = [module[0] for module in first_wave + followups] + ["web_research"]
     requested_sources = ",".join(requested_labels)
     scoring_args = [*common, "--sources", successful_sources, "--requested-sources", requested_sources, "--since", str(started_ts)]
     results.append(run_module("scoring", "tools/scoring/grader.py", scoring_args))

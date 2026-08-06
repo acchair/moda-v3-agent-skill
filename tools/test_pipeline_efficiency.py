@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import tempfile
 import time
 import unittest
@@ -136,6 +135,43 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual(data["discussion_search_count"], 1)
         self.assertEqual(data["discussion_records"][0]["status"], "网络命中（未核验）")
 
+    def test_social_module_preserves_platform_partial_failure_with_discussion_data(self) -> None:
+        from tools.akshare import social_sentiment
+
+        def fake_cached(platform, _fetcher):
+            if platform in {"weibo", "douyin"}:
+                raise RuntimeError(f"{platform} unavailable")
+            return ([{"rank": 1, "title": "平安银行", "url": ""}], "live")
+
+        discussion = {
+            "discussion_posts_total": 2,
+            "discussion_structured_count": 2,
+            "discussion_search_count": 0,
+            "discussion_source_count": 1,
+            "discussion_source_status": "结构化接口",
+            "discussion_sources": ["eastmoney"],
+            "discussion_partial": False,
+            "discussion_records": [],
+            "discussion_search_errors": [],
+            "discussion_sentiment": "中性",
+            "discussion_sentiment_score": 0.0,
+            "discussion_positive_count": 0,
+            "discussion_negative_count": 0,
+            "discussion_neutral_count": 2,
+            "discussion_promotion_hits": [],
+            "discussion_rumor_hits": [],
+            "fetch_state": "ok",
+            "source_chain": [{"source": "东方财富股吧", "status": "ok", "error": ""}],
+        }
+        with patch.object(social_sentiment, "_cached", side_effect=fake_cached), \
+             patch.object(social_sentiment, "_collect_discussion", return_value=discussion):
+            data = social_sentiment.collect("000001", "平安银行")
+        self.assertEqual(data["fetch_state"], "fallback_ok")
+        self.assertEqual(data["discussion_fetch_state"], "ok")
+        self.assertEqual(data["social_platforms_checked"], 4)
+        self.assertIn("platforms", data["source_chain"])
+        self.assertIn("discussion", data["source_chain"])
+
     def test_moda_f1_uses_cagr_penetration_cr3_expansion_and_capex(self) -> None:
         data = full_evidence()
         f1 = next(factor for factor in score_evidence(data).factors if factor.key == "F1")
@@ -236,7 +272,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
                                        "hard_cap_signals": {"controller_reduction": True}}
         }
         self.assertEqual(score_evidence(missing).rating, "根")
-        self.assertEqual(score_evidence(missing).action_rating, "根")
+        self.assertEqual(score_evidence(missing).action_rating, "买入")
         safe = full_evidence()
         safe["web_subfactor_results"] = missing["web_subfactor_results"]
         self.assertEqual(score_evidence(safe).rating, "根")
@@ -410,6 +446,119 @@ class PipelineEfficiencyTest(unittest.TestCase):
             web_research._search("auto", "刷新查询", 0.1, cache_scope="000001|F1.era_track")
         self.assertEqual(search.call_count, 2)
 
+    def test_search_cache_batch_flushes_once_for_multiple_successes(self) -> None:
+        row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(web_research, "CACHE_PATH", Path(directory) / "search.json"), \
+             patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off"}, clear=False), \
+             patch.object(web_research, "_searxng_search", return_value=row), \
+             patch.object(web_research, "_flush_search_cache", wraps=web_research._flush_search_cache) as flush:
+            with web_research._search_cache_batch():
+                web_research._search("auto", "查询一", 0.1, cache_scope="000001|F1.era_track")
+                web_research._search("auto", "查询二", 0.1, cache_scope="000001|F1.supply_gap")
+        flush.assert_called_once()
+
+    def test_ddg_mcp_session_initializes_once_per_worker(self) -> None:
+        calls: list[str] = []
+
+        class FakeResponse:
+            headers = {"Mcp-Session-Id": "session-1"}
+            content = b""
+
+            def __init__(self, payload: dict | None = None) -> None:
+                self.payload = payload or {}
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict:
+                return self.payload
+
+        class FakeSession:
+            def post(self, _url: str, *, json: dict, headers: dict, timeout: float) -> FakeResponse:
+                calls.append(str(json.get("method") or ""))
+                if json.get("method") == "tools/call":
+                    query = json["params"]["arguments"]["query"]
+                    payload = {"result": {"content": [{"type": "text", "text": f"1. {query}\nURL: https://example.com/{query}"}]}}
+                    return FakeResponse(payload)
+                return FakeResponse()
+
+            def close(self) -> None:
+                pass
+
+        web_research._reset_ddg_runtime()
+        with patch.object(web_research.requests, "Session", return_value=FakeSession()):
+            first = web_research._ddg_mcp_search("https://ddg.example", "first", 0.1)
+            second = web_research._ddg_mcp_search("https://ddg.example", "second", 0.1)
+        web_research._reset_ddg_runtime()
+        self.assertEqual(calls.count("initialize"), 1)
+        self.assertEqual(calls.count("notifications/initialized"), 1)
+        self.assertEqual(calls.count("tools/call"), 2)
+        self.assertEqual([first[0]["title"], second[0]["title"]], ["first", "second"])
+
+    def test_page_snapshot_reuses_only_successful_content(self) -> None:
+        successful = [("ok", "正文")]
+        with patch.object(web_research, "_fetch_page_uncached", side_effect=successful) as fetch:
+            web_research._reset_run_snapshot()
+            first = web_research._fetch_page("https://example.com/a", 0.1)
+            second = web_research._fetch_page("https://example.com/a", 0.1)
+        self.assertEqual((first, second), (("ok", "正文"), ("ok", "正文")))
+        fetch.assert_called_once()
+
+        with patch.object(web_research, "_fetch_page_uncached", side_effect=[("timeout", ""), ("ok", "正文")]) as fetch:
+            web_research._reset_run_snapshot()
+            first = web_research._fetch_page("https://example.com/b", 0.1)
+            second = web_research._fetch_page("https://example.com/b", 0.1)
+        self.assertEqual((first, second), (("timeout", ""), ("ok", "正文")))
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_parallel_gap_collection_preserves_targets_queries_and_order(self) -> None:
+        targets = [
+            {"factor_key": "F1", "subfactor_key": "era_track", "label": "时代赛道", "maximum": 5, "original_status": "需人工确认"},
+            {"factor_key": "F2", "subfactor_key": "controller_action", "label": "实控人行为", "maximum": 5, "original_status": "需人工确认"},
+            {"factor_key": "F3", "subfactor_key": "leadership", "label": "行业地位", "maximum": 5, "original_status": "需人工确认"},
+        ]
+        calls: list[tuple[str, str]] = []
+
+        def fake_search(_provider: str, query: str, _timeout: float, cache_scope: str = ""):
+            calls.append((cache_scope, query))
+            return "duckduckgo_html", [], []
+
+        with patch.object(web_research, "_search", side_effect=fake_search), \
+             patch.object(web_research, "MAX_GAP_BUDGET_SECONDS", 30.0):
+            result = web_research._collect_gap_targets("000001", "测试", "测试行业", targets, "auto", 1)
+
+        selected, _ = web_research._select_gap_targets(targets)
+        expected_keys = [f"{item['factor_key']}.{item['subfactor_key']}" for item in selected]
+        actual_keys = [f"{item['factor_key']}.{item['subfactor_key']}" for item in result["web_gap_results"]]
+        self.assertEqual(actual_keys, expected_keys)
+        self.assertEqual(len(calls), len(selected) * web_research.MAX_GAP_QUERIES_PER_TARGET)
+        self.assertEqual(
+            {scope for scope, _ in calls},
+            {f"000001|{key}" for key in expected_keys},
+        )
+        for item in result["web_gap_results"]:
+            key = f"{item['factor_key']}.{item['subfactor_key']}"
+            self.assertEqual(item["queries"], [
+                *search_rules.queries_for(key, "测试", "000001", "测试行业"),
+                web_research._china_finance_query(key, "测试", "000001", "测试行业"),
+            ][:web_research.MAX_GAP_QUERIES_PER_TARGET])
+
+    def test_specialized_status_gets_a_search_slot_before_target_limit(self) -> None:
+        targets = [
+            {"factor_key": "F1", "subfactor_key": f"gap_{i}", "label": f"F1-{i}", "maximum": 5, "original_status": "需人工确认"}
+            for i in range(8)
+        ] + [
+            {"factor_key": "F3", "subfactor_key": "specialized", "label": "专精特新/单项冠军", "maximum": 2, "original_status": "需人工确认"},
+            {"factor_key": "F3", "subfactor_key": "leadership", "label": "龙头/核心供应商", "maximum": 5, "original_status": "需人工确认"},
+            {"factor_key": "F5", "subfactor_key": "expectation_gap", "label": "预期差", "maximum": 1.5, "original_status": "需人工确认"},
+        ]
+        selected, skipped = web_research._select_gap_targets(targets, limit=10)
+        selected_keys = {f"{item['factor_key']}.{item['subfactor_key']}" for item in selected}
+        skipped_keys = {f"{item['factor_key']}.{item['subfactor_key']}" for item in skipped}
+        self.assertIn("F3.specialized", selected_keys)
+        self.assertNotIn("F3.specialized", skipped_keys)
+
     def test_china_finance_sources_are_tiered_and_prioritized(self) -> None:
         self.assertEqual(web_research._source_role("static.cninfo.com.cn"), ("法定信息披露", "A"))
         self.assertEqual(web_research._source_role("news.cls.cn"), ("财经媒体", "B"))
@@ -444,7 +593,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual(card.coverage, 0)
         self.assertEqual(card.research_score, 0)
         self.assertEqual(card.rating, "不碰")
-        self.assertEqual(card.action_rating, "待补证")
+        self.assertEqual(card.action_rating, "卖出")
         self.assertEqual(card.legacy_rating, "不碰")
 
     def test_f5_modifiers_are_bounded_to_ten_points(self) -> None:
@@ -577,6 +726,44 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual(len(results), 3)
         self.assertLess(time.perf_counter() - started, 0.25)
 
+    def test_report_snapshot_reads_only_new_modules(self) -> None:
+        snapshot = {"finance_data": "财务"}
+        with patch("tools.scoring.evidence.read_reports", return_value={"business_data": "主营"}) as read:
+            result = run_pipeline.update_report_snapshot(
+                "000001",
+                ("finance_data", "business_data"),
+                1.0,
+                snapshot,
+            )
+        self.assertIs(result, snapshot)
+        self.assertEqual(result, {"finance_data": "财务", "business_data": "主营"})
+        read.assert_called_once_with("000001", ("business_data",), 1.0)
+
+    def test_contextual_collectors_start_followups_before_sidecars_finish(self) -> None:
+        events: list[str] = []
+
+        def fake_run(label: str, *_args) -> dict:
+            if label == "slow_sidecar":
+                time.sleep(0.08)
+            elif label == "context":
+                time.sleep(0.01)
+            events.append(label)
+            return {"label": label, "ok": True}
+
+        def followups(_results: list[dict]) -> list[tuple]:
+            events.append("followup_created")
+            return [("followup", "followup.py", [])]
+
+        collectors = [
+            ("context", "context.py", []),
+            ("slow_sidecar", "slow.py", []),
+        ]
+        with patch.object(run_pipeline, "run_module", side_effect=fake_run):
+            first, second = run_pipeline.run_contextual_collectors(collectors, {"context"}, followups)
+        self.assertEqual([item["label"] for item in first], ["context", "slow_sidecar"])
+        self.assertEqual([item["label"] for item in second], ["followup"])
+        self.assertLess(events.index("followup_created"), events.index("slow_sidecar"))
+
     def test_scoring_reads_only_current_reports(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -614,7 +801,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertIn("| 指标 | 当前读数 | 当前评价 |", report)
         self.assertNotIn("| 排名 | 指标", report)
         self.assertNotIn("A股适用性", report)
-        self.assertIn("当前价格：30.0；支撑位：28.0；压力位：33.0", report)
+        self.assertIn("当前价格：30.00；支撑位：28.00；压力位：33.00", report)
         self.assertIn("F6 是独立的第六层，已计入研究分", report)
         self.assertIn("**1. 一句话逻辑**\n\n", report)
         self.assertIn("**6. 评级与证伪条件**\n\n", report)
@@ -628,6 +815,37 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertIn("产业链：半导体设备产业链；公司位置：上游；匹配类型：待确认", report)
         self.assertIn("| 环节 | 核心内容 | 与公司的关系 | 判断 |", report)
         self.assertIn("公司主营映射到本环节：刻蚀设备、薄膜沉积设备；相关收入占比 60.0%", report)
+
+    def test_report_uses_current_company_evidence_and_readable_numbers(self) -> None:
+        evidence = full_evidence()
+        evidence.update({
+            "name": "航天彩虹",
+            "main_business": "航空航天产品制造、无人机及相关产品、塑料薄膜制造、光学膜",
+            "latest_price": 18.469999313354492,
+            "pe_ttm": 675.396484375,
+            "pb": 2.2423210234058315,
+            "price_percentile_3y": 0.386674214959284,
+            "attention_heat": 0.8461,
+            "market_congestion": 0.32,
+            "technical_signal": "中性/无触发",
+            "technical_indicators": {
+                "macd": {"state": "多头"},
+                "obv": {"state": "资金中性"},
+                "wr": {"state": "中性"},
+            },
+        })
+        card = score_evidence(evidence)
+        report = grader.render_report("002389", "航天彩虹", evidence, card, ())
+        conclusion = report.split("## 一句话结论与最终判断", 1)[1].split("## 技术分析（easy-tdx 日 K）", 1)[0]
+
+        self.assertIn("航天彩虹主营业务为航空航天产品制造、无人机及相关产品、塑料薄膜制造、光学膜", conclusion)
+        self.assertIn("当前价格为18.47元", conclusion)
+        self.assertIn("TTM PE为675.40、PB为2.24", conclusion)
+        self.assertIn("个股关注度为84.61%，所属行业拥挤度为32.00%", conclusion)
+        self.assertIn("缠论结构向上、MACD多头、OBV资金中性、WR中性", conclusion)
+        self.assertNotIn("聚光科技", report)
+        self.assertNotIn("环保监测", report)
+        self.assertNotIn("缠论结构仍向下、WR处于超买区", report)
 
     def test_coldness_does_not_require_f3_survival_gate(self) -> None:
         data = full_evidence()
@@ -660,7 +878,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
 
     def test_missing_evidence_does_not_trigger_action_no_touch(self) -> None:
         card = score_evidence({"metric_sources": {}})
-        self.assertEqual(card.action_rating, "待补证")
+        self.assertEqual(card.action_rating, "卖出")
         self.assertFalse(any(item["result"] == "已触发" for item in card.hard_caps))
 
     def test_search_failure_preserves_structured_score_and_status(self) -> None:
@@ -690,7 +908,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
             },
         }
         card = score_evidence(data)
-        self.assertEqual(card.action_rating, "根")
+        self.assertEqual(card.action_rating, "买入")
         self.assertEqual(next(item for item in card.hard_caps if item["condition"] == "控股股东或实控人减持")["result"], "需人工确认")
 
     def test_nominee_holder_is_not_negative_background(self) -> None:
@@ -720,7 +938,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
     def test_confirmed_high_risk_caps_survive_unknown_coverage(self) -> None:
         data = {"metric_sources": {}, "st_risk": True}
         card = score_evidence(data)
-        self.assertEqual(card.action_rating, "不碰")
+        self.assertEqual(card.action_rating, "卖出")
         self.assertEqual(card.rating, "不碰")
 
     def test_industry_prosperity_only_changes_confidence_not_score(self) -> None:
@@ -755,6 +973,49 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertNotIn("AI 算力与数据中心", evidence["track_reason"])
         self.assertGreaterEqual(evidence["business_chain_revenue_ratio"], 0.3)
         self.assertFalse(evidence["chain_partial"])
+
+    def test_moda_track_match_supports_era_track_without_cagr(self) -> None:
+        reports = {
+            "finance_data": '<!-- moda_metrics: {"industry": "生物制药"} -->',
+            "business_data": '<!-- moda_business: {"main_business": "创新药、生物制药", "business_items": ["创新药", "生物制药"]} -->',
+        }
+        evidence = evidence_module.build_evidence("300765", "测试创新药", reports)
+        card = score_evidence(evidence)
+        era = next(item for factor in card.factors if factor.key == "F1" for item in factor.subfactors if item.key == "era_track")
+        self.assertEqual(evidence["dominant_track"], "创新药与生命科学")
+        self.assertGreater(era.score, 0)
+        self.assertIn("莫大选股判断", era.reason)
+
+    def test_sw_mapping_prioritizes_auto_export_track(self) -> None:
+        reports = {
+            "finance_data": '<!-- moda_metrics: {"industry": "汽车零部件"} -->',
+            "business_data": '<!-- moda_business: {"main_business": "新能源汽车零部件、海外市场", "business_items": ["新能源汽车零部件", "海外市场"], "overseas_revenue_ratio": 35} -->',
+            "industry_prosperity": '<!-- moda_industry_prosperity: {"industry_mapping": {"status": "已验证", "sw_first_name": "汽车", "sw_second_name": "汽车零部件"}} -->',
+        }
+        evidence = evidence_module.build_evidence("000001", "汽车测试", reports)
+        self.assertEqual(evidence["dominant_track"], "汽车电动化与出海")
+        self.assertIn("申万一级：汽车", evidence["track_reason"])
+        self.assertIn("申万二级：汽车零部件", evidence["track_reason"])
+
+    def test_sw_resource_mapping_can_support_track_directly(self) -> None:
+        reports = {
+            "finance_data": '<!-- moda_metrics: {"industry": "能源金属"} -->',
+            "business_data": '<!-- moda_business: {"main_business": "矿产资源开发"} -->',
+            "industry_prosperity": '<!-- moda_industry_prosperity: {"industry_mapping": {"status": "已验证", "sw_first_name": "有色金属", "sw_second_name": "能源金属"}} -->',
+        }
+        evidence = evidence_module.build_evidence("000002", "资源测试", reports)
+        self.assertEqual(evidence["dominant_track"], "资源与周期")
+        self.assertGreater(evidence["track_strength"], 0)
+
+    def test_sw_broad_industry_without_business_terms_is_only_clue(self) -> None:
+        reports = {
+            "finance_data": '<!-- moda_metrics: {"industry": "软件服务"} -->',
+            "business_data": '<!-- moda_business: {"main_business": "ERP管理软件"} -->',
+            "industry_prosperity": '<!-- moda_industry_prosperity: {"industry_mapping": {"status": "已验证", "sw_first_name": "计算机", "sw_second_name": "软件开发"}} -->',
+        }
+        evidence = evidence_module.build_evidence("000003", "软件测试", reports)
+        self.assertNotIn("track_strength", evidence)
+        self.assertIn("AI 算力与数据中心", evidence["track_clues"])
 
     def test_electronic_specialty_gas_prefers_semiconductor_supply_chain(self) -> None:
         reports = {
@@ -1161,6 +1422,8 @@ class PipelineEfficiencyTest(unittest.TestCase):
              patch.object(market_events.provider, "concept_blocks", return_value=empty), \
              patch.object(market_events.provider, "research_reports", return_value=empty), \
              patch.object(market_events, "fetch_pledge", side_effect=requests.Timeout("timeout")), \
+             patch.object(market_events, "_ak_lockup", side_effect=requests.Timeout("timeout")), \
+             patch.object(market_events, "_ak_pledge", side_effect=requests.Timeout("timeout")), \
              patch.object(market_events, "fetch_fund_holding", return_value=empty), \
              patch.object(market_events, "fetch_top_holders", return_value=[]):
             structured, _ = market_events.collect("000001")
@@ -1258,12 +1521,28 @@ class PipelineEfficiencyTest(unittest.TestCase):
         frame = pd.DataFrame([{
             "date": datetime.now().strftime("%Y-%m-%d"), "title": f"普通公告{i}", "type": "PDF", "url": "https://example.test"
         } for i in range(announcements.ANNOUNCEMENT_PAGE_SIZE)])
-        fallback = SimpleNamespace(fetch_cninfo_announcements=lambda *_args: [])
         with patch("tools.providers.easy_tdx_provider.fetch_announcements", side_effect=[frame, requests.Timeout("timeout")]), \
-             patch.dict(sys.modules, {"cninfo_backup": fallback}):
+             patch.object(announcements.ak, "stock_zh_a_disclosure_report_cninfo", side_effect=requests.Timeout("timeout")):
             data = announcements.fetch_announcements("300820", days=180)
         self.assertFalse(data["announcement_fetch_ok"])
         self.assertFalse(data["announcement_coverage_complete"])
+        self.assertEqual(data["fetch_state"], "failed")
+        report = announcements.generate_report("300820", "测试", {"qa_list": [], "fetch_state": "failed"}, data)
+        evidence = evidence_module.build_evidence("300820", "测试", {"announcements": report})
+        self.assertNotIn("controller_action", evidence)
+        self.assertNotIn("audit_risk", evidence)
+
+    def test_announcement_fallback_preserves_source_chain(self) -> None:
+        fallback = pd.DataFrame([{
+            "公告日期": datetime.now().strftime("%Y-%m-%d"), "公告标题": "备用公告", "公告类型": "PDF", "公告链接": "https://example.test/fallback",
+        }])
+        with patch("tools.providers.easy_tdx_provider.fetch_announcements", side_effect=requests.Timeout("timeout")), \
+             patch.object(announcements.ak, "stock_zh_a_disclosure_report_cninfo", return_value=fallback):
+            data = announcements.fetch_announcements("300820", days=30)
+        self.assertTrue(data["announcement_fetch_ok"])
+        self.assertTrue(data["announcement_coverage_complete"])
+        self.assertEqual(data["fetch_state"], "fallback_ok")
+        self.assertEqual([item["status"] for item in data["source_chain"]], ["failed", "ok"])
 
     def test_authority_capex_requires_two_fresh_independent_domains(self) -> None:
         records = [

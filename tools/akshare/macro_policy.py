@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import sys
 import time
 
 import akshare as ak
@@ -12,10 +13,43 @@ import requests
 
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from tools.data_call import run_with_timeout
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "macro_policy"
 GOV_POLICY_URL = "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json"
 SUPPORT_TERMS = ("支持", "促进", "鼓励", "发展", "行动方案", "规划", "补贴", "试点", "扩内需")
 TIGHTEN_TERMS = ("整治", "规范", "限制", "禁止", "处罚", "监管", "风险提示")
+
+
+def _metric_call(label: str, function) -> tuple[dict, dict]:
+    primary = run_with_timeout(label, function, seconds=15, source="AKShare/PBOC")
+    if primary.ok:
+        value = primary.value if isinstance(primary.value, dict) else {}
+        return value, {
+            "fetch_state": "empty" if not value else "ok",
+            "source": "AKShare/PBOC",
+            "source_chain": primary.source_chain or [],
+            "error": None,
+        }
+    from tools.data_patch import ensure_akshare_proxy_patch
+    ensure_akshare_proxy_patch(["www.pbc.gov.cn", "data.stats.gov.cn"], reason=f"{label} same-source retry")
+    retry = run_with_timeout(label, function, seconds=15, source="AKShare/PBOC同源代理")
+    chain = (primary.source_chain or []) + (retry.source_chain or [])
+    if retry.ok:
+        value = retry.value if isinstance(retry.value, dict) else {}
+        return value, {
+            "fetch_state": "fallback_ok" if value else "empty",
+            "source": "AKShare/PBOC同源代理",
+            "source_chain": chain,
+            "error": None,
+        }
+    return {}, {
+        "fetch_state": "failed",
+        "source": "AKShare/PBOC同源代理",
+        "source_chain": chain,
+        "error": f"{primary.error}; retry: {retry.error}",
+    }
 
 
 def _latest_lpr() -> dict:
@@ -95,19 +129,21 @@ def _policy_titles(industry: str, timeout: float = 12) -> tuple[list[dict], list
 
 
 def collect(industry: str) -> dict:
-    data: dict = {"macro_industry": industry, "macro_errors": []}
-    try:
-        data.update(_latest_lpr())
-    except Exception as exc:
-        data["macro_errors"].append(f"lpr:{type(exc).__name__}")
-    try:
-        data.update(_latest_pmi())
-    except Exception as exc:
-        data["macro_errors"].append(f"pmi:{type(exc).__name__}")
-    try:
-        data.update(_latest_ppi())
-    except Exception as exc:
-        data["macro_errors"].append(f"ppi:{type(exc).__name__}")
+    data: dict = {"macro_industry": industry, "macro_errors": [], "macro_fetch_status": {}, "source_chain": {}}
+    for key, label, function in (
+        ("lpr", "LPR", _latest_lpr),
+        ("pmi", "PMI", _latest_pmi),
+        ("ppi", "PPI", _latest_ppi),
+    ):
+        try:
+            value, status = _metric_call(label, function)
+        except Exception as exc:
+            value, status = {}, {"fetch_state": "failed", "source": "AKShare/PBOC", "source_chain": [], "error": f"{type(exc).__name__}: {exc}"}
+        data.update(value)
+        data["macro_fetch_status"][key] = status
+        data["source_chain"][key] = status.get("source_chain", [])
+        if status.get("error"):
+            data["macro_errors"].append(f"{key}:{status['error']}")
     try:
         latest, relevant = _policy_titles(industry)
         data["official_policy_titles"] = latest
@@ -119,6 +155,18 @@ def collect(industry: str) -> dict:
         data["policy_direction"] = "支持" if positive > negative else "收紧" if negative > positive else "中性/无直接命中"
     except Exception as exc:
         data["macro_errors"].append(f"policy:{type(exc).__name__}")
+        data["macro_fetch_status"]["policy"] = {
+            "fetch_state": "failed", "source": "gov.cn", "source_chain": [], "error": f"{type(exc).__name__}: {exc}"
+        }
+        data["source_chain"]["policy"] = []
+    else:
+        data["macro_fetch_status"]["policy"] = {
+            "fetch_state": "ok" if data.get("official_policy_titles") else "empty",
+            "source": "gov.cn", "source_chain": [{"source": "gov.cn", "status": "ok", "error": ""}], "error": None,
+        }
+        data["source_chain"]["policy"] = data["macro_fetch_status"]["policy"]["source_chain"]
+    states = [item.get("fetch_state") for item in data["macro_fetch_status"].values()]
+    data["fetch_state"] = "failed" if any(state == "failed" for state in states) else "fallback_ok" if any(state == "fallback_ok" for state in states) else "empty" if all(state == "empty" for state in states) else "ok"
     return data
 
 

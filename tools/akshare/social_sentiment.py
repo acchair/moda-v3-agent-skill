@@ -109,9 +109,17 @@ def collect(code: str, name: str) -> dict:
         platform, fetcher = item
         try:
             rows, mode = _cached(platform, fetcher)
-            return platform, {"ok": bool(rows), "mode": mode, "items": rows, "error": "" if rows else "empty response"}
+            return platform, {
+                "ok": bool(rows),
+                "mode": mode,
+                "items": rows,
+                "fetch_state": "ok" if rows else "empty",
+                "source_chain": [{"source": platform, "status": "ok" if rows else "empty", "error": "" if rows else "empty response"}],
+                "error": "" if rows else "empty response",
+            }
         except Exception as exc:
-            return platform, {"ok": False, "mode": "failed", "items": [], "error": f"{type(exc).__name__}: {str(exc)[:100]}"}
+            error = f"{type(exc).__name__}: {str(exc)[:100]}"
+            return platform, {"ok": False, "mode": "failed", "items": [], "fetch_state": "failed", "source_chain": [{"source": platform, "status": "failed", "error": error}], "error": error}
 
     started = time.monotonic()
     executor = ThreadPoolExecutor(max_workers=len(FETCHERS))
@@ -124,18 +132,19 @@ def collect(code: str, name: str) -> dict:
                 result_platform, result = future.result()
             except Exception as exc:
                 result_platform = platform
-                result = {"ok": False, "mode": "failed", "items": [], "error": f"{type(exc).__name__}: {str(exc)[:100]}"}
+                error = f"{type(exc).__name__}: {str(exc)[:100]}"
+                result = {"ok": False, "mode": "failed", "items": [], "fetch_state": "failed", "source_chain": [{"source": platform, "status": "failed", "error": error}], "error": error}
             results[result_platform] = result
     except TimeoutError:
         for future, platform in futures.items():
             if not future.done():
                 future.cancel()
-                results[platform] = {"ok": False, "mode": "timeout", "items": [], "error": "platform deadline exceeded"}
+                results[platform] = {"ok": False, "mode": "timeout", "items": [], "fetch_state": "failed", "source_chain": [{"source": platform, "status": "failed", "error": "platform deadline exceeded"}], "error": "platform deadline exceeded"}
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
     for platform in FETCHERS:
-        results.setdefault(platform, {"ok": False, "mode": "timeout", "items": [], "error": "platform deadline exceeded"})
+        results.setdefault(platform, {"ok": False, "mode": "timeout", "items": [], "fetch_state": "failed", "source_chain": [{"source": platform, "status": "failed", "error": "platform deadline exceeded"}], "error": "platform deadline exceeded"})
 
     aliases = _aliases(name, code)
     mentions: dict[str, list[dict]] = {}
@@ -150,6 +159,19 @@ def collect(code: str, name: str) -> dict:
     rank_weight = sum(max(0.0, (51 - float(row.get("rank", 50))) / 50) for rows in mentions.values() for row in rows)
     social_heat = min(1.0, (platform_hits / 3) * 0.6 + min(0.4, rank_weight * 0.12)) if checked >= 3 else None
     discussion = _collect_discussion(code, name, timeout=max(2.0, COLLECT_DEADLINE - (time.monotonic() - started)))
+    platform_fetch_states = [result.get("fetch_state", "failed") for result in results.values()]
+    platform_has_data = any(result.get("ok") for result in results.values())
+    discussion_has_data = bool(discussion.get("discussion_posts_total"))
+    platform_all_failed = bool(platform_fetch_states) and all(state == "failed" for state in platform_fetch_states)
+    discussion_state = discussion.get("fetch_state", "failed")
+    if platform_all_failed and not discussion_has_data and discussion_state == "failed":
+        module_fetch_state = "failed"
+    elif platform_has_data or discussion_has_data:
+        module_fetch_state = "fallback_ok" if any(state in {"failed", "empty"} for state in platform_fetch_states) or discussion_state in {"failed", "empty"} else "ok"
+    elif all(state == "empty" for state in platform_fetch_states) and discussion_state == "empty":
+        module_fetch_state = "empty"
+    else:
+        module_fetch_state = "failed"
     return {
         "social_platforms_checked": checked,
         "social_platforms_total": len(FETCHERS),
@@ -160,9 +182,15 @@ def collect(code: str, name: str) -> dict:
         "promotional_keyword_hits": promotion_hits,
         "rumor_keyword_hits": rumor_hits,
         "social_aliases": aliases,
-        "social_platform_status": {key: {"ok": value["ok"], "mode": value["mode"], "error": value["error"]} for key, value in results.items()},
+        "social_platform_status": {key: {"ok": value["ok"], "mode": value["mode"], "fetch_state": value.get("fetch_state", "failed"), "source_chain": value.get("source_chain", []), "error": value["error"]} for key, value in results.items()},
         "social_partial": checked < len(FETCHERS),
         **discussion,
+        "fetch_state": module_fetch_state,
+        "discussion_fetch_state": discussion_state,
+        "source_chain": {
+            "platforms": {key: value.get("source_chain", []) for key, value in results.items()},
+            "discussion": discussion.get("source_chain", []),
+        },
     }
 
 
@@ -188,6 +216,8 @@ def _collect_discussion(code: str, name: str, timeout: float = 8) -> dict:
             "discussion_search_errors": [f"{type(exc).__name__}: {str(exc)[:120]}"],
             "discussion_sentiment": None,
             "discussion_sentiment_score": None,
+            "fetch_state": "failed",
+            "source_chain": [{"source": "个股讨论接口/搜索", "status": "failed", "error": f"{type(exc).__name__}: {str(exc)[:120]}"}],
             "discussion_positive_count": 0,
             "discussion_negative_count": 0,
             "discussion_neutral_count": 0,

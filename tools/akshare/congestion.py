@@ -178,6 +178,8 @@ def collect(
         "market_congestion_checked_at": record.get("checked_at"),
         "market_congestion_cache_hit": record.get("cache_hit", False),
         "market_congestion_cache_status": record.get("status"),
+        "fetch_state": "stale" if record.get("fetch_state") == "stale" or not fresh else "ok" if matched else "empty",
+        "source_chain": payload.get("source_chain") or [{"source": payload.get("source") or "乐咕乐股/申万二级行业拥挤度", "status": "ok" if record.get("usable") else "failed", "error": record.get("error") or ""}],
         "market_congestion_error": record.get("error"),
         "market_congestion_rows": len(payload.get("rows") or []),
     }
