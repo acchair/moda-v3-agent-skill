@@ -143,6 +143,14 @@ python tools/export_skill_output.py --stock 000001 --name 平安银行 --input f
 
 Windows 使用 `python` 也可以。Apple/macOS 和 OpenMinis 使用 `python3`；Apple 移动端应将仓库放入 Agent 的工作区，由 Agent 的 Linux 沙箱执行。所有报告仍写入 `knowledge/research/`，不依赖 Windows 专用路径。
 
+## 更新日志
+
+### 2026-08-08
+
+- 新增 `moda-release-updater`：Agent 会话启动后每天后台检查一次 GitHub 正式 Release，并提供升级、跳过本版和暂不升级选择。
+- 新增莫大 Agent 使用说明与 Codex 安装入口；人格解读保留 moda-v4 正式报告的评分、证据和风险约束。
+- 快速安装地址、目录名和调用示例统一为 `moda-v4`。
+
 ## 隐私与安全
 
 仓库不包含浏览器登录状态、Cookie、本机日志或历史分析报告。可选代理凭据只从环境变量读取，禁止写入代码、报告或提交记录。
