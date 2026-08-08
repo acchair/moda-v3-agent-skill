@@ -1,6 +1,6 @@
 # moda-v4
 
-![moda-v3](./ChatGPT%20Image%202026%E5%B9%B47%E6%9C%8825%E6%97%A5%2020_24_27.png)
+![moda-v4](./ChatGPT%20Image%202026%E5%B9%B47%E6%9C%8825%E6%97%A5%2020_24_27.png)
 
 面向 A 股研究的六层评分 Skill，支持数据来源标注、保守硬约束和固定格式输出。
 
@@ -11,24 +11,44 @@
 将下面的提示词交给Agent：
 
 ```text
-请将 https://github.com/acchair/moda-v3-agent-skill 安装为 moda-v3 Skill：克隆到你的 skills 目录，安装 requirements.txt，读取 SKILL.md，并保持 tools 与 knowledge 的相对目录结构。随后按六层评分框架分析 A 股。
+请将 https://github.com/acchair/moda-v4-agent-skill 安装为 moda-v4 Skill：克隆到你的 skills 目录，安装 requirements.txt，读取 SKILL.md，并保持 tools 与 knowledge 的相对目录结构。随后按六层评分框架分析 A 股。
 ```
 
 也可以手动安装：
 
 ```bash
-git clone https://github.com/acchair/moda-v3-agent-skill.git
-cd moda-v3-agent-skill
+git clone https://github.com/acchair/moda-v4-agent-skill.git
+cd moda-v4-agent-skill
 python -m pip install -r requirements.txt
 ```
+
+## 自动更新
+
+Codex 可安装 `moda-release-updater`，在每次 Agent 会话启动后后台检查 GitHub 最新正式 Release；同一自然日只检查一次：
+
+```powershell
+python release-updater/scripts/release_updater.py install --target "C:\path\to\moda-v4"
+```
+
+发现新版本时会显示版本号、发布日期和改动摘要，并提供 `是`、`跳过本版`、`否` 三个选择。选择“是”会升级代码并同步依赖；检测到未提交修改时会停止升级，避免覆盖当前工作。“跳过本版”不再提示该版本，“否”会在下一自然日再次检查。
+
+## 莫大 Agent
+
+仓库内置受莫大公开投资方法与表达方式启发的研究与陪伴型 Agent。它不是莫大本人，也不代表其当前观点；具体 A 股分析始终先保留 moda-v4 正式报告，再追加“莫大 Agent 解读”，不会改写研究分、行动评级、覆盖率、Hard Cap、来源状态或 `需人工确认`。
+
+```powershell
+python moda-companion/install.py codex
+```
+
+安装后可用于行业、投资方法、AI/科技话题和日常陪伴。跨会话只保存用户明确允许的非敏感偏好，不保存账户、成本、持仓、联系方式、Cookie、密码、Token 或 API Key。
 
 ## 使用方法
 
 直接向 Agent 提供股票名称或六位股票代码，例如：
 
 ```text
-/moda-v3 中国平安
-/moda-v3 601318
+/moda-v4 中国平安
+/moda-v4 601318
 ```
 
 Agent 会确认股票代码并运行基础流水线：
