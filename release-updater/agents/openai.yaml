@@ -1,0 +1,7 @@
+interface:
+  display_name: "Moda Release 更新器"
+  short_description: "每天检查一次 Moda 正式版本并安全升级"
+  default_prompt: "Use $moda-release-updater to check the latest Moda release and manage update preferences safely."
+
+policy:
+  allow_implicit_invocation: true
